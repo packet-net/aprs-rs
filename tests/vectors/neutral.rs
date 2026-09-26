@@ -1,7 +1,7 @@
 //! The vectors' neutral data form: writing decoded data (for comparison) and reading it back (to
 //! build data for the encode cases). The rules are in vectors/README.md.
 
-use packet_aprs::*;
+use pdn_aprs::*;
 use serde_json::{Map, Value, json};
 
 pub fn diagnostic(d: &Diagnostic) -> String {
