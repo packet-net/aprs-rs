@@ -72,9 +72,42 @@ assert!(Packet::decode_tnc2(line, options)?.has_errors());
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+## Building packets
+
+Start from your station and say what the packet is. `build()` gives the encoded [`Packet`], and `to_data()` the [`Data`] alone.
+
+```rust
+use pdn_aprs::{Station, Symbol, Timestamp};
+
+let me = Station::new("M0LTE-9")?.via(&["WIDE1-1", "WIDE2-1"])?;
+
+let beacon = me.position(51.4543, -0.9781).symbol(Symbol::CAR).course(88).speed(36.0).altitude(120.0).comment("Mobile").build()?;
+assert_eq!(beacon.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:!5127.26N/00058.69W>088/036/A=000120Mobile");
+
+let message = me.message("G3NRW", "Hi Ian").id("01").build()?;
+assert_eq!(message.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1::G3NRW    :Hi Ian{01");
+
+let repeater = me
+    .object("MYRPTR")
+    .at(51.45, -0.98)
+    .symbol(Symbol::REPEATER)
+    .timestamp(Timestamp::dhm(25, 18, 30))
+    .frequency(145.725)
+    .tone(118.8)
+    .offset_khz(-600)
+    .build()?;
+assert_eq!(repeater.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:;MYRPTR   *251830z5127.00N/00058.80Wr145.725MHz T118 -060");
+
+let weather = me.weather().at(51.45, -0.98).wind(220, 4.0).gust(5.0).temperature(77.0).build()?;
+assert_eq!(weather.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:!5127.00N/00058.80W_220/004g005t077");
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+[`Station`] also starts items, Mic-E reports, acks and rejects, bulletins, status reports, telemetry and its `PARM.`/`UNIT.`/`EQNS.`/`BITS.` metadata. A station is a value, so keep one and build every packet from it. The destination is [`DEFAULT_DESTINATION`], `APZ001` from the experimental range, until you set your own with [`Station::to`]. Values are in the units APRS sends (knots, feet, Fahrenheit, mph), with `speed_kmh`, `altitude_metres`, `temperature_celsius` and the `_mm` rain methods to convert. The crate has no clock, so an object or a positionless weather report needs its timestamp given. Every defined symbol has a name ([`Symbol::CAR`], [`Symbol::GATEWAY`]`.with_overlay('I')`), the same names the other implementations use.
+
 ## Encoding
 
-Build the data, then a packet. The fields are public, and every type has a sensible `Default`.
+To build the data by hand, fill in the types, then make a packet. The fields are public, and every type has a sensible `Default`.
 
 ```rust
 use pdn_aprs::{Address, Data, Packet, PathEntry, Position, PositionReport, Positioned, Symbol};
@@ -83,7 +116,7 @@ let report = PositionReport {
     messaging: true,
     fields: Positioned {
         position: Position { latitude: 51.5, longitude: -0.116667, ambiguity: 0 },
-        symbol: Symbol { table: '/', code: '>' },
+        symbol: Symbol::CAR,
         course_degrees: Some(88),
         speed_knots: Some(36.0),
         altitude_feet: Some(120.0),
@@ -162,7 +195,7 @@ Values are in the units APRS sends (knots, feet, mph, degrees Fahrenheit), with 
 
 ## Conformance
 
-`cargo test` runs the whole [packet-net/aprs-vectors](https://github.com/packet-net/aprs-vectors) suite (a git submodule at `vectors/`): every example in APRS12c and *Understanding APRS Packets*, every tolerable defect, the encoder's rules, 1,395 real APRS-IS packets, and 40 more that settled a disagreement between this crate and the C# implementation. Each case is checked lenient, strict, with only its own tolerance switched off, re-encoded, and read back: 7,175 checks, all passing. A deliberate difference from a recorded expectation would be listed, with its reason, in [`tests/known-differences.txt`](https://github.com/packet-net/aprs-rs/blob/main/tests/known-differences.txt); there are none.
+`cargo test` runs the whole [packet-net/aprs-vectors](https://github.com/packet-net/aprs-vectors) suite (a git submodule at `vectors/`): every example in APRS12c and *Understanding APRS Packets*, every tolerable defect, the encoder's rules, 1,395 real APRS-IS packets, and 40 more that settled a disagreement between this crate and the C# implementation. Each case is checked lenient, strict, with only its own tolerance switched off, re-encoded, and read back: 7,176 checks, all passing. A deliberate difference from a recorded expectation would be listed, with its reason, in [`tests/known-differences.txt`](https://github.com/packet-net/aprs-rs/blob/main/tests/known-differences.txt); there are none.
 
 This crate was written from the spec, the vectors and their [interpretations](https://github.com/packet-net/aprs-vectors/blob/main/interpretations.md), not by porting the C# implementation. Doing so found three places where the vectors had recorded a C# quirk rather than a rule; the C# was fixed and the cases refreshed.
 
