@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0
+
 - `Station`: a fluent builder for the packets an application sends, as the C#, Python and TypeScript implementations have. `Station::new("M0LTE-9")?.position(lat, lon).symbol(Symbol::CAR).speed(36.0).build()?`, and the same for objects, items, Mic-E, weather, messages, acks and rejects, bulletins, status and telemetry.
 - Every defined symbol by name (`Symbol::CAR`), the same names the other implementations use, with `Symbol::new` and `Symbol::with_overlay`.
 - `Timestamp::dhm`, `Timestamp::hms` and `Timestamp::mdhm`; `VoiceFrequency` implements `Default`.
