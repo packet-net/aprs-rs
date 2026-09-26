@@ -143,7 +143,7 @@ pub enum Code {
     PositionNotAtStart,
     /// A weather field is one character shorter or longer than its fixed width (UAP 5.31).
     NonStandardWeatherFieldWidth,
-    /// Wind sent as c/s fields in a position weather report instead of the DDD/SSS extension.
+    /// Wind sent as c/s fields in a position weather report instead of the DDD/SSS extension, or after a compressed position whose cs bytes carry no wind.
     WindFieldsInsteadOfExtension,
     /// An uncompressed wind extension after a compressed weather position (UAP 5.33).
     WindExtensionAfterCompressed,

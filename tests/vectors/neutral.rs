@@ -149,16 +149,26 @@ pub fn data(d: &Data) -> Value {
             let kind = if matches!(d, Data::Bulletin(_)) { "bulletin" } else { "nws-bulletin" };
             Obj::new(kind).put("addressee", json!(b.addressee)).put("text", json!(b.text)).put("message_id", json!(b.message_id)).done()
         }
-        Data::TelemetryNames(t) => Obj::new("telemetry-names").put("addressee", json!(t.addressee)).put("names", json!(t.labels)).done(),
-        Data::TelemetryUnits(t) => Obj::new("telemetry-units").put("addressee", json!(t.addressee)).put("units", json!(t.labels)).done(),
+        Data::TelemetryNames(t) => Obj::new("telemetry-names")
+            .put("addressee", json!(t.addressee))
+            .put("names", json!(t.labels))
+            .put("message_id", json!(t.message_id))
+            .done(),
+        Data::TelemetryUnits(t) => Obj::new("telemetry-units")
+            .put("addressee", json!(t.addressee))
+            .put("units", json!(t.labels))
+            .put("message_id", json!(t.message_id))
+            .done(),
         Data::TelemetryCoefficients(t) => Obj::new("telemetry-coefficients")
             .put("addressee", json!(t.addressee))
             .put("coefficients", Value::Array(t.coefficients.iter().map(|c| number_text(c)).collect()))
+            .put("message_id", json!(t.message_id))
             .done(),
         Data::TelemetryBits(t) => Obj::new("telemetry-bits")
             .put("addressee", json!(t.addressee))
             .put("bits", json!(t.bits))
             .put("project", json!(t.project))
+            .put("message_id", json!(t.message_id))
             .done(),
         Data::DirectedQuery(q) => Obj::new("directed-query")
             .put("addressee", json!(q.addressee))
@@ -240,7 +250,9 @@ pub fn data(d: &Data) -> Value {
 }
 
 fn number_text(text: &str) -> Value {
-    serde_json::from_str::<Value>(&normalise_number(text)).unwrap_or_else(|_| json!(text))
+    serde_json::from_str::<Value>(&normalise_number(text))
+        .or_else(|_| text.trim().parse::<f64>().map(|v| json!(v)))
+        .unwrap_or_else(|_| json!(text))
 }
 
 /// Numbers as sent (`073`, `.53`, `-.5`, `+1`) as JSON numbers.
@@ -413,15 +425,27 @@ pub fn read_data(v: &Value) -> Data {
         }),
         "bulletin" => Data::Bulletin(Bulletin { addressee: string("addressee"), text: string("text"), message_id: s("message_id") }),
         "nws-bulletin" => Data::NwsBulletin(Bulletin { addressee: string("addressee"), text: string("text"), message_id: s("message_id") }),
-        "telemetry-names" => Data::TelemetryNames(TelemetryLabels { addressee: string("addressee"), labels: strings(o.get("names")) }),
-        "telemetry-units" => Data::TelemetryUnits(TelemetryLabels { addressee: string("addressee"), labels: strings(o.get("units")) }),
+        "telemetry-names" => Data::TelemetryNames(TelemetryLabels {
+            addressee: string("addressee"),
+            labels: strings(o.get("names")),
+            message_id: s("message_id"),
+        }),
+        "telemetry-units" => Data::TelemetryUnits(TelemetryLabels {
+            addressee: string("addressee"),
+            labels: strings(o.get("units")),
+            message_id: s("message_id"),
+        }),
         "telemetry-coefficients" => Data::TelemetryCoefficients(TelemetryCoefficients {
             addressee: string("addressee"),
             coefficients: o.get("coefficients").map(|a| a.as_array().unwrap().iter().map(|x| x.to_string()).collect()).unwrap_or_default(),
+            message_id: s("message_id"),
         }),
-        "telemetry-bits" => {
-            Data::TelemetryBits(TelemetryBits { addressee: string("addressee"), bits: string("bits"), project: string("project") })
-        }
+        "telemetry-bits" => Data::TelemetryBits(TelemetryBits {
+            addressee: string("addressee"),
+            bits: string("bits"),
+            project: string("project"),
+            message_id: s("message_id"),
+        }),
         "directed-query" => {
             Data::DirectedQuery(DirectedQuery { addressee: string("addressee"), query_type: string("query_type"), target: s("target") })
         }
@@ -664,6 +688,7 @@ fn read_positioned(o: &Map<String, Value>) -> Positioned {
             mhz: f["mhz"].as_f64().unwrap(),
             tone: f.get("tone").map(|t| match t.as_str().unwrap() {
                 "off" => Tone::Off,
+                "tone-burst" => Tone::ToneBurst,
                 "tone" => Tone::Tone,
                 "ctcss" => Tone::Ctcss,
                 _ => Tone::Dcs,

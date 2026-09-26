@@ -367,9 +367,10 @@ impl Packet {
     }
 }
 
+/// `q`, an upper-case letter, then a letter of either case: `qAr` and `qAo` (UAP section 4) are in use.
 fn is_q_construct(text: &str) -> bool {
     let b = text.as_bytes();
-    b.len() == 3 && b[0] == b'q' && b[1].is_ascii_uppercase() && b[2].is_ascii_uppercase()
+    b.len() == 3 && b[0] == b'q' && b[1].is_ascii_uppercase() && b[2].is_ascii_alphabetic()
 }
 
 fn header_address(ctx: &mut Context, text: &str) -> Result<Address, HeaderError> {

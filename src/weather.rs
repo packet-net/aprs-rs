@@ -6,186 +6,211 @@ use alloc::vec::Vec;
 use crate::context::Context;
 use crate::{Code, EncodeError, Weather, WeatherField};
 
-/// How the run starts.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Start {
-    /// A positionless report: `cccsssggg...`, wind first as fields.
-    Positionless,
-    /// After a position whose wind came from the `DDD/SSS` extension or the compressed cs bytes.
-    WindKnown,
-    /// After a position with no wind extension: `c`/`s` fields there are tolerated.
-    WindMissing,
-}
-
-/// The result of reading a field run.
-pub(crate) struct Run {
-    /// Bytes used by the fields.
-    pub(crate) len: usize,
-    /// Which mandatory fields were present (even as unknown): wind direction, wind speed, gust, temperature.
-    pub(crate) has_gust: bool,
-    pub(crate) has_temperature: bool,
-    pub(crate) has_wind: bool,
-    /// A positionless report's `s` wind speed field was present.
-    pub(crate) has_wind_speed: bool,
-}
-
-/// Reads weather fields from the start of `bytes` into `weather`. `None` when a defect was not tolerated.
-pub(crate) fn fields(ctx: &mut Context, bytes: &[u8], offset: usize, weather: &mut Weather, start: Start) -> Option<Run> {
+/// Reads letter-and-value weather fields from the start of `bytes` into `weather`, and returns the
+/// bytes used; `None` when a defect was not tolerated. A `positionless` report starts with `c`
+/// (wind direction) and `s` (wind speed) fields, and so does a positioned one that sent them
+/// instead of the `DDD/SSS` extension (`wind_as_fields`); any other `s` is snowfall. The run
+/// stops at the first thing that is not a field: an unknown byte, a letter out of place (`c` once
+/// the wind is read) or a field seen before.
+pub(crate) fn fields(
+    ctx: &mut Context,
+    bytes: &[u8],
+    offset: usize,
+    weather: &mut Weather,
+    positionless: bool,
+    wind_as_fields: bool,
+) -> Option<usize> {
     let mut at = 0;
-    let mut run = Run { len: 0, has_gust: false, has_temperature: false, has_wind: start == Start::WindKnown, has_wind_speed: false };
-    let mut first = true;
-    let mut after_wind_direction = false;
+    // Fields read so far; snowfall is `S`, to keep it apart from the wind speed `s`.
+    let mut seen: Vec<u8> = Vec::new();
+    let mut extra = Vec::new();
+    let mut wind_read = !(positionless || wind_as_fields);
     while at < bytes.len() {
         let letter = bytes[at];
-        // `c` is wind direction only as the first field of a run that has no wind yet, and `s` is
-        // wind speed only straight after it; any other `s` is snowfall.
-        let wind_direction = letter == b'c' && first && start != Start::WindKnown;
-        let wind_speed = letter == b's' && after_wind_direction;
-        after_wind_direction = false;
-        let (width, signed) = match letter {
-            b'c' if wind_direction => (3, false),
-            b's' | b'g' | b'r' | b'p' | b'P' | b'L' | b'l' | b'#' => (3, false),
-            b't' => (3, true),
-            b'h' => (2, false),
-            b'b' => (5, false),
-            _ if letter.is_ascii_alphabetic() => (0, false),
-            _ => break,
+        let snow = letter == b's' && wind_read;
+        let width = match letter {
+            b'c' if !wind_read => 3,
+            b's' | b'g' | b't' | b'r' | b'p' | b'P' | b'L' | b'l' | b'#' => 3,
+            b'h' => 2,
+            b'b' => 5,
+            _ => 0,
         };
-        let value_start = at + 1;
-        if width == 0 {
-            // A letter the spec does not define, with a number after it: kept as it came.
-            // Three digits at least, as every defined field has.
-            let len = bytes[value_start..].iter().take_while(|b| b.is_ascii_digit()).count();
-            if len < 3 {
-                break;
+        let key = if snow { b'S' } else { letter };
+        let field = if width > 0 && !seen.contains(&key) { value(ctx, bytes, at, offset, width, letter, snow)? } else { None };
+        if let Some((v, len)) = field {
+            seen.push(key);
+            if !assign(ctx, weather, letter, snow, v, offset + at) {
+                return None;
             }
-            weather.extra.push(WeatherField {
-                letter: letter as char,
-                value: String::from(core::str::from_utf8(&bytes[value_start..value_start + len]).unwrap_or_default()),
-            });
-            at = value_start + len;
-            first = false;
+            if letter == b's' && !snow {
+                wind_read = true;
+            }
+            at += 1 + len;
             continue;
         }
-
-        let Some((value, len)) = value(ctx, &bytes[value_start..], offset + value_start, width, signed)? else {
-            break;
-        };
-        match letter {
-            b'c' if wind_direction => {
-                if start == Start::WindMissing
-                    && !ctx.tolerate(
-                        Code::WindFieldsInsteadOfExtension,
-                        "wind sent as c/s fields instead of the DDD/SSS extension",
-                        Some(offset + at),
-                    )
-                {
-                    return None;
-                }
-                after_wind_direction = true;
-                run.has_wind = true;
-                match value {
-                    Some(v) if v > 360.0 => {
-                        if !ctx.tolerate(Code::OutOfRangeValue, "a wind direction over 360 degrees was dropped", Some(offset + at)) {
-                            return None;
-                        }
-                    }
-                    v => weather.wind_direction_degrees = v.map(|v| v as u16),
-                }
+        // A letter the spec does not define with a number after it: kept as it came. At least
+        // two characters (as every defined field has more), ending in a digit.
+        if letter.is_ascii_alphabetic() && !is_known(letter) {
+            let len = bytes[at + 1..].iter().take_while(|&&b| b.is_ascii_digit() || b == b'.' || b == b'-').count();
+            if len >= 2 && bytes[at + len].is_ascii_digit() {
+                extra.push(WeatherField {
+                    letter: letter as char,
+                    value: String::from(core::str::from_utf8(&bytes[at + 1..at + 1 + len]).unwrap_or_default()),
+                });
+                at += 1 + len;
+                continue;
             }
-            b's' if wind_speed => {
-                run.has_wind_speed = true;
-                weather.wind_speed_mph = value;
-            }
-            b's' => weather.snow_24h_in = value,
-            b'g' => {
-                run.has_gust = true;
-                weather.wind_gust_mph = value;
-            }
-            b't' => {
-                run.has_temperature = true;
-                weather.temperature_f = value;
-            }
-            b'r' => weather.rain_1h_in = value.map(|v| v / 100.0),
-            b'p' => weather.rain_24h_in = value.map(|v| v / 100.0),
-            b'P' => weather.rain_midnight_in = value.map(|v| v / 100.0),
-            b'h' => match value {
-                Some(v) if v > 100.0 => {
-                    if !ctx.tolerate(Code::OutOfRangeValue, "a humidity over 100% was dropped", Some(offset + at)) {
-                        return None;
-                    }
-                }
-                v => weather.humidity_percent = v.map(|v| if v == 0.0 { 100 } else { v as u8 }),
+        }
+        break;
+    }
+    if !extra.is_empty() {
+        weather.extra = extra;
+    }
+    let complete =
+        if positionless { [b'c', b's', b'g', b't'].iter().all(|k| seen.contains(k)) } else { seen.contains(&b'g') && seen.contains(&b't') };
+    if !complete
+        && !ctx.tolerate(
+            Code::IncompleteWeather,
+            if positionless {
+                "a positionless weather report starts with the c, s, g and t fields (APRS12c ch. 12)"
+            } else {
+                "a weather report has the gust (g) and temperature (t) fields (APRS12c ch. 12)"
             },
-            b'b' => weather.pressure_mbar = value.map(|v| v / 10.0),
-            b'L' => weather.luminosity_w_m2 = value.map(|v| v as u16),
-            b'l' => weather.luminosity_w_m2 = value.map(|v| v as u16 + 1000),
-            b'#' => weather.rain_raw = value.map(|v| v as u32),
-            _ => {}
-        }
-        at = value_start + len;
-        first = false;
-    }
-    run.len = at;
-    Some(run)
-}
-
-/// A field value: digits, or all dots or spaces for unknown. The spec width is tried first; a
-/// run of digits one shorter or longer is a tolerated defect. `Some(None)` when there is no value
-/// here (the run ends); `None` when a defect was not tolerated.
-#[allow(clippy::type_complexity)]
-fn value(ctx: &mut Context, bytes: &[u8], offset: usize, width: usize, signed: bool) -> Option<Option<(Option<f64>, usize)>> {
-    if bytes.len() >= width && (bytes[..width].iter().all(|&b| b == b'.') || bytes[..width].iter().all(|&b| b == b' ')) {
-        return Some(Some((None, width)));
-    }
-    let dots = bytes.iter().take_while(|&&b| b == b'.').count();
-    if dots > 0 {
-        if dots > width + 1 {
-            return Some(None);
-        }
-        if !ctx.tolerate(Code::NonStandardWeatherFieldWidth, "a weather field is not its fixed width (UAP 5.31)", Some(offset)) {
-            return None;
-        }
-        return Some(Some((None, dots)));
-    }
-    let negative = signed && bytes.first() == Some(&b'-');
-    let digits_start = usize::from(negative);
-    let digits = bytes[digits_start..].iter().take_while(|b| b.is_ascii_digit()).count();
-    let total = digits_start + digits;
-    if digits == 0 {
-        return Some(None);
-    }
-    if total > width + 1 {
-        // More digits than any field has: read the spec width and let the rest end the run.
-        return Some(Some((Some(number(&bytes[..width])), width)));
-    }
-    if total != width
-        && !ctx.tolerate(Code::NonStandardWeatherFieldWidth, "a weather field is not its fixed width (UAP 5.31)", Some(offset))
+            Some(offset),
+        )
     {
         return None;
     }
-    Some(Some((Some(number(&bytes[..total])), total)))
+    Some(at)
+}
+
+fn is_known(letter: u8) -> bool {
+    matches!(letter, b'c' | b's' | b'g' | b't' | b'r' | b'p' | b'P' | b'h' | b'b' | b'L' | b'l' | b'#')
+}
+
+/// The value of the field whose letter is at `at`: its spec width, or (tolerated) a run of 1 to
+/// width+1 digits or dots ending at a non-digit (`t45`, `h070`, `b...`). A spec-width value that
+/// runs on into another digit is read at the run's width if that fits. `Some(None)` when there is
+/// no field here; `None` when a defect was not tolerated.
+#[allow(clippy::type_complexity)]
+fn value(
+    ctx: &mut Context,
+    bytes: &[u8],
+    at: usize,
+    offset: usize,
+    width: usize,
+    letter: u8,
+    snow: bool,
+) -> Option<Option<(Option<f64>, usize)>> {
+    let avail = bytes.len() - at - 1;
+    let exact = if avail >= width { exact_value(&bytes[at + 1..at + 1 + width], letter, snow) } else { None };
+    let followed_by_digit = avail > width && bytes[at + 1 + width].is_ascii_digit();
+    if let Some(v) = exact {
+        if !followed_by_digit {
+            return Some(Some((v, width)));
+        }
+    }
+    let dots = avail > 0 && bytes[at + 1] == b'.';
+    let minus = letter == b't' && avail > 0 && bytes[at + 1] == b'-';
+    let from = at + 1 + usize::from(minus);
+    let run = bytes[from..].iter().take_while(|&&b| if dots { b == b'.' } else { b.is_ascii_digit() }).count();
+    let len = run + usize::from(minus);
+    // A snowfall value (which may have a decimal point) keeps its width unless it is unknown.
+    if run >= 1 && len != width && len <= width + 1 && (dots || !snow) {
+        if !ctx.tolerate(
+            Code::NonStandardWeatherFieldWidth,
+            "a weather field is not its fixed width (APRS12c ch. 12, UAP 5.31)",
+            Some(offset + at),
+        ) {
+            return None;
+        }
+        let v = if dots {
+            None
+        } else {
+            let n = number(&bytes[from..from + run]);
+            Some(if minus { -n } else { n })
+        };
+        return Some(Some((v, len)));
+    }
+    Some(exact.map(|v| (v, width)))
+}
+
+/// A value of exactly the spec width: all dots or all spaces (unknown), digits, a negative
+/// temperature, or a snowfall with one decimal point.
+fn exact_value(v: &[u8], letter: u8, snow: bool) -> Option<Option<f64>> {
+    if v.iter().all(|&b| b == b'.') || v.iter().all(|&b| b == b' ') {
+        return Some(None);
+    }
+    if v.iter().all(u8::is_ascii_digit) {
+        return Some(Some(number(v)));
+    }
+    if letter == b't' && v[0] == b'-' && v[1..].iter().all(u8::is_ascii_digit) {
+        return Some(Some(-number(&v[1..])));
+    }
+    if snow && v.iter().filter(|&&b| b == b'.').count() == 1 && v.iter().all(|&b| b == b'.' || b.is_ascii_digit()) {
+        return core::str::from_utf8(v).ok().and_then(|t| t.parse::<f64>().ok()).map(Some);
+    }
+    None
+}
+
+fn assign(ctx: &mut Context, w: &mut Weather, letter: u8, snow: bool, v: Option<f64>, offset: usize) -> bool {
+    match letter {
+        b'c' => match v {
+            Some(d) if d > 360.0 => {
+                if !ctx.tolerate(Code::OutOfRangeValue, "a wind direction over 360 degrees was dropped", Some(offset)) {
+                    return false;
+                }
+                w.wind_direction_degrees = None;
+            }
+            d => w.wind_direction_degrees = d.map(|d| d as u16),
+        },
+        b's' if !snow => w.wind_speed_mph = v,
+        b's' => w.snow_24h_in = v,
+        b'g' => w.wind_gust_mph = v,
+        b't' => w.temperature_f = v,
+        b'r' => w.rain_1h_in = v.map(|v| v / 100.0),
+        b'p' => w.rain_24h_in = v.map(|v| v / 100.0),
+        b'P' => w.rain_midnight_in = v.map(|v| v / 100.0),
+        b'h' => match v {
+            Some(h) if h > 100.0 => {
+                if !ctx.tolerate(Code::OutOfRangeValue, "a humidity over 100% was dropped", Some(offset)) {
+                    return false;
+                }
+                w.humidity_percent = None;
+            }
+            h => w.humidity_percent = h.map(|h| if h == 0.0 { 100 } else { h as u8 }),
+        },
+        b'b' => w.pressure_mbar = v.map(|v| v / 10.0),
+        b'L' => w.luminosity_w_m2 = v.map(|v| v as u16),
+        b'l' => w.luminosity_w_m2 = v.map(|v| v as u16 + 1000),
+        b'#' => w.rain_raw = v.map(|v| v as u32),
+        _ => {}
+    }
+    true
 }
 
 fn number(bytes: &[u8]) -> f64 {
-    let (negative, digits) = match bytes.split_first() {
-        Some((b'-', rest)) => (true, rest),
-        _ => (false, bytes),
-    };
-    let n = digits.iter().fold(0.0, |n, &b| n * 10.0 + f64::from(b - b'0'));
-    if negative { -n } else { n }
+    bytes.iter().fold(0.0, |n, &b| n * 10.0 + f64::from(b - b'0'))
 }
 
-/// Reads the software type and unit after the fields, when the rest is exactly that: one
-/// character and a 2-4 character unit, e.g. `wRSW` or `eMB64`.
+/// The software type and unit, when the rest is exactly that: a letter and a 2-4 character unit
+/// of letters, digits, `-` or `_`, not all digits (`wRSW`, `eMB64`, `tU2k`). A letter followed
+/// only by digits is a malformed weather field instead (`b0990`).
+pub(crate) fn is_software_and_unit(rest: &[u8]) -> bool {
+    (3..=5).contains(&rest.len())
+        && rest[0].is_ascii_alphabetic()
+        && !rest[1..].iter().all(u8::is_ascii_digit)
+        && rest.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Reads the software type and unit (see [`is_software_and_unit`]) into `weather`.
 pub(crate) fn software_and_unit(rest: &[u8], weather: &mut Weather) -> bool {
-    if (3..=5).contains(&rest.len()) && rest.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-') {
-        weather.software = Some(rest[0] as char);
-        weather.unit = Some(String::from(core::str::from_utf8(&rest[1..]).unwrap_or_default()));
-        true
-    } else {
-        false
+    if !is_software_and_unit(rest) {
+        return false;
     }
+    weather.software = Some(rest[0] as char);
+    weather.unit = Some(String::from(core::str::from_utf8(&rest[1..]).unwrap_or_default()));
+    true
 }
 
 /// Writes the fields after the wind (gust, temperature, rain, humidity, pressure, luminosity, snow,
@@ -227,21 +252,27 @@ pub(crate) fn encode_fields(out: &mut Vec<u8>, w: &Weather) -> Result<(), Encode
         push_digits(out, r, 3);
     }
     for extra in &w.extra {
-        if !extra.letter.is_ascii_alphabetic() || extra.value.is_empty() || !extra.value.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
-            return Err(EncodeError::new("an extra weather field is a letter and a number"));
+        // As they are read: a letter the spec does not define, then two or more digits, dots or
+        // '-', ending in a digit.
+        let v = extra.value.as_bytes();
+        if !extra.letter.is_ascii_alphabetic()
+            || is_known(extra.letter as u8)
+            || v.len() < 2
+            || !v.iter().all(|&b| b.is_ascii_digit() || b == b'.' || b == b'-')
+            || !v[v.len() - 1].is_ascii_digit()
+        {
+            return Err(EncodeError::new("an extra weather field is a letter the spec does not define and a number"));
         }
         out.push(extra.letter as u8);
         out.extend_from_slice(extra.value.as_bytes());
     }
     match (w.software, &w.unit) {
-        (Some(s), Some(u))
-            if s.is_ascii_alphanumeric() && (2..=4).contains(&u.len()) && u.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') =>
-        {
+        (Some(s), Some(u)) if s.is_ascii() && is_software_and_unit(alloc::format!("{s}{u}").as_bytes()) => {
             out.push(s as u8);
             out.extend_from_slice(u.as_bytes());
         }
         (None, None) => {}
-        _ => return Err(EncodeError::new("weather software is one character and the unit 2-4 letters or digits")),
+        _ => return Err(EncodeError::new("weather software is a letter, and the unit 2-4 letters, digits, - or _, not all digits")),
     }
     Ok(())
 }

@@ -8,7 +8,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::context::Context;
-use crate::weather::{self, Start};
+use crate::weather;
 use crate::{
     AgreloDf, Capabilities, Code, Data, EncodeError, Footprint, MaidenheadBeacon, Nmea, Packet, Query, RawWeather, RawWeatherFormat,
     TestData, Timestamp, UserDefined, Weather, WeatherReport, status, telemetry, text,
@@ -36,12 +36,7 @@ pub(crate) fn positionless_weather(ctx: &mut Context, info: &[u8]) -> Option<Dat
         return None;
     }
     let mut weather = Weather::default();
-    let run = weather::fields(ctx, &info[9..], 9, &mut weather, Start::Positionless)?;
-    let at = 9 + run.len;
-    let complete = run.has_wind && run.has_wind_speed && run.has_gust && run.has_temperature;
-    if !complete && !ctx.tolerate(Code::IncompleteWeather, "the weather report lacks a mandatory field (APRS12c ch. 12)", Some(9)) {
-        return None;
-    }
+    let at = 9 + weather::fields(ctx, &info[9..], 9, &mut weather, true, false)?;
     let rest = &info[at..];
     let mut comment = String::new();
     if !weather::software_and_unit(rest, &mut weather) && !rest.is_empty() {
@@ -53,14 +48,16 @@ pub(crate) fn positionless_weather(ctx: &mut Context, info: &[u8]) -> Option<Dat
     Some(Data::Weather(WeatherReport { timestamp: Some(timestamp), weather, comment }))
 }
 
-/// Raw NMEA: `$GPRMC`, `$GPGGA`, `$GPGLL`, `$GPVTG`, `$GPWPL` are read; other sentences are kept as text.
+/// Raw NMEA: `$GPRMC`, `$GPGGA`, `$GPGLL`, `$GPVTG`, `$GPWPL` are read; other sentences are kept as
+/// text. A field that does not parse (an empty position before a fix, say) is left out.
 pub(crate) fn nmea(ctx: &mut Context, info: &[u8]) -> Option<Data> {
     ctx.info(Code::ObsoleteFormat, "raw NMEA, which APRS12c ch. 7 does not recommend", Some(0));
-    let Some(sentence) = core::str::from_utf8(&info[1..]).ok().filter(|s| s.bytes().all(|b| (0x20..=0x7E).contains(&b))) else {
-        ctx.error(Code::InvalidNmea, "an NMEA sentence is printable ASCII", Some(1));
+    let body = &info[1..];
+    let Some(sentence) = core::str::from_utf8(body).ok().filter(|s| s.len() >= 5 && s.bytes().all(|b| (0x20..=0x7F).contains(&b))) else {
+        ctx.error(Code::InvalidNmea, "an NMEA sentence is printable ASCII, starting with the talker and sentence type", Some(1));
         return None;
     };
-    let (body, has_checksum) = match checksum(sentence) {
+    let (content, has_checksum) = match checksum(sentence) {
         Checksum::None => (sentence, false),
         Checksum::Matches(body) => (body, true),
         Checksum::Mismatch => {
@@ -68,56 +65,42 @@ pub(crate) fn nmea(ctx: &mut Context, info: &[u8]) -> Option<Data> {
             return None;
         }
     };
-    let f: Vec<&str> = body.split(',').collect();
-    let kind = f[0];
-    if kind.len() != 5 || !kind.bytes().all(|b| b.is_ascii_uppercase()) {
-        ctx.error(Code::InvalidNmea, "an NMEA sentence starts with a 5-letter talker and sentence type", Some(1));
-        return None;
-    }
+    let f: Vec<&str> = content.split(',').collect();
     let mut n = Nmea { sentence: sentence.to_string(), has_checksum, ..Nmea::default() };
-    let get = |i: usize| f.get(i).copied().unwrap_or("");
-    let number = |t: &str| t.parse::<f64>().ok();
-    let ok = match &kind[2..] {
-        "RMC" => {
-            n.time = time(get(1));
-            n.fix_valid = status_letter(get(2));
-            n.latitude = coordinate(get(3), get(4), 2);
-            n.longitude = coordinate(get(5), get(6), 3);
-            n.speed_knots = number(get(7));
-            n.course_degrees = number(get(8));
-            n.latitude.is_some() && n.longitude.is_some()
+    let number = |t: &str| t.trim().parse::<f64>().ok().filter(|v| v.is_finite());
+    let position = |n: &mut Nmea, lat: &str, ns: &str, lon: &str, ew: &str| {
+        if let Some((la, lo)) = nmea_position(lat, ns, lon, ew) {
+            (n.latitude, n.longitude) = (Some(la), Some(lo));
         }
-        "GGA" => {
-            n.time = time(get(1));
-            n.latitude = coordinate(get(2), get(3), 2);
-            n.longitude = coordinate(get(4), get(5), 3);
-            n.fix_valid = get(6).parse::<u8>().ok().map(|q| q != 0);
-            n.altitude_m = number(get(9));
-            n.latitude.is_some() && n.longitude.is_some()
-        }
-        "GLL" => {
-            n.latitude = coordinate(get(1), get(2), 2);
-            n.longitude = coordinate(get(3), get(4), 3);
-            n.time = time(get(5));
-            n.fix_valid = status_letter(get(6));
-            n.latitude.is_some() && n.longitude.is_some()
-        }
-        "VTG" => {
-            n.course_degrees = number(get(1));
-            n.speed_knots = number(get(5));
-            true
-        }
-        "WPL" => {
-            n.latitude = coordinate(get(1), get(2), 2);
-            n.longitude = coordinate(get(3), get(4), 3);
-            n.waypoint = Some(get(5).to_string()).filter(|w| !w.is_empty());
-            n.latitude.is_some() && n.longitude.is_some()
-        }
-        _ => true,
     };
-    if !ok {
-        ctx.error(Code::InvalidNmea, "the NMEA sentence's position is malformed", Some(1));
-        return None;
+    match f[0].get(2..5).unwrap_or("") {
+        "GGA" if f.len() >= 10 => {
+            n.time = time(f[1]);
+            position(&mut n, f[2], f[3], f[4], f[5]);
+            n.fix_valid = f[6].trim().parse::<i32>().ok().map(|q| q > 0);
+            n.altitude_m = number(f[9]);
+        }
+        "RMC" if f.len() >= 9 => {
+            n.time = time(f[1]);
+            n.fix_valid = status_letter(f[2]);
+            position(&mut n, f[3], f[4], f[5], f[6]);
+            n.speed_knots = number(f[7]);
+            n.course_degrees = number(f[8]);
+        }
+        "GLL" if f.len() >= 5 => {
+            position(&mut n, f[1], f[2], f[3], f[4]);
+            n.time = f.get(5).and_then(|t| time(t));
+            n.fix_valid = f.get(6).and_then(|s| status_letter(s));
+        }
+        "VTG" if f.len() >= 6 => {
+            n.course_degrees = number(f[1]);
+            n.speed_knots = number(f[5]);
+        }
+        "WPL" if f.len() >= 6 => {
+            position(&mut n, f[1], f[2], f[3], f[4]);
+            n.waypoint = Some(f[5].to_string()).filter(|w| !w.is_empty());
+        }
+        _ => {}
     }
     Some(Data::Nmea(n))
 }
@@ -141,12 +124,21 @@ fn checksum(sentence: &str) -> Checksum<'_> {
     if u8::from_str_radix(hex, 16) == Ok(sum) { Checksum::Matches(body) } else { Checksum::Mismatch }
 }
 
+/// `hhmmss` with any fraction of a second, as `hh:mm:ss.f`.
 fn time(t: &str) -> Option<String> {
     let b = t.as_bytes();
     if b.len() < 6 || !b[..6].iter().all(u8::is_ascii_digit) {
         return None;
     }
-    let fraction = t[6..].trim_end_matches('0');
+    let fraction = &t[6..];
+    if !(fraction.is_empty() || (fraction.starts_with('.') && fraction[1..].bytes().all(|b| b.is_ascii_digit()))) {
+        return None;
+    }
+    let pair = |i: usize| u32::from(b[i] - b'0') * 10 + u32::from(b[i + 1] - b'0');
+    if pair(0) > 23 || pair(2) > 59 || pair(4) > 59 {
+        return None;
+    }
+    let fraction = fraction.trim_end_matches('0');
     let fraction = if fraction == "." { "" } else { fraction };
     Some(format!("{}:{}:{}{}", &t[0..2], &t[2..4], &t[4..6], fraction))
 }
@@ -159,18 +151,19 @@ fn status_letter(s: &str) -> Option<bool> {
     }
 }
 
-fn coordinate(value: &str, hemisphere: &str, degree_digits: usize) -> Option<f64> {
-    if value.len() <= degree_digits || !value.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+/// NMEA `ddmm.mmmm,N,dddmm.mmmm,W`: the hundreds are degrees, whatever the number of digits.
+fn nmea_position(lat: &str, ns: &str, lon: &str, ew: &str) -> Option<(f64, f64)> {
+    if lat.len() < 4 || lon.len() < 5 || !matches!(ns, "N" | "S") || !matches!(ew, "E" | "W") {
         return None;
     }
-    let degrees: f64 = value[..degree_digits].parse().ok()?;
-    let minutes: f64 = value[degree_digits..].parse().ok()?;
-    let v = degrees + minutes / 60.0;
-    match hemisphere {
-        "N" | "E" => Some(v),
-        "S" | "W" => Some(-v),
-        _ => None,
+    let la: f64 = lat.trim().parse().ok().filter(|v: &f64| v.is_finite())?;
+    let lo: f64 = lon.trim().parse().ok().filter(|v: &f64| v.is_finite())?;
+    let degrees = |v: f64| libm::floor(v / 100.0) + libm::fmod(v, 100.0) / 60.0;
+    let (la, lo) = (degrees(la), degrees(lo));
+    if la > 90.0 || lo > 180.0 {
+        return None;
     }
+    Some((if ns == "S" { -la } else { la }, if ew == "W" { -lo } else { lo }))
 }
 
 /// `[IO91SX]` and a comment.
@@ -242,22 +235,28 @@ pub(crate) fn capabilities(ctx: &mut Context, info: &[u8]) -> Option<Data> {
         ctx.error(Code::InvalidCapabilities, "a capabilities report lists at least one token (APRS12c ch. 15)", Some(1));
         return None;
     }
+    // TOKEN or TOKEN=VALUE items, separated by commas; the spaces around them are not part of them.
     let items: Vec<(String, Option<String>)> = body
         .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
         .map(|item| match item.split_once('=') {
-            Some((t, v)) => (t.to_string(), Some(v.to_string())),
+            Some((t, v)) => (t.trim().to_string(), Some(v.trim().to_string())),
             None => (item.to_string(), None),
         })
         .collect();
-    if items.iter().any(|(t, _)| t.is_empty() || t.contains(' ')) {
-        if !ctx.tolerate(
+    // A token with spaces in it is free text: a beacon sent with the wrong data type identifier.
+    let free_text = items.iter().any(|(t, v)| {
+        t.is_empty() || t.chars().any(|c| c <= ' ' || c == '\x7F') || v.as_ref().is_some_and(|v| v.chars().any(|c| c < ' ' || c == '\x7F'))
+    });
+    if free_text
+        && !ctx.tolerate(
             Code::FreeTextCapabilities,
             "a capabilities packet holds free text rather than TOKEN / TOKEN=VALUE items (APRS12c ch. 15)",
             Some(1),
-        ) {
-            return None;
-        }
-        return Some(Data::Capabilities(Capabilities { capabilities: alloc::vec![(String::from(body.trim_start()), None)] }));
+        )
+    {
+        return None;
     }
     Some(Data::Capabilities(Capabilities { capabilities: items }))
 }
@@ -374,13 +373,11 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             if c.capabilities.is_empty() {
                 return Err(EncodeError::new("a capabilities report lists at least one token"));
             }
-            let bad = |t: &str| t.is_empty() || t.contains([',', '=', ' ']) || crate::text::has_line_break(t.as_bytes());
-            if c.capabilities
-                .iter()
-                .any(|(t, v)| bad(t) || v.as_ref().is_some_and(|v| v.contains(',') || crate::text::has_line_break(v.as_bytes())))
-            {
+            let bad_token = |t: &str| t.is_empty() || t.chars().any(|c| c <= ' ' || c == '\x7F' || c == ',' || c == '=');
+            let bad_value = |v: &str| v.chars().any(|c| c < ' ' || c == '\x7F' || c == ',');
+            if c.capabilities.iter().any(|(t, v)| bad_token(t) || v.as_deref().is_some_and(bad_value)) {
                 return Err(EncodeError::new(
-                    "capability tokens and values are text without ',' or line breaks (and tokens without '=' or spaces)",
+                    "capability tokens and values are text without ',' or control characters (and tokens without '=' or spaces)",
                 ));
             }
             out.push(b'<');
