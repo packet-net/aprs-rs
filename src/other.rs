@@ -231,10 +231,6 @@ fn footprint(rest: &[u8]) -> Option<Footprint> {
 /// `TOKEN,TOKEN=VALUE,...`.
 pub(crate) fn capabilities(ctx: &mut Context, info: &[u8]) -> Option<Data> {
     let body = text::decode(ctx, &info[1..], 1)?;
-    if body.is_empty() {
-        ctx.error(Code::InvalidCapabilities, "a capabilities report lists at least one token (APRS12c ch. 15)", Some(1));
-        return None;
-    }
     // TOKEN or TOKEN=VALUE items, separated by commas; the spaces around them are not part of them.
     let items: Vec<(String, Option<String>)> = body
         .split(',')
@@ -245,6 +241,10 @@ pub(crate) fn capabilities(ctx: &mut Context, info: &[u8]) -> Option<Data> {
             None => (item.to_string(), None),
         })
         .collect();
+    if items.is_empty() {
+        ctx.error(Code::InvalidCapabilities, "a capabilities report lists at least one capability (APRS12c ch. 15)", Some(1));
+        return None;
+    }
     // A token with spaces in it is free text: a beacon sent with the wrong data type identifier.
     let free_text = items.iter().any(|(t, v)| {
         t.is_empty() || t.chars().any(|c| c <= ' ' || c == '\x7F') || v.as_ref().is_some_and(|v| v.chars().any(|c| c < ' ' || c == '\x7F'))

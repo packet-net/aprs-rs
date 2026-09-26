@@ -25,7 +25,7 @@ pub enum Data {
     Reject(Reject),
     /// A bulletin or announcement (`BLNn`, `BLNx`, `BLNnGROUP`).
     Bulletin(Bulletin),
-    /// A National Weather Service bulletin (`NWS-`, `SKY`, `CWA`, ...).
+    /// A National Weather Service bulletin, addressed `NWS-` or `NWS_`.
     NwsBulletin(Bulletin),
     /// Telemetry channel names, `PARM.` (APRS12c ch. 13).
     TelemetryNames(TelemetryLabels),
