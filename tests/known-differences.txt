@@ -1,0 +1,23 @@
+# Checks where this crate deliberately differs from the recorded expectation. They run as ignored
+# tests. Every one is an observed (corpus) case, whose expected values record what Packet.Aprs (C#)
+# did, and each looks like a Packet.Aprs quirk rather than a rule: a question for
+# packet-net/aprs-vectors, not something to copy.
+#
+# One defect reported twice. A telemetry metadata message (PARM./UNIT./EQNS./BITS.) whose text is
+# not UTF-8 and whose values are malformed: Packet.Aprs decodes the text once as metadata and again
+# as a plain message, and reports non-utf8-text for each. It is one defect; this crate reports it once.
+lenient::corpus/0707  non-utf8-text reported once, not twice
+lenient::corpus/0786  non-utf8-text reported once, not twice
+lenient::corpus/0864  non-utf8-text reported once, not twice
+lenient::corpus/0904  non-utf8-text reported once, not twice
+lenient::corpus/1223  non-utf8-text reported once, not twice
+#
+# An out-of-range status timestamp written back. 034209z and 034333z have hour 42 and 43. Packet.Aprs
+# refuses to write such a timestamp in a position or object report but writes it in a status report;
+# this crate refuses in all three.
+reencode::corpus/0237  refuses the out-of-range status timestamp 034209z
+reencode::corpus/0402  refuses the out-of-range status timestamp 034333z
+#
+# A telemetry project title longer than the spec allows written back. The title is 24 characters;
+# APRS12c ch. 13 gives it 0-23. Packet.Aprs writes it; this crate refuses (decoding accepts it).
+reencode::corpus/0396  refuses a 24-character BITS project title
