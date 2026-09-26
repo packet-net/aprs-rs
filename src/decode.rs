@@ -78,76 +78,48 @@ pub(crate) fn position_report(ctx: &mut Context, info: &[u8], offset: usize) -> 
     let mut at = 1;
     let mut timestamp = None;
     if matches!(dti, b'/' | b'@') {
-        let (t, next) = position_timestamp(ctx, info, offset)?;
-        timestamp = t;
-        at = next;
-    }
-
-    let decoded = position::decode(ctx, &info[at..], offset + at)?;
-    let mut fields =
-        Positioned { position: decoded.position, symbol: decoded.symbol, compressed: decoded.compressed, ..Positioned::default() };
-    at += decoded.len;
-    if !comment::decode(ctx, &mut fields, decoded.cs, &info[at..], offset + at) {
-        return None;
-    }
-    Some(Data::Position(PositionReport { timestamp, messaging, fields }))
-}
-
-/// The timestamp of a `/` or `@` report, and where the position starts. A timestamp that is not
-/// timestamp-shaped is a tolerated defect: the position is then read straight after the DTI if
-/// one is there (the timestamp is missing), otherwise after the seven bytes (it is garbled).
-fn position_timestamp(ctx: &mut Context, info: &[u8], offset: usize) -> Option<(Option<Timestamp>, usize)> {
-    if let Some(t) = info.get(1..8).and_then(Timestamp::parse) {
+        let Some(t) = info.get(1..8).and_then(Timestamp::parse) else {
+            return bad_timestamp(ctx, info, offset, messaging);
+        };
         if !t.is_valid() && !ctx.tolerate(Code::InvalidTimestamp, "the timestamp is out of range (APRS12c ch. 6)", Some(offset + 1)) {
             return None;
         }
-        return Some((Some(t), 8));
+        timestamp = Some(t);
+        at = 8;
     }
-    if !ctx.tolerate(Code::MalformedTimestamp, "the timestamp is missing or not timestamp-shaped (UAP 5.8)", Some(offset + 1)) {
-        return None;
-    }
-    match timestamp_reading(ctx, info, 1, false) {
-        Reading::Missing => Some((None, 1)),
-        Reading::Garbled => Some((None, 8.min(info.len()))),
-        Reading::Neither => {
-            // Neither reading gives a position: the tolerance cannot help, so it is an error.
-            ctx.diagnostics.pop();
-            ctx.error(
-                Code::MalformedTimestamp,
-                "the timestamp is not timestamp-shaped and no position follows it (UAP 5.8)",
-                Some(offset + 1),
-            );
-            None
+    let fields = body(ctx, info, at, offset)?;
+    Some(Data::Position(PositionReport { timestamp, messaging, fields }))
+}
+
+/// A `/` or `@` report whose timestamp is missing or garbled, a tolerated defect (UAP 5.8). A
+/// position straight after the DTI (the timestamp is missing) is tried first: a timestamp starts
+/// with six digits, so it cannot be mistaken for one. Then seven garbled bytes are skipped.
+fn bad_timestamp(ctx: &mut Context, info: &[u8], offset: usize, messaging: bool) -> Option<Data> {
+    for at in [1, 8] {
+        let mut probe = Context::new(ctx.options);
+        let Some(fields) = body(&mut probe, info, at, offset) else { continue };
+        let why = if at == 1 {
+            "the timestamp is missing: the position follows the data type identifier (UAP 5.8)"
+        } else {
+            "the timestamp is not 6 digits then z, / or h (APRS12c ch. 6); skipped (UAP 5.8)"
+        };
+        if !ctx.tolerate(Code::MalformedTimestamp, why, Some(offset + 1)) {
+            return None;
         }
+        ctx.diagnostics.extend(probe.diagnostics);
+        return Some(Data::Position(PositionReport { timestamp: None, messaging, fields }));
     }
+    ctx.error(Code::MalformedTimestamp, "the timestamp is not timestamp-shaped and no position follows it (UAP 5.8)", Some(offset + 1));
+    None
 }
 
-pub(crate) enum Reading {
-    /// The position starts where the timestamp should.
-    Missing,
-    /// Seven bytes of garbage, then the position.
-    Garbled,
-    /// No position either way.
-    Neither,
-}
-
-/// After a timestamp slot that holds no timestamp: whether the timestamp is missing (the position
-/// starts at `at`) or garbled (it starts seven bytes later). An uncompressed position at `at`
-/// settles it (for an object, an uncompressed latitude is enough); otherwise a position seven
-/// bytes on wins, since garbage often happens to read as a compressed position.
-pub(crate) fn timestamp_reading(ctx: &Context, info: &[u8], at: usize, latitude_is_enough: bool) -> Reading {
-    let valid_at = |i: usize| {
-        let mut trial = ctx.clone();
-        info.get(i..).is_some_and(|rest| position::decode(&mut trial, rest, i).is_some())
-    };
-    let here = if latitude_is_enough { info.get(at..).is_some_and(position::starts_with_latitude) } else { valid_at(at) };
-    if info.get(at).is_some_and(u8::is_ascii_digit) && here {
-        Reading::Missing
-    } else if valid_at(at + 7) {
-        Reading::Garbled
-    } else if valid_at(at) {
-        Reading::Missing
-    } else {
-        Reading::Neither
-    }
+/// The position body shared by position reports, objects and items: the position and symbol,
+/// then the data extension, weather and comment. `offset` is where `info` starts in the field.
+pub(crate) fn body(ctx: &mut Context, info: &[u8], at: usize, offset: usize) -> Option<Positioned> {
+    let rest = info.get(at..).unwrap_or_default();
+    let decoded = position::decode(ctx, rest, offset + at)?;
+    let mut fields =
+        Positioned { position: decoded.position, symbol: decoded.symbol, compressed: decoded.compressed, ..Positioned::default() };
+    let after = at + decoded.len;
+    comment::decode(ctx, &mut fields, decoded.cs, &info[after..], offset + after).then_some(fields)
 }

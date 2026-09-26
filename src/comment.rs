@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 
 use crate::context::Context;
 use crate::position::Cs;
-use crate::weather::{self, Start};
+use crate::weather;
 use crate::{
     AreaColor, AreaObject, AreaShape, Code, CommentTelemetry, Dao, DaoPrecision, DfBearing, DfSignalStrength, NmeaSource, Phg, Positioned,
     Storm, StormKind, Tone, VoiceFrequency, Weather, base91, text,
@@ -28,8 +28,9 @@ fn is_area_symbol(fields: &Positioned) -> bool {
     fields.symbol.table == '\\' && fields.symbol.code == 'l'
 }
 
+/// The hurricane symbol, in either table or with an overlay.
 fn is_storm_symbol(fields: &Positioned) -> bool {
-    fields.symbol.code == '@' && matches!(fields.symbol.table, '/' | '\\')
+    fields.symbol.code == '@'
 }
 
 fn is_signpost_symbol(fields: &Positioned) -> bool {
@@ -42,8 +43,7 @@ fn is_signpost_symbol(fields: &Positioned) -> bool {
 pub(crate) fn decode(ctx: &mut Context, fields: &mut Positioned, cs: Option<Cs>, bytes: &[u8], offset: usize) -> bool {
     let weather_symbol = is_weather_symbol(fields);
     let mut weather = Weather::default();
-    let mut wind_from_cs = false;
-    let mut at = 0;
+    let mut cs_is_wind = false;
 
     if let Some(cs) = cs {
         fields.compression = Some(cs.t);
@@ -55,7 +55,7 @@ pub(crate) fn decode(ctx: &mut Context, fields: &mut Positioned, cs: Option<Cs>,
         } else if weather_symbol {
             weather.wind_direction_degrees = Some((c * 4) as u16);
             weather.wind_speed_mph = Some((libm::pow(1.08, f64::from(s)) - 1.0) * KNOTS_TO_MPH);
-            wind_from_cs = true;
+            cs_is_wind = true;
         } else {
             // The compressed course has no "unknown": 0 is north, reported as 360 (interpretations.md).
             fields.course_degrees = Some(if c == 0 { 360 } else { (c * 4) as u16 });
@@ -63,11 +63,11 @@ pub(crate) fn decode(ctx: &mut Context, fields: &mut Positioned, cs: Option<Cs>,
         }
     }
 
-    // The 7-byte data extension.
-    let mut extension = false;
-    if bytes.len() >= 7 {
-        let ext = &bytes[..7];
-        if weather_symbol && is_course_speed(ext) {
+    if weather_symbol {
+        // A weather station's report is weather, whatever else it holds: the wind, then the fields.
+        let mut at = 0;
+        let mut wind_as_fields = false;
+        if bytes.len() >= 7 && is_course_speed(&bytes[..7]) {
             if fields.compressed
                 && !ctx.tolerate(
                     Code::WindExtensionAfterCompressed,
@@ -77,97 +77,82 @@ pub(crate) fn decode(ctx: &mut Context, fields: &mut Positioned, cs: Option<Cs>,
             {
                 return false;
             }
-            let (dir, speed) = course_speed_values(ext);
-            if !wind_from_cs {
-                match dir {
-                    Some(d) if d > 360 => {
-                        if !ctx.tolerate(Code::OutOfRangeValue, "a wind direction over 360 degrees was dropped", Some(offset)) {
-                            return false;
-                        }
+            // The extension replaces any wind in the cs bytes, unknown included (interpretations.md).
+            let (dir, speed) = course_speed_values(&bytes[..7]);
+            weather.wind_direction_degrees = match dir {
+                Some(d) if d > 360 => {
+                    if !ctx.tolerate(Code::OutOfRangeValue, "a wind direction over 360 degrees was dropped", Some(offset)) {
+                        return false;
                     }
-                    d => weather.wind_direction_degrees = d.map(|d| d as u16),
+                    None
                 }
-                weather.wind_speed_mph = speed.map(f64::from);
-                // The wind will be written into the cs bytes, under the default type byte.
-                if fields.compressed
-                    && fields.compression.is_none()
-                    && (weather.wind_direction_degrees.is_some() || weather.wind_speed_mph.is_some())
-                {
-                    fields.compression = Some(crate::CompressionType {
-                        fix: crate::GpsFix::Current,
-                        source: NmeaSource::Other,
-                        origin: crate::CompressionOrigin::Software,
-                    });
-                }
-            }
+                d => d.map(|d| d as u16),
+            };
+            weather.wind_speed_mph = speed.map(f64::from);
             at = 7;
-            extension = true;
-        } else if !fields.compressed && !weather_symbol {
-            match extension_at_start(ctx, fields, bytes, offset) {
-                None => return false,
-                Some(n) => {
-                    at = n;
-                    extension = n > 0;
-                }
+        } else if !cs_is_wind && bytes.len() >= 4 && bytes[0] == b'c' {
+            // c/s fields where the extension (or, compressed, the cs bytes) should carry the wind.
+            if !ctx.tolerate(Code::WindFieldsInsteadOfExtension, "wind sent as c/s fields instead of the DDD/SSS extension", Some(offset)) {
+                return false;
             }
-        }
-    }
-
-    if weather_symbol {
-        // A weather station's report is weather, whatever else it holds.
-        let start = if extension || wind_from_cs { Start::WindKnown } else { Start::WindMissing };
-        let Some(run) = weather::fields(ctx, &bytes[at..], offset + at, &mut weather, start) else {
-            return false;
-        };
-        at += run.len;
-        // A compressed position carries the wind in its cs bytes (or says it has none).
-        let has_wind = fields.compressed || extension || run.has_wind;
-        if !has_wind
-            && !ctx.tolerate(Code::IncompleteWeather, "the weather report has no wind direction and speed (APRS12c ch. 12)", Some(offset))
-        {
-            return false;
-        }
-        let has_gust_and_temperature = run.has_gust && run.has_temperature;
-        if !has_gust_and_temperature
+            wind_as_fields = true;
+        } else if !fields.compressed
             && !ctx.tolerate(
                 Code::IncompleteWeather,
-                "the weather report lacks the gust or temperature field (APRS12c ch. 12)",
+                "the weather report has no wind direction/speed extension (APRS12c ch. 12)",
                 Some(offset),
             )
         {
             return false;
         }
+        let Some(len) = weather::fields(ctx, &bytes[at..], offset + at, &mut weather, false, wind_as_fields) else {
+            return false;
+        };
+        at += len;
+        // Wind read from the bytes after a compressed position is written back into its cs bytes,
+        // under the default type byte.
+        if fields.compressed
+            && !cs_is_wind
+            && fields.compression.is_none()
+            && (weather.wind_direction_degrees.is_some() || weather.wind_speed_mph.is_some())
+        {
+            fields.compression = Some(crate::CompressionType {
+                fix: crate::GpsFix::Current,
+                source: NmeaSource::Other,
+                origin: crate::CompressionOrigin::Software,
+            });
+        }
         fields.weather = Some(weather);
         return weather_tail(ctx, fields, &bytes[at..], offset + at);
     }
 
-    tail(ctx, fields, &bytes[at..], offset + at, true)
+    let mut at = 0;
+    if !fields.compressed {
+        match extension_at_start(ctx, fields, bytes, offset) {
+            None => return false,
+            Some(n) => at = n,
+        }
+    }
+    tail(ctx, fields, &bytes[at..], offset + at)
 }
 
-/// After a position's weather data: telemetry and a `!DAO!` are lifted out, then what is left is
-/// the software and unit, or text that a weather report should not have.
+/// After a position's weather data: the software and unit, or else text that a weather report
+/// should not have, from which telemetry and a `!DAO!` are still lifted.
 fn weather_tail(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], offset: usize) -> bool {
+    if bytes.is_empty() || weather::software_and_unit(bytes, fields.weather.get_or_insert_with(Weather::default)) {
+        return true;
+    }
     let mut c: Vec<u8> = bytes.to_vec();
     if !lift_telemetry_and_dao(ctx, fields, &mut c, offset) {
         return false;
     }
-    let weather = fields.weather.get_or_insert_with(Weather::default);
-    if weather::software_and_unit(&c, weather) || c.is_empty() {
+    if c.is_empty() {
         return true;
     }
     if !ctx.tolerate(Code::WeatherComment, "text after the weather data; a weather report has no comment (UAP 2.7.1)", Some(offset)) {
         return false;
     }
-    if matches!(c.first(), Some(b' ' | b'/')) {
-        c.remove(0);
-    }
-    match text::decode(ctx, &c, offset) {
-        Some(comment) => {
-            fields.comment = comment;
-            true
-        }
-        None => false,
-    }
+    finish(ctx, fields, c, offset)
 }
 
 /// Lifts base-91 telemetry and a `!DAO!` out of `c`. The telemetry block is located first, so a
@@ -193,11 +178,15 @@ fn lift_telemetry_and_dao(ctx: &mut Context, fields: &mut Positioned, c: &mut Ve
     true
 }
 
-/// The comment after any extension and weather: lifts out altitude, telemetry, `!DAO!`, a late
-/// data extension (when `late_extension`), a leading delimiter, a voice frequency and signpost
-/// text, and keeps the rest as the comment.
-pub(crate) fn tail(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], offset: usize, late_extension: bool) -> bool {
+/// The comment after any data extension: lifts out telemetry and a `!DAO!` (from the end), then an
+/// altitude, signpost or corridor braces, a data extension found later in the text, and a voice
+/// frequency at the start, in the order that keeps one from being taken for another; the rest,
+/// less one leading delimiter, is the comment.
+pub(crate) fn tail(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], offset: usize) -> bool {
     let mut c: Vec<u8> = bytes.to_vec();
+    if !lift_telemetry_and_dao(ctx, fields, &mut c, offset) {
+        return false;
+    }
 
     // A /A= altitude is read wherever it is, and wins over a compressed or Mic-E one.
     if let Some((i, feet)) = find_altitude(&c) {
@@ -205,50 +194,84 @@ pub(crate) fn tail(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], off
         c.drain(i..i + 9);
     }
 
-    if !lift_telemetry_and_dao(ctx, fields, &mut c, offset) {
-        return false;
+    braces(fields, &mut c);
+
+    if fields.phg.is_none() && fields.range_miles.is_none() && fields.dfs.is_none() {
+        late_extension(ctx, fields, &mut c, offset);
     }
 
-    if late_extension {
-        if let Some((i, len)) = find_late_extension(fields, &c) {
-            if ctx.allows(
-                Code::DataExtensionInComment,
-                "a data extension found later in the comment; the spec puts it straight after the symbol (UAP 5.15)",
-                Some(offset + i),
-            ) {
-                // Read it again into the fields, now that it is known to be wanted.
-                let ext = c[i..i + len].to_vec();
-                read_late_extension(fields, &ext);
-                c.drain(i..i + len);
-            }
+    // A voice frequency at the start, after at most one delimiter, and one space after it.
+    let start = usize::from(matches!(c.first(), Some(b' ' | b'/')));
+    if let Some((f, len)) = frequency(&c[start..]) {
+        fields.frequency = Some(f);
+        let mut end = start + len;
+        if c.get(end) == Some(&b' ') {
+            end += 1;
         }
+        c.drain(..end);
     }
 
-    // One leading delimiter, a space or `/`, is not part of the text (APRS12c ch. 18).
+    finish(ctx, fields, c, offset)
+}
+
+/// One leading delimiter, a space or `/`, is not part of the text (APRS12c ch. 18); the rest is the comment.
+fn finish(ctx: &mut Context, fields: &mut Positioned, mut c: Vec<u8>, offset: usize) -> bool {
     if matches!(c.first(), Some(b' ' | b'/')) {
         c.remove(0);
     }
-
-    if let Some((f, len)) = frequency(&c) {
-        fields.frequency = Some(f);
-        c.drain(..len);
-    }
-
-    if is_signpost_symbol(fields) && c.first() == Some(&b'{') {
-        if let Some(end) = c.iter().take(5).position(|&b| b == b'}') {
-            if (2..=4).contains(&end) {
-                fields.signpost = Some(String::from(core::str::from_utf8(&c[1..end]).unwrap_or_default()));
-                c.drain(..=end);
-            }
-        }
-    }
-
     match text::decode(ctx, &c, offset) {
         Some(comment) => {
             fields.comment = comment;
             true
         }
         None => false,
+    }
+}
+
+/// Signpost text `{ttt}` on the `\m` symbol, or a corridor width `{www}` on a line area object:
+/// the first braces in the comment, holding 1-3 characters.
+fn braces(fields: &mut Positioned, c: &mut Vec<u8>) {
+    let signpost = is_signpost_symbol(fields);
+    let corridor = fields.area.is_some_and(|a| matches!(a.shape, AreaShape::LineDownRight | AreaShape::LineDownLeft));
+    if !signpost && !corridor {
+        return;
+    }
+    let Some(open) = c.iter().position(|&b| b == b'{') else { return };
+    let Some(close) = c[open..].iter().position(|&b| b == b'}').map(|i| open + i) else { return };
+    let inner = &c[open + 1..close];
+    if !(1..=3).contains(&inner.len()) {
+        return;
+    }
+    if signpost && text::is_printable_ascii(inner) {
+        fields.signpost = Some(String::from(core::str::from_utf8(inner).unwrap_or_default()));
+    } else if corridor && text::all_digits(inner) {
+        let width = text::digits(inner) as u16;
+        if let Some(area) = fields.area.as_mut() {
+            area.corridor_width_miles = Some(width);
+        }
+    } else {
+        return;
+    }
+    c.drain(open..=close);
+}
+
+/// A PHG, RNG or DFS extension after other comment text instead of straight after the symbol:
+/// the first `PHG`, else the first `RNG`, else the first `DFS`, if that one is well formed.
+/// Strictly that is free text (UAP 5.15); recognising it is an extra reading the options allow.
+fn late_extension(ctx: &mut Context, fields: &mut Positioned, c: &mut Vec<u8>, offset: usize) {
+    for tag in [&b"PHG"[..], b"RNG", b"DFS"] {
+        let Some(at) = c.windows(3).position(|w| w == tag) else { continue };
+        let mut found = Positioned::default();
+        let Some(len) = station_extension(&mut found, &c[at..]) else { continue };
+        if ctx.allows(
+            Code::DataExtensionInComment,
+            "a data extension found later in the comment; the spec puts it straight after the symbol (UAP 5.15)",
+            Some(offset + at),
+        ) {
+            (fields.phg, fields.range_miles, fields.dfs) = (found.phg, found.range_miles, found.dfs);
+            c.drain(at..at + len);
+        }
+        return;
     }
 }
 
@@ -265,12 +288,12 @@ fn course_speed_values(ext: &[u8]) -> (Option<u32>, Option<u32>) {
 /// Reads a data extension at the start of an uncompressed position's comment. The number of bytes
 /// used, or `None` when a defect was not tolerated.
 fn extension_at_start(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], offset: usize) -> Option<usize> {
-    let ext = &bytes[..7];
+    let Some(ext) = bytes.get(..7) else { return Some(0) };
     // An area object's Tyy/Cxx looks like course/speed; the area symbol says which it is.
     if is_area_symbol(fields) {
-        if let Some((area, len)) = area(bytes) {
+        if let Some(area) = area(ext) {
             fields.area = Some(area);
-            return Some(len);
+            return Some(7);
         }
     }
     if is_course_speed(ext) {
@@ -285,39 +308,40 @@ fn extension_at_start(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], 
             None => {}
         }
         fields.speed_knots = speed.map(f64::from);
-        let mut at = 7;
         if is_df_symbol(fields) {
-            if let Some(b) = df_bearing(&bytes[7..]) {
+            if let Some(b) = bytes.get(7..15).and_then(df_bearing) {
                 fields.df_bearing = Some(b);
-                at += 8;
+                return Some(15);
             }
-        }
-        if is_storm_symbol(fields) {
-            if let Some((storm, len)) = storm(&bytes[at..]) {
+        } else if is_storm_symbol(fields) {
+            if let Some((storm, len)) = storm(&bytes[7..]) {
                 fields.storm = Some(storm);
-                at += len;
+                return Some(7 + len);
             }
         }
-        return Some(at);
-    }
-    if let Some((phg, len)) = phg(bytes) {
-        fields.phg = Some(phg);
-        return Some(len);
-    }
-    if ext.starts_with(b"RNG") && text::all_digits(&ext[3..7]) {
-        fields.range_miles = Some(f64::from(text::digits(&ext[3..7])));
         return Some(7);
     }
-    if ext.starts_with(b"DFS") && text::all_digits(&ext[3..7]) {
-        fields.dfs =
-            Some(DfSignalStrength { strength: ext[3] - b'0', height: ext[4] - b'0', gain: ext[5] - b'0', directivity: ext[6] - b'0' });
-        return Some(7);
-    }
-    Some(0)
+    Some(station_extension(fields, bytes).unwrap_or(0))
 }
 
-/// A PHG, RNG or DFS extension at the start of a Mic-E status text; its length.
+/// A data extension at the start of a Mic-E status text (PHG, RNG, DFS, or an area on the area
+/// symbol; not course and speed, which Mic-E carries itself); its length.
 pub(crate) fn mic_e_extension(fields: &mut Positioned, bytes: &[u8]) -> Option<usize> {
+    let ext = bytes.get(..7)?;
+    if is_course_speed(ext) {
+        return None;
+    }
+    if is_area_symbol(fields) {
+        if let Some(area) = area(ext) {
+            fields.area = Some(area);
+            return Some(7);
+        }
+    }
+    station_extension(fields, bytes)
+}
+
+/// PHG, RNG or DFS at the start of `bytes`, read into `fields`; its length.
+fn station_extension(fields: &mut Positioned, bytes: &[u8]) -> Option<usize> {
     if let Some((p, len)) = phg(bytes) {
         fields.phg = Some(p);
         return Some(len);
@@ -327,26 +351,24 @@ pub(crate) fn mic_e_extension(fields: &mut Positioned, bytes: &[u8]) -> Option<u
         fields.range_miles = Some(f64::from(text::digits(&ext[3..7])));
         return Some(7);
     }
-    if ext.starts_with(b"DFS") && text::all_digits(&ext[3..7]) {
-        fields.dfs =
-            Some(DfSignalStrength { strength: ext[3] - b'0', height: ext[4] - b'0', gain: ext[5] - b'0', directivity: ext[6] - b'0' });
-        return Some(7);
-    }
-    None
+    fields.dfs = Some(dfs(ext)?);
+    Some(7)
+}
+
+/// PHG and DFS codes: digits, except the height, which goes on past 9 through the ASCII table
+/// (`:` is 10, 2^10 x 10 feet), up to `~`.
+fn is_phg_codes(ext: &[u8]) -> bool {
+    ext[3].is_ascii_digit() && (b'0'..=b'~').contains(&ext[4]) && ext[5].is_ascii_digit() && ext[6].is_ascii_digit()
 }
 
 /// `PHGphgd`, or PHGR `PHGphgdR/`.
 fn phg(bytes: &[u8]) -> Option<(Phg, usize)> {
-    if bytes.len() < 7 || !bytes.starts_with(b"PHG") || !text::all_digits(&bytes[3..7]) {
+    let ext = bytes.get(..7)?;
+    if !ext.starts_with(b"PHG") || !is_phg_codes(ext) {
         return None;
     }
-    let mut phg = Phg {
-        power: bytes[3] - b'0',
-        height: bytes[4] - b'0',
-        gain: bytes[5] - b'0',
-        directivity: bytes[6] - b'0',
-        beacons_per_hour: None,
-    };
+    let mut phg =
+        Phg { power: ext[3] - b'0', height: ext[4] - b'0', gain: ext[5] - b'0', directivity: ext[6] - b'0', beacons_per_hour: None };
     let mut len = 7;
     if bytes.len() >= 9 && bytes[8] == b'/' {
         if let Some(rate) = beacon_rate(bytes[7]) {
@@ -355,6 +377,16 @@ fn phg(bytes: &[u8]) -> Option<(Phg, usize)> {
         }
     }
     Some((phg, len))
+}
+
+/// `DFSshgd`.
+fn dfs(ext: &[u8]) -> Option<DfSignalStrength> {
+    (ext.starts_with(b"DFS") && is_phg_codes(ext)).then(|| DfSignalStrength {
+        strength: ext[3] - b'0',
+        height: ext[4] - b'0',
+        gain: ext[5] - b'0',
+        directivity: ext[6] - b'0',
+    })
 }
 
 /// PHGR beacon rate: 1-9, then A = 10 up to Z = 35 per hour.
@@ -377,6 +409,9 @@ pub(crate) fn beacon_rate_char(rate: u8) -> Option<u8> {
 /// `/BRG/NRQ` after the course and speed of a DF report.
 fn df_bearing(bytes: &[u8]) -> Option<DfBearing> {
     if bytes.len() < 8 || bytes[0] != b'/' || bytes[4] != b'/' || !text::all_digits(&bytes[1..4]) || !text::all_digits(&bytes[5..8]) {
+        return None;
+    }
+    if text::digits(&bytes[1..4]) > 360 {
         return None;
     }
     Some(DfBearing {
@@ -435,9 +470,9 @@ fn storm(bytes: &[u8]) -> Option<(Storm, usize)> {
     ))
 }
 
-/// `TyyCCxx` (CC is `/0`-`/9` or `10`-`15`), then `{www}` for a line.
-fn area(bytes: &[u8]) -> Option<(AreaObject, usize)> {
-    let b = bytes.get(..7)?;
+/// `TyyCCxx` (CC is `/0`-`/9` or `10`-`15`). A line's corridor width `{www}` is read with the
+/// comment's braces.
+fn area(b: &[u8]) -> Option<AreaObject> {
     if !b[0].is_ascii_digit() || !text::all_digits(&b[1..3]) || !text::all_digits(&b[5..7]) {
         return None;
     }
@@ -458,25 +493,13 @@ fn area(bytes: &[u8]) -> Option<(AreaObject, usize)> {
         AreaShape::FilledTriangle,
         AreaShape::FilledBox,
     ][usize::from(b[0] - b'0')];
-    let mut area = AreaObject {
+    Some(AreaObject {
         shape,
         lat_offset: (text::digits(&b[1..3])) as u8,
         color: AREA_COLORS[usize::from(color)],
         lon_offset: text::digits(&b[5..7]) as u8,
         corridor_width_miles: None,
-    };
-    let mut len = 7;
-    if let Some(rest) = bytes.get(7..) {
-        if rest.first() == Some(&b'{') {
-            if let Some(end) = rest.iter().position(|&x| x == b'}') {
-                if (2..=4).contains(&end) && text::all_digits(&rest[1..end]) {
-                    area.corridor_width_miles = Some(text::digits(&rest[1..end]) as u16);
-                    len += end + 1;
-                }
-            }
-        }
-    }
-    Some((area, len))
+    })
 }
 
 pub(crate) const AREA_COLORS: [AreaColor; 16] = [
@@ -532,91 +555,59 @@ fn find_telemetry(c: &[u8]) -> Option<(core::ops::Range<usize>, CommentTelemetry
     None
 }
 
+/// A `!DAO!` and the extra minutes of latitude and longitude it adds.
 #[derive(Clone, Copy)]
 struct FoundDao {
-    datum: u8,
-    lat: u8,
-    lon: u8,
+    dao: Dao,
+    lat: f64,
+    lon: f64,
 }
 
-/// `!DAO!` outside the telemetry block.
+/// The last `!DAO!` outside the telemetry block: `!Wdd!` (an upper-case datum, a digit each:
+/// thousandths of a minute), `!wBB!` (a lower-case datum, a base-91 character each: v/91
+/// hundredths of a minute) or `!D  !` (datum only).
 fn find_dao(c: &[u8], telemetry: Option<core::ops::Range<usize>>) -> Option<(core::ops::Range<usize>, FoundDao)> {
-    (0..c.len().saturating_sub(4)).find_map(|i| {
-        if telemetry.as_ref().is_some_and(|t| t.contains(&i) || t.contains(&(i + 4))) {
+    (0..c.len().saturating_sub(4)).rev().find_map(|i| {
+        if telemetry.as_ref().is_some_and(|t| i + 4 >= t.start && i < t.end) {
             return None;
         }
         let w = &c[i..i + 5];
-        if w[0] != b'!' || w[4] != b'!' || !w[1].is_ascii_alphabetic() {
+        if w[0] != b'!' || w[4] != b'!' {
             return None;
         }
-        let ok = if w[1].is_ascii_uppercase() {
-            (w[2].is_ascii_digit() || w[2] == b' ') && (w[3].is_ascii_digit() || w[3] == b' ')
+        let (d, a, o) = (w[1], w[2], w[3]);
+        let found = if a == b' ' && o == b' ' && d.is_ascii_alphanumeric() {
+            FoundDao { dao: Dao { datum: d.to_ascii_uppercase() as char, precision: DaoPrecision::None }, lat: 0.0, lon: 0.0 }
+        } else if d.is_ascii_uppercase() && a.is_ascii_digit() && o.is_ascii_digit() {
+            let extra = |b: u8| f64::from(b - b'0') * 0.001;
+            FoundDao { dao: Dao { datum: d as char, precision: DaoPrecision::Thousandths }, lat: extra(a), lon: extra(o) }
+        } else if d.is_ascii_lowercase() && base91::is_digit(a) && base91::is_digit(o) {
+            let extra = |b: u8| f64::from(b - 33) / 91.0 * 0.01;
+            FoundDao { dao: Dao { datum: d.to_ascii_uppercase() as char, precision: DaoPrecision::Base91 }, lat: extra(a), lon: extra(o) }
         } else {
-            (base91::is_digit(w[2]) || w[2] == b' ') && (base91::is_digit(w[3]) || w[3] == b' ')
+            return None;
         };
-        ok.then_some((i..i + 5, FoundDao { datum: w[1], lat: w[2], lon: w[3] }))
+        Some((i..i + 5, found))
     })
 }
 
-fn apply_dao(ctx: &mut Context, fields: &mut Positioned, dao: FoundDao, offset: usize) -> bool {
-    let precision = if dao.lat == b' ' && dao.lon == b' ' {
-        DaoPrecision::None
-    } else if dao.datum.is_ascii_uppercase() {
-        DaoPrecision::Thousandths
-    } else {
-        DaoPrecision::Base91
-    };
-    fields.dao = Some(Dao { datum: dao.datum.to_ascii_uppercase() as char, precision });
-    if precision == DaoPrecision::None || fields.compressed {
+fn apply_dao(ctx: &mut Context, fields: &mut Positioned, found: FoundDao, offset: usize) -> bool {
+    fields.dao = Some(found.dao);
+    if found.dao.precision == DaoPrecision::None || fields.compressed {
         return true;
     }
     if fields.position.ambiguity > 0 {
         // Extra precision on an ambiguous position contradicts it; the position stays as it was.
         return ctx.tolerate(Code::DaoWithAmbiguity, "a !DAO! adds precision to an ambiguous position", Some(offset));
     }
-    let extra = |b: u8| -> f64 {
-        match precision {
-            DaoPrecision::Thousandths if b.is_ascii_digit() => f64::from(b - b'0') / 1000.0,
-            DaoPrecision::Base91 if base91::is_digit(b) => f64::from(b - 33) / 91.0 / 100.0,
-            _ => 0.0,
-        }
-    };
-    let (lat_extra, lon_extra) = (extra(dao.lat) / 60.0, extra(dao.lon) / 60.0);
     let p = &mut fields.position;
-    p.latitude += if p.latitude.is_sign_negative() { -lat_extra } else { lat_extra };
-    p.longitude += if p.longitude.is_sign_negative() { -lon_extra } else { lon_extra };
+    p.latitude += if p.latitude.is_sign_negative() { -found.lat / 60.0 } else { found.lat / 60.0 };
+    p.longitude += if p.longitude.is_sign_negative() { -found.lon / 60.0 } else { found.lon / 60.0 };
     true
 }
 
-/// A PHG, RNG or DFS extension later in the comment: its position and length.
-fn find_late_extension(fields: &Positioned, c: &[u8]) -> Option<(usize, usize)> {
-    (0..c.len().saturating_sub(6)).find_map(|i| {
-        let w = &c[i..];
-        if fields.phg.is_none() {
-            if let Some((_, len)) = phg(w) {
-                return Some((i, len));
-            }
-        }
-        let rng = w.starts_with(b"RNG") && fields.range_miles.is_none();
-        let dfs = w.starts_with(b"DFS") && fields.dfs.is_none();
-        ((rng || dfs) && text::all_digits(&w[3..7])).then_some((i, 7))
-    })
-}
-
-fn read_late_extension(fields: &mut Positioned, ext: &[u8]) {
-    if let Some((phg, _)) = phg(ext) {
-        fields.phg = Some(phg);
-    } else if ext.starts_with(b"RNG") {
-        fields.range_miles = Some(f64::from(text::digits(&ext[3..7])));
-    } else if ext.starts_with(b"DFS") {
-        fields.dfs =
-            Some(DfSignalStrength { strength: ext[3] - b'0', height: ext[4] - b'0', gain: ext[5] - b'0', directivity: ext[6] - b'0' });
-    }
-}
-
-/// An APRS 1.2 voice frequency at the start of the comment: `FFF.FFFMHz` or `FFF.FF MHz`, then
-/// optional tone, offset and range fields, each after a space. Its length, including one space
-/// after it.
+/// An APRS 1.2 voice frequency at the start of `c`: `FFF.FFFMHz` or `FFF.FF MHz`, then optional
+/// tone, offset and range fields, each after a space. Its length.
 pub(crate) fn frequency(c: &[u8]) -> Option<(VoiceFrequency, usize)> {
     let head = c.get(..10)?;
     let mhz_ok = |b: &[u8]| b.eq_ignore_ascii_case(b"MHz");
@@ -656,6 +647,7 @@ pub(crate) fn frequency(c: &[u8]) -> Option<(VoiceFrequency, usize)> {
     if let Some(b) = field(at) {
         let tone = match b {
             b"Toff" | b"toff" => Some((Tone::Off, None)),
+            b"1750" | b"l750" => Some((Tone::ToneBurst, None)),
             [t @ (b'T' | b't' | b'C' | b'c' | b'D' | b'd'), rest @ ..] if text::all_digits(rest) => {
                 let kind = match t.to_ascii_uppercase() {
                     b'T' => Tone::Tone,
@@ -686,17 +678,6 @@ pub(crate) fn frequency(c: &[u8]) -> Option<(VoiceFrequency, usize)> {
             f.range_km = b[3] == b'k';
             at += 5;
         }
-    }
-    finish(c, f, at)
-}
-
-/// The text after a frequency starts past any spaces and one '/' delimiter.
-fn finish(c: &[u8], f: VoiceFrequency, mut at: usize) -> Option<(VoiceFrequency, usize)> {
-    while c.get(at) == Some(&b' ') {
-        at += 1;
-    }
-    if c.get(at) == Some(&b'/') {
-        at += 1;
     }
     Some((f, at))
 }

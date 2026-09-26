@@ -136,6 +136,11 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
         }
         position::encode_compressed(out, &f.position, f.symbol)?;
         altitude_in_cs = compressed_cs(out, f)?;
+        if f.weather.is_some() && f.altitude_feet.is_some() && !altitude_in_cs {
+            return Err(EncodeError::new(
+                "a weather report has no comment, so an altitude the cs bytes cannot carry exactly has nowhere to go",
+            ));
+        }
     } else {
         let count = [
             f.course_degrees.is_some() || f.speed_knots.is_some(),
@@ -246,7 +251,7 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
     ))
 }
 
-/// Writes the compressed cs and type bytes. `true` when the altitude went into them.
+/// Writes the compressed cs and type bytes. `true` when they carry the altitude exactly.
 fn compressed_cs(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError> {
     let weather_wind = f.weather.as_ref().filter(|w| w.wind_direction_degrees.is_some() || w.wind_speed_mph.is_some());
     let t =
@@ -261,7 +266,10 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError>
         if cs > 90 * 91 + 90 {
             return Err(EncodeError::new("the altitude is too high for a compressed position"));
         }
-        ((cs / 91) as u8, (cs % 91) as u8, true)
+        // The cs bytes carry altitude only to 0.2%; one they cannot carry exactly is also written
+        // as /A=, which the decoder prefers.
+        let exact = (libm::pow(1.002, cs as f64) - feet).abs() <= 1e-9 * feet;
+        ((cs / 91) as u8, (cs % 91) as u8, exact)
     } else if let Some(w) = weather_wind {
         let dir = w.wind_direction_degrees.unwrap_or(0);
         let knots = w.wind_speed_mph.unwrap_or(0.0) / KNOTS_TO_MPH;
@@ -461,6 +469,10 @@ pub(crate) fn frequency(out: &mut Vec<u8>, f: &crate::VoiceFrequency) -> Result<
         let letter = match tone {
             Tone::Off => {
                 out.extend_from_slice(if f.narrow { b"toff" } else { b"Toff" });
+                None
+            }
+            Tone::ToneBurst => {
+                out.extend_from_slice(if f.narrow { b"l750" } else { b"1750" });
                 None
             }
             Tone::Tone => Some(b'T'),

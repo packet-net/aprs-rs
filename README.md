@@ -162,9 +162,11 @@ Values are in the units APRS sends (knots, feet, mph, degrees Fahrenheit), with 
 
 ## Conformance
 
-`cargo test` runs the whole [packet-net/aprs-vectors](https://github.com/packet-net/aprs-vectors) suite (a git submodule at `vectors/`): every example in APRS12c and *Understanding APRS Packets*, every tolerable defect, the encoder's rules, and 1,395 real APRS-IS packets. Each case is checked lenient, strict, with only its own tolerance switched off, re-encoded, and read back: 6,997 checks, all passing. A deliberate difference from a recorded expectation would be listed, with its reason, in [`tests/known-differences.txt`](https://github.com/packet-net/aprs-rs/blob/main/tests/known-differences.txt); there are none.
+`cargo test` runs the whole [packet-net/aprs-vectors](https://github.com/packet-net/aprs-vectors) suite (a git submodule at `vectors/`): every example in APRS12c and *Understanding APRS Packets*, every tolerable defect, the encoder's rules, 1,395 real APRS-IS packets, and 40 more that settled a disagreement between this crate and the C# implementation. Each case is checked lenient, strict, with only its own tolerance switched off, re-encoded, and read back: 7,155 checks, all passing. A deliberate difference from a recorded expectation would be listed, with its reason, in [`tests/known-differences.txt`](https://github.com/packet-net/aprs-rs/blob/main/tests/known-differences.txt); there are none.
 
 This crate was written from the spec, the vectors and their [interpretations](https://github.com/packet-net/aprs-vectors/blob/main/interpretations.md), not by porting the C# implementation. Doing so found three places where the vectors had recorded a C# quirk rather than a rule; the C# was fixed and the cases refreshed.
+
+The two implementations have also been run over the same 6.9 million APRS-IS packets and compared packet by packet, with [`examples/diff_dump.rs`](https://github.com/packet-net/aprs-rs/blob/main/examples/diff_dump.rs) and the vectors' `tools/compare.py`. They now decode every one of them the same way, leniently and strictly. Where they differ is only in how some data is re-encoded: both write something that decodes back to the same data, but only one writes the original bytes.
 
 ## `no_std`
 

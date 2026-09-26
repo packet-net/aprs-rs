@@ -47,24 +47,12 @@ pub(crate) fn decode(ctx: &mut Context, bytes: &[u8], offset: usize) -> Option<D
     }
 }
 
-/// Whether `bytes` starts with a well-formed uncompressed latitude (`DDMM.hhN`, ambiguity allowed),
-/// whatever follows it.
-pub(crate) fn starts_with_latitude(bytes: &[u8]) -> bool {
-    let mut ctx = Context::new(crate::ParseOptions::LENIENT);
-    match bytes.get(..19) {
-        Some(_) => {
-            uncompressed(&mut ctx, bytes, 0);
-            !ctx.diagnostics.iter().any(|d| matches!(d.code, Code::InvalidLatitude | Code::Truncated | Code::InvalidPosition))
-        }
-        None => false,
-    }
-}
-
 fn uncompressed(ctx: &mut Context, bytes: &[u8], offset: usize) -> Option<Decoded> {
     if bytes.len() < 19 {
         ctx.error(Code::Truncated, "an uncompressed position needs 19 bytes: latitude, table, longitude, symbol", Some(offset));
         return None;
     }
+    // Checked in the order the bytes come: latitude, table, longitude, symbol.
     let lat = &bytes[0..8];
     let lon = &bytes[9..18];
 
@@ -74,12 +62,26 @@ fn uncompressed(ctx: &mut Context, bytes: &[u8], offset: usize) -> Option<Decode
     while (ambiguity as usize) < LAT_DIGITS.len() && lat[LAT_DIGITS[ambiguity as usize]] == b' ' {
         ambiguity += 1;
     }
+    let lat_ignored = &LAT_DIGITS[..ambiguity as usize];
     let lat_ok = lat[4] == b'.'
         && lat[0].is_ascii_digit()
         && lat[1].is_ascii_digit()
-        && [2, 3, 5, 6].iter().all(|&i| lat[i].is_ascii_digit() || (lat[i] == b' ' && LAT_DIGITS[..ambiguity as usize].contains(&i)));
+        && [2, 3, 5, 6].iter().all(|&i| lat[i].is_ascii_digit() || lat_ignored.contains(&i));
     if !lat_ok {
         ctx.error(Code::InvalidLatitude, "the latitude is not DDMM.hh with N or S (APRS12c ch. 6)", Some(offset));
+        return None;
+    }
+    // An ambiguous position is the centre of the area it covers (interpretations.md).
+    let half_box = [0.0, 0.05, 0.5, 5.0, 30.0][ambiguity as usize];
+    let digit = |b: &[u8], i: usize, ignored: &[usize]| if ignored.contains(&i) || b[i] == b' ' { 0.0 } else { f64::from(b[i] - b'0') };
+    let lat_deg = digit(lat, 0, &[]) * 10.0 + digit(lat, 1, &[]);
+    let lat_min = digit(lat, 2, lat_ignored) * 10.0
+        + digit(lat, 3, lat_ignored)
+        + digit(lat, 5, lat_ignored) / 10.0
+        + digit(lat, 6, lat_ignored) / 100.0
+        + half_box;
+    if lat_min >= 60.0 {
+        ctx.error(Code::InvalidLatitude, "the latitude minutes are 60 or more", Some(offset));
         return None;
     }
     let north = match lat[7] {
@@ -96,8 +98,13 @@ fn uncompressed(ctx: &mut Context, bytes: &[u8], offset: usize) -> Option<Decode
             return None;
         }
     };
+    let latitude = lat_deg + lat_min / 60.0;
+    if latitude > 90.0 {
+        ctx.error(Code::InvalidLatitude, "the latitude is beyond 90 degrees", Some(offset));
+        return None;
+    }
 
-    // The symbol table sits between latitude and longitude, and is checked in that order.
+    // The symbol table sits between latitude and longitude.
     let table_ok = matches!(bytes[8], b'/' | b'\\' | b'0'..=b'9' | b'A'..=b'Z');
     if !table_ok {
         ctx.error(Code::InvalidSymbolTable, "the symbol table identifier is not /, \\, 0-9 or A-Z", Some(offset + 8));
@@ -114,6 +121,15 @@ fn uncompressed(ctx: &mut Context, bytes: &[u8], offset: usize) -> Option<Decode
         ctx.error(Code::InvalidLongitude, "the longitude is not DDDMM.hh with E or W (APRS12c ch. 6)", Some(offset + 9));
         return None;
     }
+    let lon_deg = digit(lon, 0, &[]) * 100.0 + digit(lon, 1, &[]) * 10.0 + digit(lon, 2, &[]);
+    let lon_min = digit(lon, 3, lon_ignored) * 10.0
+        + digit(lon, 4, lon_ignored)
+        + digit(lon, 6, lon_ignored) / 10.0
+        + digit(lon, 7, lon_ignored) / 100.0;
+    if lon_min >= 60.0 {
+        ctx.error(Code::InvalidLongitude, "the longitude minutes are 60 or more", Some(offset + 9));
+        return None;
+    }
     let east = match lon[8] {
         b'E' => true,
         b'W' => false,
@@ -128,32 +144,11 @@ fn uncompressed(ctx: &mut Context, bytes: &[u8], offset: usize) -> Option<Decode
             return None;
         }
     };
-
-    let digit = |b: &[u8], i: usize, ignored: &[usize]| if ignored.contains(&i) || b[i] == b' ' { 0.0 } else { f64::from(b[i] - b'0') };
-    let lat_ignored = &LAT_DIGITS[..ambiguity as usize];
-    let lat_deg = digit(lat, 0, &[]) * 10.0 + digit(lat, 1, &[]);
-    let lat_min = digit(lat, 2, lat_ignored) * 10.0
-        + digit(lat, 3, lat_ignored)
-        + digit(lat, 5, lat_ignored) / 10.0
-        + digit(lat, 6, lat_ignored) / 100.0;
-    let lon_deg = digit(lon, 0, &[]) * 100.0 + digit(lon, 1, &[]) * 10.0 + digit(lon, 2, &[]);
-    let lon_min = digit(lon, 3, lon_ignored) * 10.0
-        + digit(lon, 4, lon_ignored)
-        + digit(lon, 6, lon_ignored) / 10.0
-        + digit(lon, 7, lon_ignored) / 100.0;
-    if lat_min >= 60.0 || lat_deg + lat_min / 60.0 > 90.0 {
-        ctx.error(Code::InvalidLatitude, "the latitude is out of range", Some(offset));
-        return None;
-    }
-    if lon_min >= 60.0 || lon_deg + lon_min / 60.0 > 180.0 {
-        ctx.error(Code::InvalidLongitude, "the longitude is out of range", Some(offset + 9));
-        return None;
-    }
-
-    // An ambiguous position is the centre of the area it covers (interpretations.md).
-    let half_box = [0.0, 0.05, 0.5, 5.0, 30.0][ambiguity as usize];
-    let latitude = lat_deg + (lat_min + half_box) / 60.0;
     let longitude = lon_deg + (lon_min + half_box) / 60.0;
+    if longitude > 180.0 {
+        ctx.error(Code::InvalidLongitude, "the longitude is beyond 180 degrees", Some(offset + 9));
+        return None;
+    }
 
     let symbol = symbol(ctx, bytes[8], bytes[18], offset + 8, offset + 18, false)?;
     Some(Decoded {

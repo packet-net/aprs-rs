@@ -406,6 +406,8 @@ pub enum Tone {
     Ctcss,
     /// `Dnnn`: digital-coded squelch.
     Dcs,
+    /// `1750`: a 1750 Hz tone burst opens the repeater (APRS12c ch. 18).
+    ToneBurst,
 }
 
 /// Weather data (APRS12c ch. 12), in the units APRS sends.
@@ -634,6 +636,8 @@ pub struct TelemetryLabels {
     pub addressee: String,
     /// Up to 13 labels, in channel order (A1-A5, then B1-B8); empty for a channel not named.
     pub labels: Vec<String>,
+    /// The message ID, when the metadata was sent as a numbered message.
+    pub message_id: Option<String>,
 }
 
 /// Telemetry equation coefficients.
@@ -643,6 +647,8 @@ pub struct TelemetryCoefficients {
     pub addressee: String,
     /// Up to 15 values, a, b, c for each analog channel in turn, as sent.
     pub coefficients: Vec<String>,
+    /// The message ID, when the metadata was sent as a numbered message.
+    pub message_id: Option<String>,
 }
 
 /// Telemetry bit sense and project name.
@@ -654,6 +660,8 @@ pub struct TelemetryBits {
     pub bits: String,
     /// The project title.
     pub project: String,
+    /// The message ID, when the metadata was sent as a numbered message.
+    pub message_id: Option<String>,
 }
 
 /// A directed query.

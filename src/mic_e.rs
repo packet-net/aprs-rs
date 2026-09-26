@@ -69,7 +69,8 @@ pub(crate) fn decode(ctx: &mut Context, destination: &Address, info: &[u8]) -> O
     let digit = |i: usize| f64::from(chars[i].0.unwrap_or(0));
     let lat_deg = digit(0) * 10.0 + digit(1);
     let lat_min = digit(2) * 10.0 + digit(3) + digit(4) / 10.0 + digit(5) / 100.0;
-    if lat_deg > 90.0 || lat_min >= 60.0 {
+    let half_box = [0.0, 0.05, 0.5, 5.0, 30.0][ambiguity as usize];
+    if lat_min >= 60.0 || lat_deg + (lat_min + half_box) / 60.0 > 90.0 {
         ctx.error(Code::InvalidMicEDestination, "the Mic-E latitude is out of range", None);
         return None;
     }
@@ -124,7 +125,6 @@ pub(crate) fn decode(ctx: &mut Context, destination: &Address, info: &[u8]) -> O
         3 => lon_units / 1000 * 1000,
         _ => 0,
     };
-    let half_box = [0.0, 0.05, 0.5, 5.0, 30.0][ambiguity as usize];
     let latitude = lat_deg + (lat_min + half_box) / 60.0;
     let longitude = f64::from(lon_deg) + (f64::from(lon_units) / 100.0 + half_box) / 60.0;
 
@@ -237,7 +237,7 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
         extension = true;
     }
     let _ = extension;
-    comment::tail(ctx, &mut report.fields, &s, offset, true)
+    comment::tail(ctx, &mut report.fields, &s, offset)
 }
 
 fn altitude(s: &[u8]) -> Option<f64> {
