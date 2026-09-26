@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   publish:
-    name: publish packet-aprs
+    name: publish pdn-aprs
     runs-on: ubuntu-latest
     env:
       CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
@@ -47,4 +47,4 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF#refs/tags/}" --title "${GITHUB_REF#refs/tags/}" --notes "See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md). On crates.io: https://crates.io/crates/packet-aprs" --verify-tag
+        run: gh release create "${GITHUB_REF#refs/tags/}" --title "${GITHUB_REF#refs/tags/}" --notes "See [CHANGELOG.md](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md). On crates.io: https://crates.io/crates/pdn-aprs" --verify-tag

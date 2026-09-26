@@ -21,7 +21,7 @@ use std::io::{BufRead, BufReader, BufWriter, Write};
 use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
-use packet_aprs::{Data, Packet, ParseOptions};
+use pdn_aprs::{Data, Packet, ParseOptions};
 use serde_json::{Map, Value, json};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

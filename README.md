@@ -1,4 +1,4 @@
-# packet-aprs
+# pdn-aprs
 
 An APRS (Automatic Packet Reporting System) encoder and decoder in Rust. It covers every APRS 1.2 data type in [APRS12c](https://github.com/wb2osz/aprsspec), from TNC2 / APRS-IS text lines or AX.25 UI frames. It is `no_std` with `alloc`, and has no `unsafe`.
 
@@ -11,13 +11,13 @@ It is built and tested against the language-neutral conformance vectors in [pack
 ## Install
 
 ```sh
-cargo add packet-aprs
+cargo add pdn-aprs
 ```
 
 ## Decoding
 
 ```rust
-use packet_aprs::{Data, Packet, ParseOptions};
+use pdn_aprs::{Data, Packet, ParseOptions};
 
 let packet = Packet::decode_tnc2(b"N0CALL-9>APZ001,WIDE1-1,qAR,M0LTE-10:=5130.00N/00007.00W>088/036Mobile", ParseOptions::default())?;
 
@@ -38,7 +38,7 @@ Only an unusable header is an error, a [`HeaderError`]. Anything wrong in the in
 An AX.25 frame in KISS form (no flags, no FCS) decodes the same way:
 
 ```rust
-use packet_aprs::{Packet, ParseOptions};
+use pdn_aprs::{Packet, ParseOptions};
 
 let frame = [
     0x82, 0xA0, 0xB4, 0x60, 0x60, 0x62, 0xE0, 0x9A, 0x60, 0x98, 0xA8, 0x8A, 0x40, 0x72, 0x9A, 0x60, 0x98, 0xA8, 0x8A, 0x40,
@@ -53,7 +53,7 @@ assert_eq!(packet.to_ax25()?, frame);
 ## Strict and lenient
 
 ```rust
-use packet_aprs::{Code, Data, Packet, ParseOptions, Severity};
+use pdn_aprs::{Code, Data, Packet, ParseOptions, Severity};
 
 let line = b"N1EOE>APN391:!4216.95n/07243.20w#phg6230/ Easthampton MA";
 
@@ -77,7 +77,7 @@ assert!(Packet::decode_tnc2(line, options)?.has_errors());
 Build the data, then a packet. The fields are public, and every type has a sensible `Default`.
 
 ```rust
-use packet_aprs::{Address, Data, Packet, PathEntry, Position, PositionReport, Positioned, Symbol};
+use pdn_aprs::{Address, Data, Packet, PathEntry, Position, PositionReport, Positioned, Symbol};
 
 let report = PositionReport {
     messaging: true,
@@ -105,7 +105,7 @@ assert_eq!(packet.to_tnc2(), b"N0CALL-9>APZ001,WIDE1-1:=5130.00N/00007.00W>088/0
 Messages, acks, bulletins and the rest encode with [`Data::encode`]:
 
 ```rust
-use packet_aprs::{Data, Message};
+use pdn_aprs::{Data, Message};
 
 let message = Data::Message(Message {
     addressee: "G3NRW".into(),
@@ -126,7 +126,7 @@ assert!(too_long.encode().unwrap_err().message.contains("67 characters"));
 Mic-E carries half its position in the destination address, so it has its own constructor, [`Packet::create_mic_e`], which works out that address. [`Packet::device`] names the sending device or program from the [APRS device identification database](https://github.com/aprsorg/aprs-deviceid): from the Mic-E type code and suffix, or from the destination address for everything else.
 
 ```rust
-use packet_aprs::{Data, Packet, ParseOptions};
+use pdn_aprs::{Data, Packet, ParseOptions};
 
 let packet = Packet::decode_tnc2(b"N1JCM-9>TRQP7T,WA1PLE-4*:`c'wl|+>/`\"4-}_%", ParseOptions::default())?;
 let Data::MicE(report) = &packet.data else { panic!("Mic-E") };

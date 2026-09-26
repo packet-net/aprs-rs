@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use libtest_mimic::{Arguments, Failed, Trial};
-use packet_aprs::{Address, Code, Data, HeaderError, Packet, ParseOptions, PathEntry, Severity, Unrecognized};
+use pdn_aprs::{Address, Code, Data, HeaderError, Packet, ParseOptions, PathEntry, Severity, Unrecognized};
 use serde_json::Value;
 
 fn root() -> PathBuf {
