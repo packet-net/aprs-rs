@@ -162,7 +162,7 @@ Values are in the units APRS sends (knots, feet, mph, degrees Fahrenheit), with 
 
 ## Conformance
 
-`cargo test` runs the whole [packet-net/aprs-vectors](https://github.com/packet-net/aprs-vectors) suite (a git submodule at `vectors/`): every example in APRS12c and *Understanding APRS Packets*, every tolerable defect, the encoder's rules, and 1,395 real APRS-IS packets. Each case is checked lenient, strict, with only its own tolerance switched off, re-encoded, and read back: 6,994 checks, all passing except 8 that are recorded, with reasons, in [`tests/known-differences.txt`](tests/known-differences.txt).
+`cargo test` runs the whole [packet-net/aprs-vectors](https://github.com/packet-net/aprs-vectors) suite (a git submodule at `vectors/`): every example in APRS12c and *Understanding APRS Packets*, every tolerable defect, the encoder's rules, and 1,395 real APRS-IS packets. Each case is checked lenient, strict, with only its own tolerance switched off, re-encoded, and read back: 6,994 checks, all passing except 8 that are recorded, with reasons, in [`tests/known-differences.txt`](https://github.com/packet-net/aprs-rs/blob/main/tests/known-differences.txt).
 
 This crate was written from the spec, the vectors and their [interpretations](https://github.com/packet-net/aprs-vectors/blob/main/interpretations.md), not by porting the C# implementation. The known differences are the places where the vectors' observed cases record a C# quirk rather than a rule.
 
@@ -172,4 +172,4 @@ The crate is `#![no_std]` and needs only `alloc`; its one dependency, [`libm`](h
 
 ## Licence
 
-AGPL-3.0-or-later ([`LICENSE`](LICENSE)). It includes data from the APRS device identification database, CC BY-SA 2.0; see [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
+AGPL-3.0-or-later ([`LICENSE`](https://github.com/packet-net/aprs-rs/blob/main/LICENSE)). It includes data from the APRS device identification database, CC BY-SA 2.0; see [`THIRD-PARTY-NOTICES.md`](https://github.com/packet-net/aprs-rs/blob/main/THIRD-PARTY-NOTICES.md).
