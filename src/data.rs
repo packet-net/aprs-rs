@@ -104,6 +104,22 @@ impl Default for Symbol {
     }
 }
 
+impl Symbol {
+    /// A symbol from its table (or overlay) character and code, e.g. `Symbol::new('/', '>')` for a car.
+    /// Every defined symbol also has a name: [`Symbol::CAR`].
+    pub const fn new(table: char, code: char) -> Symbol {
+        Symbol { table, code }
+    }
+
+    /// This alternate-table symbol with an overlay character, `0`-`9` or `A`-`Z`, e.g.
+    /// `Symbol::GATEWAY.with_overlay('I')` for an IGate. `None` for a primary-table symbol, which takes no
+    /// overlay, or any other character (APRS12c ch. 21).
+    pub fn with_overlay(self, overlay: char) -> Option<Symbol> {
+        (self.table != '/' && (overlay.is_ascii_digit() || overlay.is_ascii_uppercase()))
+            .then_some(Symbol { table: overlay, code: self.code })
+    }
+}
+
 /// A timestamp as sent. The fields are kept even when out of range, so they can be reported;
 /// [`Timestamp::is_valid`] says whether they make sense.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -375,7 +391,7 @@ pub struct CommentTelemetry {
 }
 
 /// An APRS 1.2 voice frequency and its settings (APRS12c ch. 18 addendum).
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct VoiceFrequency {
     /// The frequency in MHz.
     pub mhz: f64,

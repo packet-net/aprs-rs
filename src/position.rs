@@ -326,9 +326,9 @@ fn coordinate(value: f64, degree_digits: usize, ambiguity: u8, dao: Option<bool>
         Some(false) => (1000.0, 10),
         Some(true) => (9100.0, 91),
     };
-    let half_box = [0.0, 0.05, 0.5, 5.0, 30.0][ambiguity as usize];
-    let minutes_total = value * 60.0 - half_box;
-    let mut units = libm::round(minutes_total.max(0.0) * per_minute) as u64;
+    // Rounding then blanking keeps the box the position is in, and a decoded position (the centre of
+    // its box) writes back the same digits.
+    let mut units = libm::round(value * 60.0 * per_minute) as u64;
     let extra = (units % extra_base) as u8;
     units /= extra_base;
     // units is now hundredths of a minute.

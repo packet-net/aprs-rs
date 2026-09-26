@@ -6,6 +6,21 @@ use crate::Timestamp;
 use crate::text::all_digits;
 
 impl Timestamp {
+    /// Day of month, hour and minute, UTC: `DDHHMMz`, the form most reports use.
+    pub const fn dhm(day: u8, hour: u8, minute: u8) -> Timestamp {
+        Timestamp::DayHourMinute { day, hour, minute, utc: true }
+    }
+
+    /// Hour, minute and second, UTC: `HHMMSSh`.
+    pub const fn hms(hour: u8, minute: u8, second: u8) -> Timestamp {
+        Timestamp::HourMinuteSecond { hour, minute, second }
+    }
+
+    /// Month, day, hour and minute, UTC: `MMDDHHMM`, the form positionless weather reports use.
+    pub const fn mdhm(month: u8, day: u8, hour: u8, minute: u8) -> Timestamp {
+        Timestamp::MonthDayHourMinute { month, day, hour, minute }
+    }
+
     /// Reads a 7-character DHM (`z` or `/`) or HMS (`h`) timestamp. `None` if it is not that shape.
     pub fn parse(bytes: &[u8]) -> Option<Timestamp> {
         if bytes.len() != 7 || !all_digits(&bytes[..6]) {
