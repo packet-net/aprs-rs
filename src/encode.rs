@@ -183,23 +183,15 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
         weather::encode_fields(out, w)?;
     }
 
-    let tail_start = out.len();
+    // After the data extension, in this order: the voice frequency and its fields, in the first
+    // bytes of the comment where radios read it (APRS12c ch. 18); the signpost or corridor braces,
+    // straight after the symbol or area extension as APRS12c's examples put them; the /A= altitude;
+    // then the free text, base-91 telemetry and the !DAO! (APRS12c ch. 13).
     if f.weather.is_none() {
-        if let Some(feet) = f.altitude_feet.filter(|_| !altitude_in_cs) {
-            let n = libm::round(feet);
-            if !(-99_999.0..=999_999.0).contains(&n) {
-                return Err(EncodeError::new("/A= altitude must fit in 6 digits (or - and 5 digits)"));
-            }
-            if n < 0.0 {
-                out.extend_from_slice(b"/A=-");
-                push_digits(out, (-n) as u32, 5);
-            } else {
-                out.extend_from_slice(b"/A=");
-                push_digits(out, n as u32, 6);
-            }
-        }
         if let Some(fr) = &f.frequency {
-            if extension && out.len() == tail_start {
+            // APRS12c ch. 18 writes a frequency after a data extension as `$CSE/SPD/FFF.FFFMHz`;
+            // a PHGR (`PHG72604/`) already ends in its mandatory `/`.
+            if extension && out.last() != Some(&b'/') {
                 out.push(b'/');
             }
             frequency(out, fr)?;
@@ -216,6 +208,25 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
             out.push(b'{');
             out.extend_from_slice(sign.as_bytes());
             out.push(b'}');
+        }
+        if let Some(w) = f.area.and_then(|a| a.corridor_width_miles) {
+            if w > 999 {
+                return Err(EncodeError::new("an area corridor width is at most 999 miles"));
+            }
+            out.extend_from_slice(format!("{{{w}}}").as_bytes());
+        }
+        if let Some(feet) = f.altitude_feet.filter(|_| !altitude_in_cs) {
+            let n = libm::round(feet);
+            if !(-99_999.0..=999_999.0).contains(&n) {
+                return Err(EncodeError::new("/A= altitude must fit in 6 digits (or - and 5 digits)"));
+            }
+            if n < 0.0 {
+                out.extend_from_slice(b"/A=-");
+                push_digits(out, (-n) as u32, 5);
+            } else {
+                out.extend_from_slice(b"/A=");
+                push_digits(out, n as u32, 6);
+            }
         }
     }
 
@@ -239,9 +250,15 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
             (DaoPrecision::Base91, Some((lat, lon))) => {
                 trailer.extend_from_slice(&[d.datum.to_ascii_lowercase() as u8, lat + 33, lon + 33])
             }
-            // A compressed position does not use the digits, but writing them keeps the precision.
-            (DaoPrecision::Base91, None) => trailer.extend_from_slice(&[d.datum.to_ascii_lowercase() as u8, b'!', b'!']),
-            (DaoPrecision::Thousandths, None) => trailer.extend_from_slice(&[d.datum as u8, b'0', b'0']),
+            // A compressed position does not use the digits, which agree with the position.
+            (DaoPrecision::Base91, None) => {
+                let (lat, lon) = position::dao_digits(&f.position, true);
+                trailer.extend_from_slice(&[d.datum.to_ascii_lowercase() as u8, lat + 33, lon + 33])
+            }
+            (DaoPrecision::Thousandths, None) => {
+                let (lat, lon) = position::dao_digits(&f.position, false);
+                trailer.extend_from_slice(&[d.datum as u8, b'0' + lat, b'0' + lon])
+            }
             _ => trailer.extend_from_slice(&[d.datum as u8, b' ', b' ']),
         }
         trailer.push(b'!');
@@ -470,12 +487,7 @@ fn uncompressed_extension(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, Enc
             push_digits(out, color, 2);
         }
         push_digits(out, u32::from(a.lon_offset), 2);
-        if let Some(w) = a.corridor_width_miles {
-            if w > 999 {
-                return Err(EncodeError::new("an area corridor width is at most 999 miles"));
-            }
-            out.extend_from_slice(format!("{{{w}}}").as_bytes());
-        }
+        // A line's corridor width, {www}, is written with the comment's braces.
         return Ok(true);
     }
     Ok(false)

@@ -817,15 +817,41 @@ pub struct Query {
     pub footprint: Option<Footprint>,
 }
 
-/// A query's target area.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+/// A query's target area. The latitude and longitude are kept as sent, a leading space included, so
+/// that ` 34.0` and `-.1715` write back unchanged; [`Footprint::latitude_degrees`] and
+/// [`Footprint::longitude_degrees`] read them as numbers, and [`Footprint::new`] writes them from
+/// numbers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Footprint {
-    /// Latitude, degrees.
-    pub latitude: f64,
-    /// Longitude, degrees.
-    pub longitude: f64,
+    /// Latitude in decimal degrees as sent: an optional `-`, or for a positive value an optional
+    /// leading space ("Note the leading space in the latitude, as its value is positive", APRS12c
+    /// ch. 15), then digits with an optional decimal point.
+    pub latitude: String,
+    /// Longitude in decimal degrees as sent, written as the latitude is.
+    pub longitude: String,
     /// Radius, miles.
     pub radius_miles: u32,
+}
+
+impl Footprint {
+    /// A footprint from degrees, north and east positive, written as APRS12c ch. 15 writes them: a
+    /// positive value after a space, a negative one with its sign.
+    pub fn new(latitude: f64, longitude: f64, radius_miles: u32) -> Footprint {
+        let text = |v: f64| if v.is_sign_negative() { alloc::format!("{v}") } else { alloc::format!(" {v}") };
+        Footprint { latitude: text(latitude), longitude: text(longitude), radius_miles }
+    }
+
+    /// The latitude in degrees, north positive; `None` when the text is not a number as APRS12c
+    /// writes one, or is beyond 90 degrees.
+    pub fn latitude_degrees(&self) -> Option<f64> {
+        crate::other::footprint_degrees(&self.latitude, 90.0)
+    }
+
+    /// The longitude in degrees, east positive; `None` when the text is not a number as APRS12c
+    /// writes one, or is beyond 180 degrees.
+    pub fn longitude_degrees(&self) -> Option<f64> {
+        crate::other::footprint_degrees(&self.longitude, 180.0)
+    }
 }
 
 /// Station capabilities.

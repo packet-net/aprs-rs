@@ -371,8 +371,9 @@ fn number_field(out: &mut Vec<u8>, value: f64, width: usize, signed: bool) -> Re
 }
 
 /// Snowfall in its three characters, which may include one decimal point (APRS12c ch. 12: "A
-/// decimal point is allowed for non-integer values"): `012`, `1.5` or `.25`. A value those cannot
-/// hold exactly is refused.
+/// decimal point is allowed for non-integer values"): a whole number as three digits (`012`), one
+/// under 1 as `.` and two digits (`.50`, `.25`), and any other as a digit, `.` and a digit (`1.5`).
+/// A value those cannot hold exactly is refused.
 fn snowfall(out: &mut Vec<u8>, inches: f64) -> Result<(), EncodeError> {
     let exact = |scale: f64| {
         let n = libm::round(inches * scale);
@@ -383,8 +384,8 @@ fn snowfall(out: &mut Vec<u8>, inches: f64) -> Result<(), EncodeError> {
     }
     let text = match (exact(1.0), exact(10.0), exact(100.0)) {
         (Some(n), _, _) => alloc::format!("{n:03}"),
+        (None, _, Some(n)) if n < 100 => alloc::format!(".{n:02}"),
         (None, Some(n), _) if n < 100 => alloc::format!("{}.{}", n / 10, n % 10),
-        (None, None, Some(n)) if n < 100 => alloc::format!(".{n:02}"),
         _ => return Err(EncodeError::new("snowfall is three characters with at most one decimal point, which cannot hold this value")),
     };
     out.extend_from_slice(text.as_bytes());

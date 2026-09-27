@@ -317,6 +317,14 @@ pub(crate) fn encode_uncompressed(
     Ok(dao.map(|_| (lat_extra, lon_extra)))
 }
 
+/// The `!DAO!` digits for a position: latitude, then longitude, each the digit (`base91`: the
+/// base-91 value, 0-90) a DAO of that precision gives the position written uncompressed. A
+/// decoder does not apply them to a compressed position, so there they are written to agree with
+/// it: a reader that did apply them lands on the position reported.
+pub(crate) fn dao_digits(position: &Position, base91: bool) -> (u8, u8) {
+    (coordinate(position.latitude, 2, 0, Some(base91)).1, coordinate(position.longitude, 3, 0, Some(base91)).1)
+}
+
 /// Degrees and minutes to hundredths (`DDMM.hh` or `DDDMM.hh`), with ambiguity blanks, plus the
 /// `!DAO!` digit for the next place when asked for (`Some(base91)`).
 fn coordinate(value: f64, degree_digits: usize, ambiguity: u8, dao: Option<bool>) -> (Vec<u8>, u8) {

@@ -214,8 +214,11 @@ pub fn data(d: &Data) -> Value {
         Data::Query(q) => {
             let mut o = Obj::new("query");
             o.put("query_type", json!(q.query_type));
-            if let Some(f) = q.footprint {
-                o.put("footprint", json!({"latitude": f.latitude, "longitude": f.longitude, "radius_miles": f.radius_miles}));
+            if let Some(f) = &q.footprint {
+                o.put(
+                    "footprint",
+                    json!({"latitude": number_text(&f.latitude), "longitude": number_text(&f.longitude), "radius_miles": f.radius_miles}),
+                );
             }
             o.done()
         }
@@ -378,229 +381,551 @@ fn weather(w: &Weather) -> Value {
 
 // ------------------------------------------------------------------ reading
 
-pub fn read_data(v: &Value) -> Data {
-    let o = v.as_object().expect("data is an object");
-    let s = |k: &str| o.get(k).and_then(Value::as_str).map(str::to_string);
-    let string = |k: &str| s(k).unwrap_or_default();
-    let flag = |k: &str| o.get(k).and_then(Value::as_bool).unwrap_or(false);
-    match o["type"].as_str().unwrap() {
-        "position" => Data::Position(PositionReport {
-            timestamp: read_timestamp(o.get("timestamp")),
-            messaging: flag("messaging"),
-            fields: read_positioned(o),
-        }),
+/// Why data in the neutral form could not be made into this crate's data.
+#[derive(Debug)]
+pub enum Unreadable {
+    /// This crate's data cannot hold something in it: the key, and why.
+    Unsupported(String),
+    /// Its encoder refused a part that has to be encoded to be held: a third-party packet keeps
+    /// its inner packet's information field, which the neutral form does not carry.
+    Refused(String),
+}
+
+impl std::fmt::Display for Unreadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unreadable::Unsupported(why) | Unreadable::Refused(why) => f.write_str(why),
+        }
+    }
+}
+
+type Read<T> = Result<T, Unreadable>;
+
+fn unsupported<T>(why: String) -> Read<T> {
+    Err(Unreadable::Unsupported(why))
+}
+
+/// An object's keys, checked against the ones this crate's data can hold, with getters that name
+/// the key when a value will not fit.
+struct Keys<'a> {
+    o: &'a Map<String, Value>,
+    at: String,
+}
+
+impl<'a> Keys<'a> {
+    fn new(v: &'a Value, at: &str, allowed: &[&str]) -> Read<Keys<'a>> {
+        let Some(o) = v.as_object() else { return unsupported(format!("{at}: not an object")) };
+        let keys = Keys { o, at: at.to_string() };
+        if let Some(k) = o.keys().find(|k| !allowed.contains(&k.as_str())) {
+            return unsupported(format!("{}: not a field this crate has", keys.name(k)));
+        }
+        Ok(keys)
+    }
+
+    fn name(&self, k: &str) -> String {
+        if self.at.is_empty() { k.to_string() } else { format!("{}.{k}", self.at) }
+    }
+
+    fn get(&self, k: &str) -> Option<&'a Value> {
+        self.o.get(k).filter(|v| !v.is_null())
+    }
+
+    fn string(&self, k: &str) -> Read<Option<String>> {
+        match self.get(k) {
+            None => Ok(None),
+            Some(Value::String(s)) => Ok(Some(s.clone())),
+            Some(_) => unsupported(format!("{}: not text", self.name(k))),
+        }
+    }
+
+    fn text(&self, k: &str) -> Read<String> {
+        Ok(self.string(k)?.unwrap_or_default())
+    }
+
+    fn char(&self, k: &str) -> Read<Option<char>> {
+        let Some(t) = self.string(k)? else { return Ok(None) };
+        let mut chars = t.chars();
+        match (chars.next(), chars.next()) {
+            (Some(c), None) => Ok(Some(c)),
+            _ => unsupported(format!("{}: not one character", self.name(k))),
+        }
+    }
+
+    fn flag(&self, k: &str) -> Read<bool> {
+        match self.get(k) {
+            None => Ok(false),
+            Some(Value::Bool(b)) => Ok(*b),
+            Some(_) => unsupported(format!("{}: not a boolean", self.name(k))),
+        }
+    }
+
+    fn float(&self, k: &str) -> Read<Option<f64>> {
+        match self.get(k) {
+            None => Ok(None),
+            Some(v) => v.as_f64().map(Some).ok_or_else(|| Unreadable::Unsupported(format!("{}: not a number", self.name(k)))),
+        }
+    }
+
+    fn required_float(&self, k: &str) -> Read<f64> {
+        self.float(k)?
+            .ok_or_else(|| Unreadable::Unsupported(format!("{}: missing, and this crate has no value for its absence", self.name(k))))
+    }
+
+    /// A whole number that fits `T`.
+    fn int<T: TryFrom<i128>>(&self, k: &str) -> Read<Option<T>> {
+        let Some(v) = self.get(k) else { return Ok(None) };
+        whole(v)
+            .and_then(|n| T::try_from(n).ok())
+            .map(Some)
+            .ok_or_else(|| Unreadable::Unsupported(format!("{}: not a whole number in the range this crate holds", self.name(k))))
+    }
+
+    fn required_int<T: TryFrom<i128>>(&self, k: &str) -> Read<T> {
+        self.int(k)?
+            .ok_or_else(|| Unreadable::Unsupported(format!("{}: missing, and this crate has no value for its absence", self.name(k))))
+    }
+
+    fn strings(&self, k: &str) -> Read<Vec<String>> {
+        match self.get(k) {
+            None => Ok(Vec::new()),
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|x| match x {
+                    Value::String(s) => Ok(s.clone()),
+                    _ => unsupported(format!("{}: not text", self.name(k))),
+                })
+                .collect(),
+            Some(_) => unsupported(format!("{}: not a list", self.name(k))),
+        }
+    }
+
+    fn array(&self, k: &str) -> Read<Option<&'a Vec<Value>>> {
+        match self.get(k) {
+            None => Ok(None),
+            Some(Value::Array(a)) => Ok(Some(a)),
+            Some(_) => unsupported(format!("{}: not a list", self.name(k))),
+        }
+    }
+
+    fn object(&self, k: &str, allowed: &[&str]) -> Read<Option<Keys<'a>>> {
+        self.get(k).map(|v| Keys::new(v, &self.name(k), allowed)).transpose()
+    }
+
+    /// One of an enumeration's values, by its neutral name.
+    fn choice<T: Copy>(&self, k: &str, values: &[(&str, T)]) -> Read<Option<T>> {
+        let Some(t) = self.string(k)? else { return Ok(None) };
+        match values.iter().find(|(name, _)| *name == t) {
+            Some((_, v)) => Ok(Some(*v)),
+            None => unsupported(format!("{}: not a value this crate has", self.name(k))),
+        }
+    }
+
+    fn required<T>(&self, k: &str, v: Option<T>) -> Read<T> {
+        v.ok_or_else(|| Unreadable::Unsupported(format!("{}: missing, and this crate has no value for its absence", self.name(k))))
+    }
+}
+
+/// A JSON number that is a whole number, as an integer.
+fn whole(v: &Value) -> Option<i128> {
+    if let Some(n) = v.as_i64() {
+        return Some(i128::from(n));
+    }
+    if let Some(n) = v.as_u64() {
+        return Some(i128::from(n));
+    }
+    let f = v.as_f64()?;
+    (f.fract() == 0.0 && f.abs() < 1e30).then_some(f as i128)
+}
+
+/// A number in the neutral form as the text this crate keeps as sent: as the JSON gives it, or in
+/// full where the JSON would use an exponent, which APRS numbers do not.
+fn number_as_text(v: &Value) -> Option<String> {
+    match v {
+        Value::Number(n) => {
+            let t = n.to_string();
+            Some(if t.contains(['e', 'E']) { format!("{}", n.as_f64()?) } else { t })
+        }
+        Value::String(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+const POSITIONED: [&str; 24] = [
+    "latitude",
+    "longitude",
+    "ambiguity",
+    "symbol",
+    "compressed",
+    "compression",
+    "course_degrees",
+    "speed_knots",
+    "altitude_feet",
+    "phg",
+    "range_miles",
+    "dfs",
+    "area",
+    "df_bearing",
+    "storm",
+    "dao",
+    "telemetry",
+    "frequency",
+    "weather",
+    "signpost",
+    "comment",
+    "type",
+    "timestamp",
+    "messaging",
+];
+
+fn with_positioned(extra: &[&'static str]) -> Vec<&'static str> {
+    POSITIONED.iter().copied().chain(extra.iter().copied()).collect()
+}
+
+/// Neutral data as this crate's data, or why it cannot be.
+pub fn try_read_data(v: &Value) -> Read<Data> {
+    let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
+    let keys: Vec<&str> = match kind {
+        "position" => with_positioned(&[]),
+        "mic-e" => {
+            with_positioned(&["mic_e_message", "old_data", "type_code", "device_suffix", "locator", "legacy_telemetry", "destination_ssid"])
+        }
+        "object" => with_positioned(&["name", "killed"]),
+        "item" => with_positioned(&["name", "killed"]),
+        "message" => vec!["type", "addressee", "text", "message_id", "reply_ack"],
+        "ack" => vec!["type", "addressee", "acked_id", "message_id", "reply_ack"],
+        "reject" => vec!["type", "addressee", "rejected_id", "message_id", "reply_ack"],
+        "bulletin" | "nws-bulletin" => vec!["type", "addressee", "text", "message_id"],
+        "telemetry-names" => vec!["type", "addressee", "names", "message_id"],
+        "telemetry-units" => vec!["type", "addressee", "units", "message_id"],
+        "telemetry-coefficients" => vec!["type", "addressee", "coefficients", "message_id"],
+        "telemetry-bits" => vec!["type", "addressee", "bits", "project", "message_id"],
+        "directed-query" => vec!["type", "addressee", "query_type", "target"],
+        "status" => vec!["type", "timestamp", "locator", "symbol", "beam", "text"],
+        "telemetry" => vec!["type", "sequence", "analog", "bits", "comment"],
+        "weather" => vec!["type", "timestamp", "weather", "comment"],
+        "raw-weather" => vec!["type", "format", "data"],
+        "nmea" => vec![
+            "type",
+            "sentence",
+            "has_checksum",
+            "latitude",
+            "longitude",
+            "fix",
+            "course_degrees",
+            "speed_knots",
+            "altitude_m",
+            "time",
+            "waypoint",
+            "comment",
+        ],
+        "maidenhead-beacon" => vec!["type", "locator", "comment"],
+        "query" => vec!["type", "query_type", "footprint"],
+        "capabilities" => vec!["type", "capabilities"],
+        "third-party" => vec!["type", "packet"],
+        "user-defined" => vec!["type", "user_id", "packet_type", "data"],
+        "test" => vec!["type", "data"],
+        "agrelo-df" => vec!["type", "bearing_degrees", "quality"],
+        "unrecognized" => vec!["type", "reason"],
+        _ => return unsupported("type: not a data type this crate has".into()),
+    };
+    // Positioned fields that belong to another kind of report.
+    let keys: Vec<&str> = keys
+        .into_iter()
+        .filter(|k| match *k {
+            "timestamp" => matches!(kind, "position" | "object" | "status" | "weather"),
+            "messaging" => kind == "position",
+            _ => true,
+        })
+        .collect();
+    let o = Keys::new(v, "", &keys)?;
+    Ok(match kind {
+        "position" => {
+            Data::Position(PositionReport { timestamp: read_timestamp(&o)?, messaging: o.flag("messaging")?, fields: read_positioned(&o)? })
+        }
         "mic-e" => Data::MicE(MicEReport {
-            message: read_mic_e_message(o.get("mic_e_message").and_then(Value::as_str).unwrap_or("off-duty")),
-            old_data: flag("old_data"),
-            type_code: s("type_code").and_then(|t| t.chars().next()),
-            device_suffix: string("device_suffix"),
-            locator: s("locator"),
-            legacy_telemetry: o
-                .get("legacy_telemetry")
-                .map(|a| a.as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u8).collect())
-                .unwrap_or_default(),
-            destination_ssid: o.get("destination_ssid").and_then(Value::as_u64).unwrap_or(0) as u8,
-            fields: read_positioned(o),
+            message: o.required("mic_e_message", read_mic_e_message(&o)?)?,
+            old_data: o.flag("old_data")?,
+            type_code: o.char("type_code")?,
+            device_suffix: o.text("device_suffix")?,
+            locator: o.string("locator")?,
+            legacy_telemetry: match o.array("legacy_telemetry")? {
+                None => Vec::new(),
+                Some(a) => a
+                    .iter()
+                    .map(|x| whole(x).and_then(|n| u8::try_from(n).ok()))
+                    .collect::<Option<Vec<u8>>>()
+                    .ok_or_else(|| Unreadable::Unsupported("legacy_telemetry: values are bytes, 0-255".into()))?,
+            },
+            destination_ssid: o.int("destination_ssid")?.unwrap_or(0),
+            fields: read_positioned(&o)?,
         }),
         "object" => Data::Object(ObjectReport {
-            name: string("name"),
-            killed: flag("killed"),
-            timestamp: read_timestamp(o.get("timestamp")),
-            fields: read_positioned(o),
+            name: o.text("name")?,
+            killed: o.flag("killed")?,
+            timestamp: read_timestamp(&o)?,
+            fields: read_positioned(&o)?,
         }),
-        "item" => Data::Item(ItemReport { name: string("name"), killed: flag("killed"), fields: read_positioned(o) }),
+        "item" => Data::Item(ItemReport { name: o.text("name")?, killed: o.flag("killed")?, fields: read_positioned(&o)? }),
         "message" => Data::Message(Message {
-            addressee: string("addressee"),
-            text: string("text"),
-            message_id: s("message_id"),
-            reply_ack: s("reply_ack"),
+            addressee: o.text("addressee")?,
+            text: o.text("text")?,
+            message_id: o.string("message_id")?,
+            reply_ack: o.string("reply_ack")?,
         }),
         "ack" => Data::Ack(Ack {
-            addressee: string("addressee"),
-            acked_id: string("acked_id"),
-            message_id: s("message_id"),
-            reply_ack: s("reply_ack"),
+            addressee: o.text("addressee")?,
+            acked_id: o.text("acked_id")?,
+            message_id: o.string("message_id")?,
+            reply_ack: o.string("reply_ack")?,
         }),
         "reject" => Data::Reject(Reject {
-            addressee: string("addressee"),
-            rejected_id: string("rejected_id"),
-            message_id: s("message_id"),
-            reply_ack: s("reply_ack"),
+            addressee: o.text("addressee")?,
+            rejected_id: o.text("rejected_id")?,
+            message_id: o.string("message_id")?,
+            reply_ack: o.string("reply_ack")?,
         }),
-        "bulletin" => Data::Bulletin(Bulletin { addressee: string("addressee"), text: string("text"), message_id: s("message_id") }),
-        "nws-bulletin" => Data::NwsBulletin(Bulletin { addressee: string("addressee"), text: string("text"), message_id: s("message_id") }),
+        "bulletin" | "nws-bulletin" => {
+            let b = Bulletin { addressee: o.text("addressee")?, text: o.text("text")?, message_id: o.string("message_id")? };
+            if kind == "bulletin" { Data::Bulletin(b) } else { Data::NwsBulletin(b) }
+        }
         "telemetry-names" => Data::TelemetryNames(TelemetryLabels {
-            addressee: string("addressee"),
-            labels: strings(o.get("names")),
-            message_id: s("message_id"),
+            addressee: o.text("addressee")?,
+            labels: o.strings("names")?,
+            message_id: o.string("message_id")?,
         }),
         "telemetry-units" => Data::TelemetryUnits(TelemetryLabels {
-            addressee: string("addressee"),
-            labels: strings(o.get("units")),
-            message_id: s("message_id"),
+            addressee: o.text("addressee")?,
+            labels: o.strings("units")?,
+            message_id: o.string("message_id")?,
         }),
         "telemetry-coefficients" => Data::TelemetryCoefficients(TelemetryCoefficients {
-            addressee: string("addressee"),
-            coefficients: o.get("coefficients").map(|a| a.as_array().unwrap().iter().map(|x| x.to_string()).collect()).unwrap_or_default(),
-            message_id: s("message_id"),
+            addressee: o.text("addressee")?,
+            coefficients: o
+                .array("coefficients")?
+                .map(|a| a.iter().map(number_as_text).collect::<Option<Vec<String>>>())
+                .unwrap_or(Some(Vec::new()))
+                .ok_or_else(|| Unreadable::Unsupported("coefficients: each is a number".into()))?,
+            message_id: o.string("message_id")?,
         }),
         "telemetry-bits" => Data::TelemetryBits(TelemetryBits {
-            addressee: string("addressee"),
-            bits: string("bits"),
-            project: string("project"),
-            message_id: s("message_id"),
+            addressee: o.text("addressee")?,
+            bits: o.text("bits")?,
+            project: o.text("project")?,
+            message_id: o.string("message_id")?,
         }),
-        "directed-query" => {
-            Data::DirectedQuery(DirectedQuery { addressee: string("addressee"), query_type: string("query_type"), target: s("target") })
-        }
+        "directed-query" => Data::DirectedQuery(DirectedQuery {
+            addressee: o.text("addressee")?,
+            query_type: o.text("query_type")?,
+            target: o.string("target")?,
+        }),
         "status" => Data::Status(Status {
-            timestamp: read_timestamp(o.get("timestamp")),
-            locator: s("locator"),
-            symbol: s("symbol").map(|t| read_symbol(&t)),
-            beam: o.get("beam").map(|b| BeamHeading {
-                heading_code: b["heading_code"].as_str().unwrap().chars().next().unwrap(),
-                power_code: b["power_code"].as_str().unwrap().chars().next().unwrap(),
-            }),
-            text: string("text"),
+            timestamp: read_timestamp(&o)?,
+            locator: o.string("locator")?,
+            symbol: read_symbol(&o)?,
+            beam: match o.object("beam", &["heading_code", "power_code"])? {
+                None => None,
+                Some(b) => Some(BeamHeading {
+                    heading_code: b.required("heading_code", b.char("heading_code")?)?,
+                    power_code: b.required("power_code", b.char("power_code")?)?,
+                }),
+            },
+            text: o.text("text")?,
         }),
         "telemetry" => Data::Telemetry(Telemetry {
-            sequence: string("sequence"),
+            sequence: o.text("sequence")?,
             analog: o
-                .get("analog")
-                .map(|a| a.as_array().unwrap().iter().map(|x| (!x.is_null()).then(|| x.to_string())).collect())
-                .unwrap_or_default(),
-            bits: s("bits"),
-            comment: string("comment"),
+                .array("analog")?
+                .map(|a| {
+                    a.iter()
+                        .map(|x| if x.is_null() { Some(None) } else { number_as_text(x).map(Some) })
+                        .collect::<Option<Vec<Option<String>>>>()
+                })
+                .unwrap_or(Some(Vec::new()))
+                .ok_or_else(|| Unreadable::Unsupported("analog: each is a number or null".into()))?,
+            bits: o.string("bits")?,
+            comment: o.text("comment")?,
         }),
         "weather" => Data::Weather(WeatherReport {
-            timestamp: read_timestamp(o.get("timestamp")),
-            weather: o.get("weather").map(read_weather).unwrap_or_default(),
-            comment: string("comment"),
+            timestamp: read_timestamp(&o)?,
+            weather: read_weather(&o)?.unwrap_or_default(),
+            comment: o.text("comment")?,
         }),
         "raw-weather" => Data::RawWeather(RawWeather {
-            format: match o["format"].as_str().unwrap() {
-                "peet-bros-hash" => RawWeatherFormat::PeetBrosHash,
-                "peet-bros-star" => RawWeatherFormat::PeetBrosStar,
-                "ultimeter-packet" => RawWeatherFormat::UltimeterPacket,
-                _ => RawWeatherFormat::UltimeterLogging,
-            },
-            data: string("data"),
+            format: o.required(
+                "format",
+                o.choice(
+                    "format",
+                    &[
+                        ("peet-bros-hash", RawWeatherFormat::PeetBrosHash),
+                        ("peet-bros-star", RawWeatherFormat::PeetBrosStar),
+                        ("ultimeter-packet", RawWeatherFormat::UltimeterPacket),
+                        ("ultimeter-logging", RawWeatherFormat::UltimeterLogging),
+                    ],
+                )?,
+            )?,
+            data: o.text("data")?,
         }),
         "nmea" => Data::Nmea(Nmea {
-            sentence: string("sentence"),
-            has_checksum: flag("has_checksum"),
-            latitude: o.get("latitude").and_then(Value::as_f64),
-            longitude: o.get("longitude").and_then(Value::as_f64),
-            fix_valid: s("fix").map(|f| f == "valid"),
-            course_degrees: o.get("course_degrees").and_then(Value::as_f64),
-            speed_knots: o.get("speed_knots").and_then(Value::as_f64),
-            altitude_m: o.get("altitude_m").and_then(Value::as_f64),
-            time: s("time"),
-            waypoint: s("waypoint"),
-            comment: string("comment"),
+            sentence: o.text("sentence")?,
+            has_checksum: o.flag("has_checksum")?,
+            latitude: o.float("latitude")?,
+            longitude: o.float("longitude")?,
+            fix_valid: o.choice("fix", &[("valid", true), ("invalid", false)])?,
+            course_degrees: o.float("course_degrees")?,
+            speed_knots: o.float("speed_knots")?,
+            altitude_m: o.float("altitude_m")?,
+            time: o.string("time")?,
+            waypoint: o.string("waypoint")?,
+            comment: o.text("comment")?,
         }),
-        "maidenhead-beacon" => Data::MaidenheadBeacon(MaidenheadBeacon { locator: string("locator"), comment: string("comment") }),
+        "maidenhead-beacon" => Data::MaidenheadBeacon(MaidenheadBeacon { locator: o.text("locator")?, comment: o.text("comment")? }),
         "query" => Data::Query(Query {
-            query_type: string("query_type"),
-            footprint: o.get("footprint").map(|f| Footprint {
-                latitude: f["latitude"].as_f64().unwrap(),
-                longitude: f["longitude"].as_f64().unwrap(),
-                radius_miles: f["radius_miles"].as_u64().unwrap() as u32,
-            }),
+            query_type: o.text("query_type")?,
+            // The neutral form has the numbers, not their text: each is written as the JSON gives
+            // it, after a space when it is positive (APRS12c ch. 15).
+            footprint: match o.object("footprint", &["latitude", "longitude", "radius_miles"])? {
+                None => None,
+                Some(f) => {
+                    let text = |k: &str| -> Read<String> {
+                        let t = f.get(k).and_then(number_as_text);
+                        let t = f.required(k, t)?;
+                        Ok(if t.starts_with('-') { t } else { format!(" {t}") })
+                    };
+                    Some(Footprint {
+                        latitude: text("latitude")?,
+                        longitude: text("longitude")?,
+                        radius_miles: f.required_int("radius_miles")?,
+                    })
+                }
+            },
         }),
         "capabilities" => Data::Capabilities(Capabilities {
             capabilities: o
-                .get("capabilities")
+                .array("capabilities")?
                 .map(|a| {
-                    a.as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|p| {
-                            let p = p.as_array().unwrap();
-                            (p[0].as_str().unwrap().to_string(), p.get(1).map(|v| v.as_str().unwrap().to_string()))
+                    a.iter()
+                        .map(|p| match p.as_array().map(Vec::as_slice) {
+                            Some([Value::String(t)]) => Some((t.clone(), None)),
+                            Some([Value::String(t), Value::String(v)]) => Some((t.clone(), Some(v.clone()))),
+                            _ => None,
                         })
-                        .collect()
+                        .collect::<Option<Vec<_>>>()
                 })
-                .unwrap_or_default(),
+                .unwrap_or(Some(Vec::new()))
+                .ok_or_else(|| Unreadable::Unsupported("capabilities: each is [token] or [token, value]".into()))?,
         }),
         "third-party" => {
             // The inner packet as the neutral form gives it: its source may be any third-party
-            // source (APRS12c ch. 17), and its diagnostics are part of the data.
-            let p = &o["packet"];
-            let path: Vec<PathEntry> = strings(p.get("path")).iter().map(|e| read_path_entry(e)).collect();
-            let data = read_data(&p["data"]);
-            let information = data.encode().unwrap_or_default();
-            Data::ThirdParty(Box::new(Packet {
-                source: Address::third_party_source(p["source"].as_str().unwrap()).unwrap(),
-                destination: read_destination(p["destination"].as_str().unwrap()),
-                path,
-                information,
-                data,
-                diagnostics: strings(p.get("diagnostics")).iter().map(|d| read_diagnostic(d)).collect(),
-                third_party: true,
-            }))
+            // source (APRS12c ch. 17), and its diagnostics are part of the data. This crate keeps
+            // the inner information field as received, which the neutral form does not carry, so
+            // it is the inner data encoded.
+            let p = o.required("packet", o.object("packet", &["source", "destination", "path", "data", "diagnostics"])?)?;
+            let source = p.text("source")?;
+            let source = Address::third_party_source(&source).or_else(|_| unsupported("packet.source: not a third-party source".into()))?;
+            let destination = read_destination(&p.text("destination")?)?;
+            let path = p.strings("path")?.iter().map(|e| read_path_entry_checked(e)).collect::<Read<Vec<PathEntry>>>()?;
+            let data = try_read_data(p.required("data", p.get("data"))?)?;
+            let information = match &data {
+                Data::Unrecognized(Unrecognized::Empty) => Vec::new(),
+                Data::Unrecognized(_) => return unsupported("packet.data: undecoded, and its bytes are not in the neutral form".into()),
+                data => data.encode().map_err(|e| Unreadable::Refused(format!("the inner packet's data: {e}")))?,
+            };
+            let diagnostics = p.strings("diagnostics")?.iter().map(|d| read_diagnostic(d)).collect::<Read<Vec<Diagnostic>>>()?;
+            Data::ThirdParty(Box::new(Packet { source, destination, path, information, data, diagnostics, third_party: true }))
         }
-        "user-defined" => Data::UserDefined(UserDefined {
-            user_id: string("user_id").chars().next().unwrap(),
-            packet_type: string("packet_type").chars().next().unwrap(),
-            data: string("data").chars().map(|c| c as u8).collect(),
-        }),
-        "test" => Data::Test(TestData { data: string("data") }),
-        "agrelo-df" => Data::AgreloDf(AgreloDf {
-            bearing_degrees: o["bearing_degrees"].as_u64().unwrap() as u16,
-            quality: o["quality"].as_u64().unwrap() as u8,
-        }),
-        other => panic!("cannot read data of type {other}"),
-    }
+        "user-defined" => {
+            let byte_text = |k: &str| -> Read<Vec<u8>> {
+                o.text(k)?
+                    .chars()
+                    .map(|c| u8::try_from(u32::from(c)).ok())
+                    .collect::<Option<Vec<u8>>>()
+                    .ok_or_else(|| Unreadable::Unsupported(format!("{k}: user-defined data is bytes, U+0000-U+00FF")))
+            };
+            Data::UserDefined(UserDefined {
+                user_id: o.required("user_id", o.char("user_id")?)?,
+                packet_type: o.required("packet_type", o.char("packet_type")?)?,
+                data: byte_text("data")?,
+            })
+        }
+        "test" => Data::Test(TestData { data: o.text("data")? }),
+        "agrelo-df" => {
+            Data::AgreloDf(AgreloDf { bearing_degrees: o.required_int("bearing_degrees")?, quality: o.required_int("quality")? })
+        }
+        _ => Data::Unrecognized(
+            o.choice(
+                "reason",
+                &[
+                    ("empty", Unrecognized::Empty),
+                    ("not-aprs", Unrecognized::NotAprs),
+                    ("reserved-data-type", Unrecognized::ReservedDataType),
+                    ("malformed", Unrecognized::Malformed),
+                ],
+            )?
+            .unwrap_or(Unrecognized::Malformed),
+        ),
+    })
 }
 
 /// A destination address; an empty one (a tolerated defect, UAP 5.2) is only made by decoding
 /// a header that has one.
-fn read_destination(text: &str) -> Address {
+fn read_destination(text: &str) -> Read<Address> {
     if text.is_empty() {
-        return Packet::decode_tnc2(b"N0CALL>:", ParseOptions::LENIENT).expect("an empty destination is tolerated").destination;
+        return Ok(Packet::decode_tnc2(b"N0CALL>:", ParseOptions::LENIENT).expect("an empty destination is tolerated").destination);
     }
-    Address::new(text).unwrap()
+    Address::new(text).or_else(|_| unsupported("packet.destination: not an address".into()))
 }
 
 /// A diagnostic from its neutral form, `severity:code`; the message and offset are not part of it.
-fn read_diagnostic(text: &str) -> Diagnostic {
-    let (severity, code) = text.split_once(':').expect("a diagnostic is severity:code");
-    Diagnostic {
-        severity: match severity {
-            "info" => Severity::Info,
-            "warning" => Severity::Warning,
-            _ => Severity::Error,
-        },
-        code: Code::from_id(code).unwrap_or_else(|| panic!("unknown diagnostic code {code}")),
-        message: String::new(),
-        offset: None,
-    }
+fn read_diagnostic(text: &str) -> Read<Diagnostic> {
+    let Some((severity, code)) = text.split_once(':') else {
+        return unsupported("packet.diagnostics: not severity:code".into());
+    };
+    let severity = match severity {
+        "info" => Severity::Info,
+        "warning" => Severity::Warning,
+        "error" => Severity::Error,
+        _ => return unsupported("packet.diagnostics: not a severity".into()),
+    };
+    let Some(code) = Code::from_id(code) else {
+        return unsupported("packet.diagnostics: not a code this crate has".into());
+    };
+    Ok(Diagnostic { severity, code, message: String::new(), offset: None })
 }
 
 pub fn read_path_entry(text: &str) -> PathEntry {
-    match text.strip_suffix('*') {
-        Some(t) => PathEntry { address: Address::new(t).unwrap(), used: true },
-        None => PathEntry::new(Address::new(text).unwrap()),
+    read_path_entry_checked(text).unwrap_or_else(|e| panic!("{e}"))
+}
+
+fn read_path_entry_checked(text: &str) -> Read<PathEntry> {
+    let (address, used) = match text.strip_suffix('*') {
+        Some(t) => (t, true),
+        None => (text, false),
+    };
+    let address = Address::new(address).or_else(|_| unsupported("path: not an address".into()))?;
+    Ok(PathEntry { address, used })
+}
+
+fn read_timestamp(o: &Keys) -> Read<Option<Timestamp>> {
+    let Some(t) = o.string("timestamp")? else { return Ok(None) };
+    let b = t.as_bytes();
+    match Timestamp::parse(b).or_else(|| Timestamp::parse_mdhm(b)) {
+        Some(ts) => Ok(Some(ts)),
+        None => unsupported("timestamp: not a timestamp as on air".into()),
     }
 }
 
-fn strings(v: Option<&Value>) -> Vec<String> {
-    v.map(|a| a.as_array().unwrap().iter().map(|x| x.as_str().unwrap().to_string()).collect()).unwrap_or_default()
-}
-
-fn read_timestamp(v: Option<&Value>) -> Option<Timestamp> {
-    let t = v?.as_str()?.as_bytes();
-    Timestamp::parse(t).or_else(|| Timestamp::parse_mdhm(t))
-}
-
-fn read_symbol(t: &str) -> Symbol {
+fn read_symbol(o: &Keys) -> Read<Option<Symbol>> {
+    let Some(t) = o.string("symbol")? else { return Ok(None) };
     let mut c = t.chars();
-    Symbol { table: c.next().unwrap(), code: c.next().unwrap() }
+    match (c.next(), c.next(), c.next()) {
+        (Some(table), Some(code), None) => Ok(Some(Symbol { table, code })),
+        _ => unsupported("symbol: not a table and a code".into()),
+    }
 }
 
-fn read_mic_e_message(t: &str) -> MicEMessage {
-    match t {
+fn read_mic_e_message(o: &Keys) -> Read<Option<MicEMessage>> {
+    let Some(t) = o.string("mic_e_message")? else { return Ok(None) };
+    Ok(Some(match t.as_str() {
         "off-duty" => MicEMessage::OffDuty,
         "en-route" => MicEMessage::EnRoute,
         "in-service" => MicEMessage::InService,
@@ -610,183 +935,261 @@ fn read_mic_e_message(t: &str) -> MicEMessage {
         "priority" => MicEMessage::Priority,
         "emergency" => MicEMessage::Emergency,
         "unknown" => MicEMessage::Unknown,
-        custom => MicEMessage::Custom(custom.trim_start_matches("custom").parse().unwrap()),
-    }
-}
-
-fn read_positioned(o: &Map<String, Value>) -> Positioned {
-    let f64_of = |k: &str| o.get(k).and_then(Value::as_f64);
-    let u = |v: &Value, k: &str| v[k].as_u64().unwrap() as u8;
-    Positioned {
-        position: Position {
-            latitude: f64_of("latitude").unwrap(),
-            longitude: f64_of("longitude").unwrap(),
-            ambiguity: o.get("ambiguity").and_then(Value::as_u64).unwrap_or(0) as u8,
+        custom => match custom.strip_prefix("custom").and_then(|n| n.parse::<u8>().ok()) {
+            Some(n) => MicEMessage::Custom(n),
+            None => return unsupported("mic_e_message: not a value this crate has".into()),
         },
-        symbol: read_symbol(o["symbol"].as_str().unwrap()),
-        compressed: o.get("compressed").and_then(Value::as_bool).unwrap_or(false),
-        compression: o.get("compression").map(|c| CompressionType {
-            fix: if c["fix"] == "current" { GpsFix::Current } else { GpsFix::Old },
-            source: match c["source"].as_str().unwrap() {
-                "gll" => NmeaSource::Gll,
-                "gga" => NmeaSource::Gga,
-                "rmc" => NmeaSource::Rmc,
-                _ => NmeaSource::Other,
-            },
-            origin: match c["origin"].as_str().unwrap() {
-                "compressed" => CompressionOrigin::Compressed,
-                "tnc-beacon-text" => CompressionOrigin::TncBeaconText,
-                "software" => CompressionOrigin::Software,
-                "reserved3" => CompressionOrigin::Reserved3,
-                "kpc3" => CompressionOrigin::Kpc3,
-                "pico" => CompressionOrigin::Pico,
-                "other-tracker" => CompressionOrigin::OtherTracker,
-                _ => CompressionOrigin::DigipeaterConversion,
-            },
-        }),
-        course_degrees: o.get("course_degrees").and_then(Value::as_u64).map(|v| v as u16),
-        speed_knots: f64_of("speed_knots"),
-        altitude_feet: f64_of("altitude_feet"),
-        phg: o.get("phg").map(|p| Phg {
-            power: u(p, "power"),
-            height: u(p, "height"),
-            gain: u(p, "gain"),
-            directivity: u(p, "directivity"),
-            beacons_per_hour: p.get("beacons_per_hour").and_then(Value::as_u64).map(|v| v as u8),
-        }),
-        range_miles: f64_of("range_miles"),
-        dfs: o.get("dfs").map(|d| DfSignalStrength {
-            strength: u(d, "strength"),
-            height: u(d, "height"),
-            gain: u(d, "gain"),
-            directivity: u(d, "directivity"),
-        }),
-        area: o.get("area").map(|a| AreaObject {
-            shape: [
-                AreaShape::OpenCircle,
-                AreaShape::LineDownRight,
-                AreaShape::OpenEllipse,
-                AreaShape::OpenTriangle,
-                AreaShape::OpenBox,
-                AreaShape::FilledCircle,
-                AreaShape::LineDownLeft,
-                AreaShape::FilledEllipse,
-                AreaShape::FilledTriangle,
-                AreaShape::FilledBox,
-            ]
-            .into_iter()
-            .find(|s| enum_name(*s) == a["shape"].as_str().unwrap())
-            .unwrap(),
-            lat_offset: u(a, "lat_offset"),
-            color: ALL_COLORS.into_iter().find(|c| color(*c) == a["color"].as_str().unwrap()).unwrap(),
-            lon_offset: u(a, "lon_offset"),
-            corridor_width_miles: a.get("corridor_width_miles").and_then(Value::as_u64).map(|v| v as u16),
-        }),
-        df_bearing: o.get("df_bearing").map(|b| DfBearing {
-            bearing_degrees: b["bearing_degrees"].as_u64().unwrap() as u16,
-            number: u(b, "number"),
-            range: u(b, "range"),
-            quality: u(b, "quality"),
-        }),
-        storm: o.get("storm").map(|s| {
-            let n = |k: &str| s.get(k).and_then(Value::as_u64).map(|v| v as u16);
-            Storm {
-                kind: match s["type"].as_str().unwrap() {
-                    "tropical-storm" => StormKind::TropicalStorm,
-                    "hurricane" => StormKind::Hurricane,
-                    _ => StormKind::TropicalDepression,
-                },
-                sustained_wind_knots: n("sustained_wind_knots"),
-                gust_knots: n("gust_knots"),
-                central_pressure_mbar: n("central_pressure_mbar"),
-                hurricane_radius_nm: n("hurricane_radius_nm"),
-                tropical_storm_radius_nm: n("tropical_storm_radius_nm"),
-                whole_gale_radius_nm: n("whole_gale_radius_nm"),
-            }
-        }),
-        dao: o.get("dao").map(|d| Dao {
-            datum: d["datum"].as_str().unwrap().chars().next().unwrap(),
-            precision: match d["precision"].as_str().unwrap() {
-                "thousandths" => DaoPrecision::Thousandths,
-                "base91" => DaoPrecision::Base91,
-                _ => DaoPrecision::None,
-            },
-        }),
-        telemetry: o.get("telemetry").map(|t| CommentTelemetry {
-            sequence: t["sequence"].as_u64().unwrap() as u16,
-            analog: t["analog"].as_array().unwrap().iter().map(|x| x.as_u64().unwrap() as u16).collect(),
-            digital: t.get("digital").and_then(Value::as_u64).map(|v| v as u8),
-        }),
-        frequency: o.get("frequency").map(|f| VoiceFrequency {
-            mhz: f["mhz"].as_f64().unwrap(),
-            tone: f.get("tone").map(|t| match t.as_str().unwrap() {
-                "off" => Tone::Off,
-                "tone-burst" => Tone::ToneBurst,
-                "tone" => Tone::Tone,
-                "ctcss" => Tone::Ctcss,
-                _ => Tone::Dcs,
-            }),
-            tone_value: f.get("tone_value").and_then(Value::as_u64).map(|v| v as u16),
-            offset_khz: f.get("offset_khz").and_then(Value::as_i64).map(|v| v as i32),
-            range: f.get("range").and_then(Value::as_u64).map(|v| v as u16),
-            range_km: f.get("range_km").and_then(Value::as_bool).unwrap_or(false),
-            narrow: f.get("narrow").and_then(Value::as_bool).unwrap_or(false),
-            ten_khz_resolution: f.get("ten_khz_resolution").and_then(Value::as_bool).unwrap_or(false),
-        }),
-        weather: o.get("weather").map(read_weather),
-        signpost: o.get("signpost").and_then(Value::as_str).map(str::to_string),
-        comment: o.get("comment").and_then(Value::as_str).unwrap_or_default().to_string(),
-    }
+    }))
 }
 
-const ALL_COLORS: [AreaColor; 16] = [
-    AreaColor::Black,
-    AreaColor::Blue,
-    AreaColor::Green,
-    AreaColor::Cyan,
-    AreaColor::Red,
-    AreaColor::Violet,
-    AreaColor::Yellow,
-    AreaColor::Gray,
-    AreaColor::BlackLow,
-    AreaColor::BlueLow,
-    AreaColor::GreenLow,
-    AreaColor::CyanLow,
-    AreaColor::RedLow,
-    AreaColor::VioletLow,
-    AreaColor::YellowLow,
-    AreaColor::GrayLow,
+const SHAPES: [(&str, AreaShape); 10] = [
+    ("open-circle", AreaShape::OpenCircle),
+    ("line-down-right", AreaShape::LineDownRight),
+    ("open-ellipse", AreaShape::OpenEllipse),
+    ("open-triangle", AreaShape::OpenTriangle),
+    ("open-box", AreaShape::OpenBox),
+    ("filled-circle", AreaShape::FilledCircle),
+    ("line-down-left", AreaShape::LineDownLeft),
+    ("filled-ellipse", AreaShape::FilledEllipse),
+    ("filled-triangle", AreaShape::FilledTriangle),
+    ("filled-box", AreaShape::FilledBox),
 ];
 
-fn read_weather(v: &Value) -> Weather {
-    let f = |k: &str| v.get(k).and_then(Value::as_f64);
-    Weather {
-        wind_direction_degrees: f("wind_direction_degrees").map(|x| x as u16),
-        wind_speed_mph: f("wind_speed_mph"),
-        wind_gust_mph: f("wind_gust_mph"),
-        temperature_f: f("temperature_f"),
-        rain_1h_in: f("rain_1h_in"),
-        rain_24h_in: f("rain_24h_in"),
-        rain_midnight_in: f("rain_midnight_in"),
-        rain_raw: f("rain_raw").map(|x| x as u32),
-        humidity_percent: f("humidity_percent").map(|x| x as u8),
-        pressure_mbar: f("pressure_mbar"),
-        luminosity_w_m2: f("luminosity_w_m2").map(|x| x as u16),
-        snow_24h_in: f("snow_24h_in"),
-        software: v.get("software").and_then(Value::as_str).and_then(|s| s.chars().next()),
-        unit: v.get("unit").and_then(Value::as_str).map(str::to_string),
-        extra: v
-            .get("extra")
-            .map(|a| {
-                a.as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|e| WeatherField {
-                        letter: e["letter"].as_str().unwrap().chars().next().unwrap(),
-                        value: e["value"].as_str().unwrap().to_string(),
-                    })
-                    .collect()
+const COLORS: [(&str, AreaColor); 16] = [
+    ("black", AreaColor::Black),
+    ("blue", AreaColor::Blue),
+    ("green", AreaColor::Green),
+    ("cyan", AreaColor::Cyan),
+    ("red", AreaColor::Red),
+    ("violet", AreaColor::Violet),
+    ("yellow", AreaColor::Yellow),
+    ("gray", AreaColor::Gray),
+    ("black-low", AreaColor::BlackLow),
+    ("blue-low", AreaColor::BlueLow),
+    ("green-low", AreaColor::GreenLow),
+    ("cyan-low", AreaColor::CyanLow),
+    ("red-low", AreaColor::RedLow),
+    ("violet-low", AreaColor::VioletLow),
+    ("yellow-low", AreaColor::YellowLow),
+    ("gray-low", AreaColor::GrayLow),
+];
+
+fn read_positioned(o: &Keys) -> Read<Positioned> {
+    Ok(Positioned {
+        position: Position {
+            latitude: o.required_float("latitude")?,
+            longitude: o.required_float("longitude")?,
+            ambiguity: o.int("ambiguity")?.unwrap_or(0),
+        },
+        symbol: o.required("symbol", read_symbol(o)?)?,
+        compressed: o.flag("compressed")?,
+        compression: match o.object("compression", &["fix", "source", "origin"])? {
+            None => None,
+            Some(c) => Some(CompressionType {
+                fix: c.required("fix", c.choice("fix", &[("old", GpsFix::Old), ("current", GpsFix::Current)])?)?,
+                source: c.required(
+                    "source",
+                    c.choice(
+                        "source",
+                        &[("other", NmeaSource::Other), ("gll", NmeaSource::Gll), ("gga", NmeaSource::Gga), ("rmc", NmeaSource::Rmc)],
+                    )?,
+                )?,
+                origin: c.required(
+                    "origin",
+                    c.choice(
+                        "origin",
+                        &[
+                            ("compressed", CompressionOrigin::Compressed),
+                            ("tnc-beacon-text", CompressionOrigin::TncBeaconText),
+                            ("software", CompressionOrigin::Software),
+                            ("reserved3", CompressionOrigin::Reserved3),
+                            ("kpc3", CompressionOrigin::Kpc3),
+                            ("pico", CompressionOrigin::Pico),
+                            ("other-tracker", CompressionOrigin::OtherTracker),
+                            ("digipeater-conversion", CompressionOrigin::DigipeaterConversion),
+                        ],
+                    )?,
+                )?,
+            }),
+        },
+        course_degrees: o.int("course_degrees")?,
+        speed_knots: o.float("speed_knots")?,
+        altitude_feet: o.float("altitude_feet")?,
+        phg: match o.object("phg", &["power", "height", "gain", "directivity", "beacons_per_hour"])? {
+            None => None,
+            Some(p) => Some(Phg {
+                power: p.required_int("power")?,
+                height: p.required_int("height")?,
+                gain: p.required_int("gain")?,
+                directivity: p.required_int("directivity")?,
+                beacons_per_hour: p.int("beacons_per_hour")?,
+            }),
+        },
+        range_miles: o.float("range_miles")?,
+        dfs: match o.object("dfs", &["strength", "height", "gain", "directivity"])? {
+            None => None,
+            Some(d) => Some(DfSignalStrength {
+                strength: d.required_int("strength")?,
+                height: d.required_int("height")?,
+                gain: d.required_int("gain")?,
+                directivity: d.required_int("directivity")?,
+            }),
+        },
+        area: match o.object("area", &["shape", "lat_offset", "color", "lon_offset", "corridor_width_miles"])? {
+            None => None,
+            Some(a) => Some(AreaObject {
+                shape: a.required("shape", a.choice("shape", &SHAPES)?)?,
+                lat_offset: a.required_int("lat_offset")?,
+                color: a.required("color", a.choice("color", &COLORS)?)?,
+                lon_offset: a.required_int("lon_offset")?,
+                corridor_width_miles: a.int("corridor_width_miles")?,
+            }),
+        },
+        df_bearing: match o.object("df_bearing", &["bearing_degrees", "number", "range", "quality"])? {
+            None => None,
+            Some(b) => Some(DfBearing {
+                bearing_degrees: b.required_int("bearing_degrees")?,
+                number: b.required_int("number")?,
+                range: b.required_int("range")?,
+                quality: b.required_int("quality")?,
+            }),
+        },
+        storm: match o.object(
+            "storm",
+            &[
+                "type",
+                "sustained_wind_knots",
+                "gust_knots",
+                "central_pressure_mbar",
+                "hurricane_radius_nm",
+                "tropical_storm_radius_nm",
+                "whole_gale_radius_nm",
+            ],
+        )? {
+            None => None,
+            Some(s) => Some(Storm {
+                kind: s.required(
+                    "type",
+                    s.choice(
+                        "type",
+                        &[
+                            ("tropical-storm", StormKind::TropicalStorm),
+                            ("hurricane", StormKind::Hurricane),
+                            ("tropical-depression", StormKind::TropicalDepression),
+                        ],
+                    )?,
+                )?,
+                sustained_wind_knots: s.int("sustained_wind_knots")?,
+                gust_knots: s.int("gust_knots")?,
+                central_pressure_mbar: s.int("central_pressure_mbar")?,
+                hurricane_radius_nm: s.int("hurricane_radius_nm")?,
+                tropical_storm_radius_nm: s.int("tropical_storm_radius_nm")?,
+                whole_gale_radius_nm: s.int("whole_gale_radius_nm")?,
+            }),
+        },
+        dao: match o.object("dao", &["datum", "precision"])? {
+            None => None,
+            Some(d) => Some(Dao {
+                datum: d.required("datum", d.char("datum")?)?,
+                precision: d
+                    .choice(
+                        "precision",
+                        &[("none", DaoPrecision::None), ("thousandths", DaoPrecision::Thousandths), ("base91", DaoPrecision::Base91)],
+                    )?
+                    .unwrap_or(DaoPrecision::None),
+            }),
+        },
+        telemetry: match o.object("telemetry", &["sequence", "analog", "digital"])? {
+            None => None,
+            Some(t) => Some(CommentTelemetry {
+                sequence: t.required_int("sequence")?,
+                analog: t
+                    .array("analog")?
+                    .map(|a| a.iter().map(|x| whole(x).and_then(|n| u16::try_from(n).ok())).collect::<Option<Vec<u16>>>())
+                    .unwrap_or(Some(Vec::new()))
+                    .ok_or_else(|| Unreadable::Unsupported("telemetry.analog: each is a whole number, 0-65535".into()))?,
+                digital: t.int("digital")?,
+            }),
+        },
+        frequency: match o
+            .object("frequency", &["mhz", "tone", "tone_value", "offset_khz", "range", "range_km", "narrow", "ten_khz_resolution"])?
+        {
+            None => None,
+            Some(f) => Some(VoiceFrequency {
+                mhz: f.required_float("mhz")?,
+                tone: f.choice(
+                    "tone",
+                    &[
+                        ("off", Tone::Off),
+                        ("tone", Tone::Tone),
+                        ("ctcss", Tone::Ctcss),
+                        ("dcs", Tone::Dcs),
+                        ("tone-burst", Tone::ToneBurst),
+                    ],
+                )?,
+                tone_value: f.int("tone_value")?,
+                offset_khz: f.int("offset_khz")?,
+                range: f.int("range")?,
+                range_km: f.flag("range_km")?,
+                narrow: f.flag("narrow")?,
+                ten_khz_resolution: f.flag("ten_khz_resolution")?,
+            }),
+        },
+        weather: read_weather(o)?,
+        signpost: o.string("signpost")?,
+        comment: o.text("comment")?,
+    })
+}
+
+fn read_weather(o: &Keys) -> Read<Option<Weather>> {
+    let Some(w) = o.object(
+        "weather",
+        &[
+            "wind_direction_degrees",
+            "wind_speed_mph",
+            "wind_gust_mph",
+            "temperature_f",
+            "rain_1h_in",
+            "rain_24h_in",
+            "rain_midnight_in",
+            "rain_raw",
+            "humidity_percent",
+            "pressure_mbar",
+            "luminosity_w_m2",
+            "snow_24h_in",
+            "software",
+            "unit",
+            "extra",
+        ],
+    )?
+    else {
+        return Ok(None);
+    };
+    let extra = match w.array("extra")? {
+        None => Vec::new(),
+        Some(a) => a
+            .iter()
+            .map(|e| {
+                let e = Keys::new(e, "weather.extra", &["letter", "value"])?;
+                Ok(WeatherField { letter: e.required("letter", e.char("letter")?)?, value: e.text("value")? })
             })
-            .unwrap_or_default(),
-    }
+            .collect::<Read<Vec<WeatherField>>>()?,
+    };
+    Ok(Some(Weather {
+        wind_direction_degrees: w.int("wind_direction_degrees")?,
+        wind_speed_mph: w.float("wind_speed_mph")?,
+        wind_gust_mph: w.float("wind_gust_mph")?,
+        temperature_f: w.float("temperature_f")?,
+        rain_1h_in: w.float("rain_1h_in")?,
+        rain_24h_in: w.float("rain_24h_in")?,
+        rain_midnight_in: w.float("rain_midnight_in")?,
+        rain_raw: w.int("rain_raw")?,
+        humidity_percent: w.int("humidity_percent")?,
+        pressure_mbar: w.float("pressure_mbar")?,
+        luminosity_w_m2: w.int("luminosity_w_m2")?,
+        snow_24h_in: w.float("snow_24h_in")?,
+        software: w.char("software")?,
+        unit: w.string("unit")?,
+        extra,
+    }))
 }

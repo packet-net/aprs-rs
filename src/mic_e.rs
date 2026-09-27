@@ -392,8 +392,16 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     if course > 360 {
         return Err(EncodeError::new("course must be 0-360 degrees"));
     }
-    // The encodings the spec's own examples use: speed tens from 'l', course hundreds + 4.
-    out.push((if speed < 200 { 108 + speed / 10 } else { 28 + speed / 10 }) as u8);
+    // A course of 0 is how Mic-E sends no course, so it would read back as none.
+    if f.course_degrees == Some(0) {
+        return Err(EncodeError::new(
+            "a Mic-E course of 0 means an unknown course (APRS12c ch. 10), so it cannot be sent: due north is 360",
+        ));
+    }
+    // The printable forms APRS12c ch. 10 allows, as its own examples use them: speed tens + 80 from
+    // 'l' below 190 knots, then '/' for 190-199 (the other form is DEL, a control character), and
+    // course hundreds + 4.
+    out.push((if speed < 190 { 108 + speed / 10 } else { 28 + speed / 10 }) as u8);
     out.push((32 + (speed % 10) * 10 + course / 100) as u8);
     out.push((28 + course % 100) as u8);
     out.push(f.symbol.code as u8);
@@ -468,7 +476,7 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     } else if let Some(dfs) = f.dfs {
         encode::dfs_codes(&mut out, dfs)?;
     }
-    let extension = out.len() > before_extension;
+    let after_extension = (out.len() > before_extension).then_some(out.len());
     if let Some(feet) = altitude_in_text {
         let n = libm::round(feet);
         if !(-99_999.0..=999_999.0).contains(&n) {
@@ -482,7 +490,9 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     }
 
     if let Some(fr) = &f.frequency {
-        if extension {
+        // Straight after a data extension, a `/` (a PHGR already ends in one), as in a position's
+        // comment; after a /A= altitude, straight on.
+        if after_extension == Some(out.len()) && out.last() != Some(&b'/') {
             out.push(b'/');
         }
         encode::frequency(&mut out, fr)?;
@@ -510,7 +520,17 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
 
     let text_at = out.len();
     let needs_space = !text.is_empty() && f.frequency.is_some();
-    let separators: &[&[u8]] = if needs_space { &[b" ", b"", b" /"] } else { &[b"", b"/"] };
+    // Status text that would start with a type code character or 0x1D (Rev 0 telemetry) is written
+    // after a `/`, even when it would read back without one (vectors README, Encoding). Only the
+    // start of the status text counts: after a type code or telemetry, it is written straight on.
+    let status_starts_with_code = text_at == status_start && matches!(text.first(), Some(b'`' | b'\'' | b'>' | b']' | b' ' | 0x1D));
+    let separators: &[&[u8]] = if needs_space {
+        &[b" ", b"", b" /"]
+    } else if status_starts_with_code {
+        &[b"/"]
+    } else {
+        &[b"", b"/"]
+    };
     for separator in separators {
         out.truncate(text_at);
         out.extend_from_slice(separator);

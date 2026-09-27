@@ -111,6 +111,22 @@ fn an_object_announcing_a_repeater() {
 }
 
 #[test]
+fn a_voice_frequency_comes_first_in_the_comment() {
+    // Radios read the frequency in the first bytes of the comment (APRS12c ch. 18). After a data
+    // extension it follows a `/`, which a PHGR already ends in; the altitude and the text come after.
+    let at = (49.0 + 3.50 / 60.0, -(72.0 + 1.75 / 60.0));
+    let phg = Phg { power: 5, height: 1, gain: 3, directivity: 2, beacons_per_hour: None };
+    let repeater = me().position(at.0, at.1).symbol(Symbol::REPEATER).frequency(146.52).tone(100.0).altitude(1234.0).comment("Net 8pm");
+    assert_eq!(sent(repeater.clone().build().unwrap()), "M0LTE>APZ001:!4903.50N/07201.75Wr146.520MHz T100/A=001234 Net 8pm");
+    assert_eq!(
+        sent(repeater.clone().phg(phg).build().unwrap()),
+        "M0LTE>APZ001:!4903.50N/07201.75WrPHG5132/146.520MHz T100/A=001234 Net 8pm"
+    );
+    let phgr = Phg { beacons_per_hour: Some(4), ..phg };
+    assert_eq!(sent(repeater.phg(phgr).build().unwrap()), "M0LTE>APZ001:!4903.50N/07201.75WrPHG51324/146.520MHz T100/A=001234 Net 8pm");
+}
+
+#[test]
 fn a_permanent_object_and_a_killed_one() {
     let obj = me().object("MYRPTR").at(51.45, -0.98).symbol(Symbol::REPEATER).permanent();
     assert_eq!(sent(obj.clone().build().unwrap()), "M0LTE>APZ001:;MYRPTR   *111111z5127.00N/00058.80Wr");
@@ -240,6 +256,9 @@ fn what_the_spec_forbids_is_refused_when_built() {
     let phg = Phg { power: 5, height: 3, gain: 6, directivity: 0, beacons_per_hour: None };
     assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().phg(phg).build().is_err());
     assert!(me().telemetry(1).analog(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).build().is_err());
+    // Mic-E sends an unknown course as 0 (APRS12c ch. 10), so north is 360.
+    assert!(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).course(0).build().is_err());
+    assert!(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).course(360).build().is_ok());
 }
 
 #[test]
