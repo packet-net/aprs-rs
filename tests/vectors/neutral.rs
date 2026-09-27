@@ -537,6 +537,7 @@ pub fn read_data(v: &Value) -> Data {
                 information,
                 data,
                 diagnostics: strings(p.get("diagnostics")).iter().map(|d| read_diagnostic(d)).collect(),
+                third_party: true,
             }))
         }
         "user-defined" => Data::UserDefined(UserDefined {

@@ -184,6 +184,10 @@ pub struct Packet {
     pub data: Data,
     /// What the decoder noticed, header first.
     pub diagnostics: Vec<Diagnostic>,
+    /// This packet was carried inside a third-party packet ([`Data::ThirdParty`]). Its header is
+    /// kept as sent: an APRS-IS q-construct is read only in the outer header, so
+    /// [`Packet::q_construct`] finds none here.
+    pub third_party: bool,
 }
 
 impl Packet {
@@ -262,7 +266,9 @@ impl Packet {
             }
         }
 
-        Ok(Packet::decode_with_context(ctx, source, destination, path, info))
+        let mut packet = Packet::decode_with_context(ctx, source, destination, path, info);
+        packet.third_party = third_party;
+        Ok(packet)
     }
 
     /// Decodes an AX.25 UI frame in KISS form: addresses, control and PID, information; no flags, no FCS.
@@ -314,7 +320,7 @@ impl Packet {
 
     fn decode_with_context(mut ctx: Context, source: Address, destination: Address, path: Vec<PathEntry>, information: &[u8]) -> Packet {
         let data = crate::decode::information(&mut ctx, &source, &destination, &path, information);
-        Packet { source, destination, path, information: information.to_vec(), data, diagnostics: ctx.diagnostics }
+        Packet { source, destination, path, information: information.to_vec(), data, diagnostics: ctx.diagnostics, third_party: false }
     }
 
     /// Builds a packet from data, encoding its information field. For Mic-E data use
@@ -325,7 +331,7 @@ impl Packet {
         }
         let information = data.encode()?;
         let decoded = Packet::decode(source.clone(), destination.clone(), path.clone(), &information, ParseOptions::STRICT);
-        Ok(Packet { source, destination, path, information, data, diagnostics: decoded.diagnostics })
+        Ok(Packet { source, destination, path, information, data, diagnostics: decoded.diagnostics, third_party: false })
     }
 
     /// Builds a Mic-E packet: the information field and the destination address that carries the
@@ -333,7 +339,15 @@ impl Packet {
     pub fn create_mic_e(source: Address, report: crate::MicEReport, path: Vec<PathEntry>) -> Result<Packet, EncodeError> {
         let (destination, information) = crate::mic_e::encode(&report)?;
         let decoded = Packet::decode(source.clone(), destination.clone(), path.clone(), &information, ParseOptions::STRICT);
-        Ok(Packet { source, destination, path, information, data: Data::MicE(report), diagnostics: decoded.diagnostics })
+        Ok(Packet {
+            source,
+            destination,
+            path,
+            information,
+            data: Data::MicE(report),
+            diagnostics: decoded.diagnostics,
+            third_party: false,
+        })
     }
 
     /// Whether any diagnostic is a warning.
@@ -346,8 +360,13 @@ impl Packet {
         self.diagnostics.iter().any(|d| d.severity == Severity::Error)
     }
 
-    /// The first APRS-IS q-construct in the path, and the station after it.
+    /// The first APRS-IS q-construct in the path, and the station after it. `None` for a packet
+    /// carried inside a third-party packet, whose path is kept as sent: a q-construct is read only
+    /// in the outer header.
     pub fn q_construct(&self) -> Option<QConstruct<'_>> {
+        if self.third_party {
+            return None;
+        }
         let i = self.path.iter().position(|e| is_q_construct(e.address.as_str()))?;
         Some(QConstruct { construct: self.path[i].address.as_str(), station: self.path.get(i + 1).map(|e| &e.address) })
     }
