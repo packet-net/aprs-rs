@@ -284,10 +284,13 @@ fn footprint(rest: &[u8]) -> Option<Footprint> {
     if parts.len() != 3 {
         return None;
     }
-    // Degrees as a decimal number, with a minus sign or (for a positive value) a leading space.
+    // Degrees as a decimal number, with a minus sign or, only for a positive value, a leading
+    // space ("Note the leading space in the latitude, as its value is positive", APRS12c ch. 15).
     let signed = |t: &str, limit: f64| -> Option<f64> {
-        let t = t.strip_prefix(' ').unwrap_or(t);
-        let digits = t.strip_prefix('-').unwrap_or(t);
+        let (t, digits) = match t.strip_prefix(' ') {
+            Some(positive) => (positive, positive),
+            None => (t, t.strip_prefix('-').unwrap_or(t)),
+        };
         let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
         if (whole.is_empty() && fraction.is_empty())
             || !whole.bytes().all(|b| b.is_ascii_digit())
@@ -448,7 +451,8 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                 if !(-90.0..=90.0).contains(&f.latitude) || !(-180.0..=180.0).contains(&f.longitude) || f.radius_miles > 9999 {
                     return Err(EncodeError::new("a query footprint is within -90..90, -180..180 and a radius of up to 9999 miles"));
                 }
-                let signed = |v: f64| if v < 0.0 { format!("{v}") } else { format!(" {v}") };
+                // A space only before a positive value; a negative one (-0 included) has its sign.
+                let signed = |v: f64| if v.is_sign_negative() { format!("{v}") } else { format!(" {v}") };
                 out.extend_from_slice(format!("{},{},{:04}", signed(f.latitude), signed(f.longitude), f.radius_miles).as_bytes());
             }
         }
