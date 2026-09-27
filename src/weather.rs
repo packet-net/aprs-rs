@@ -6,44 +6,80 @@ use alloc::vec::Vec;
 use crate::context::Context;
 use crate::{Code, EncodeError, Weather, WeatherField};
 
-/// Reads letter-and-value weather fields from the start of `bytes` into `weather`, and returns the
-/// bytes used; `None` when a defect was not tolerated. A `positionless` report starts with `c`
-/// (wind direction) and `s` (wind speed) fields, and so does a positioned one that sent them
-/// instead of the `DDD/SSS` extension (`wind_as_fields`); any other `s` is snowfall. The run
-/// stops at the first thing that is not a field: an unknown byte, a letter out of place (`c` once
-/// the wind is read) or a field seen before.
-pub(crate) fn fields(
-    ctx: &mut Context,
-    bytes: &[u8],
-    offset: usize,
-    weather: &mut Weather,
-    positionless: bool,
-    wind_as_fields: bool,
-) -> Option<usize> {
+/// How the wind is read from the weather fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Wind {
+    /// A positionless report: `c` and `s` are the wind, wherever they come, until each is read.
+    Positionless,
+    /// Already known, from the `DDD/SSS` extension or the compressed cs bytes: `c` ends the
+    /// fields and `s` is snowfall.
+    Known,
+    /// A positioned report without the extension: a `c` field, wherever it comes, is the wind
+    /// direction, and once it is read an `s` is the wind speed until that is read
+    /// (`wind-fields-instead-of-extension`).
+    AsFields,
+}
+
+/// What a run of weather fields held.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Run {
+    /// Bytes used.
+    pub(crate) len: usize,
+    /// A wind direction was read from a `c` field.
+    pub(crate) direction: bool,
+    /// A wind speed was read from an `s` field.
+    pub(crate) speed: bool,
+}
+
+/// Reads letter-and-value weather fields from the start of `bytes` into `weather`; `None` when a
+/// defect was not tolerated. Which field a letter is depends on what has been read (vectors
+/// interpretations.md, "Which weather field a letter is"): `c` is the wind direction until the
+/// wind is known, but only with a value after it; when the wind comes as fields, `s` is the wind
+/// speed until the speed is known (see [`Wind`]), and snowfall otherwise; `L` and `l` are one
+/// field, luminosity. The run stops at the first thing that is not a field, at a defined field
+/// already read, and at `c` once the wind direction is known. Extra fields are kept as a list, so
+/// a repeated extra letter does not stop it.
+pub(crate) fn fields(ctx: &mut Context, bytes: &[u8], offset: usize, weather: &mut Weather, wind: Wind) -> Option<Run> {
     let mut at = 0;
-    // Fields read so far; snowfall is `S`, to keep it apart from the wind speed `s`.
+    // Fields read so far, by the field rather than the letter: snowfall is `S`, to keep it apart
+    // from the wind speed `s`, and both luminosity letters are `L`.
     let mut seen: Vec<u8> = Vec::new();
     let mut extra = Vec::new();
-    let mut wind_read = !(positionless || wind_as_fields);
+    let known = wind == Wind::Known;
+    let (mut direction_known, mut speed_known) = (known, known);
+    let mut run = Run { len: 0, direction: false, speed: false };
     while at < bytes.len() {
         let letter = bytes[at];
-        let snow = letter == b's' && wind_read;
+        if letter == b'c' && direction_known {
+            break;
+        }
+        // In a positioned report the wind comes as fields once a c field is read; an s before
+        // that is snowfall (vectors differential/weather-snowfall-keeps-its-width).
+        let snow = letter == b's' && (speed_known || (wind == Wind::AsFields && !run.direction));
         let width = match letter {
-            b'c' if !wind_read => 3,
-            b's' | b'g' | b't' | b'r' | b'p' | b'P' | b'L' | b'l' | b'#' => 3,
+            b'c' | b's' | b'g' | b't' | b'r' | b'p' | b'P' | b'L' | b'l' | b'#' => 3,
             b'h' => 2,
             b'b' => 5,
             _ => 0,
         };
-        let key = if snow { b'S' } else { letter };
-        let field = if width > 0 && !seen.contains(&key) { value(ctx, bytes, at, offset, width, letter, snow)? } else { None };
+        let key = match letter {
+            b's' if snow => b'S',
+            b'l' => b'L',
+            other => other,
+        };
+        if width > 0 && seen.contains(&key) {
+            break;
+        }
+        let field = if width > 0 { value(ctx, bytes, at, offset, width, letter, snow)? } else { None };
         if let Some((v, len)) = field {
             seen.push(key);
             if !assign(ctx, weather, letter, snow, v, offset + at) {
                 return None;
             }
-            if letter == b's' && !snow {
-                wind_read = true;
+            match letter {
+                b'c' => (direction_known, run.direction) = (true, true),
+                b's' if !snow => (speed_known, run.speed) = (true, true),
+                _ => {}
             }
             at += 1 + len;
             continue;
@@ -66,6 +102,7 @@ pub(crate) fn fields(
     if !extra.is_empty() {
         weather.extra = extra;
     }
+    let positionless = wind == Wind::Positionless;
     let complete =
         if positionless { [b'c', b's', b'g', b't'].iter().all(|k| seen.contains(k)) } else { seen.contains(&b'g') && seen.contains(&b't') };
     if !complete
@@ -81,7 +118,8 @@ pub(crate) fn fields(
     {
         return None;
     }
-    Some(at)
+    run.len = at;
+    Some(run)
 }
 
 fn is_known(letter: u8) -> bool {

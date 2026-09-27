@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+Brought into line with the rulings from differential fuzzing of all five implementations (packet-net/aprs-vectors, 120 new cases, the rules in its README and interpretations.md). The vectors submodule moves to them.
+
+**Breaking:** `Nmea` has a new field, `comment`: the text after a sentence's checksum, kept as sent (TinyTrack and FreeTrak send one). `sentence` now ends at the checksum. Code that builds an `Nmea` with a struct literal must set `comment`, or use `..Nmea::default()`.
+
+- `Address::third_party_source`: the source of a packet inside a third-party packet, which APRS12c ch. 17 lets be any 1-9 printable ASCII characters other than `>` and `:`. A third-party packet with such a source (`PY2SP_R-R`) now decodes and re-encodes.
+- NMEA: `$` text must be an NMEA 0183 sentence, or it is `invalid-nmea`: printable ASCII (not DEL), an address field of five upper-case letters or digits (or `P` and three or more), at least one field, no `$`, and `*` only to start the checksum. The checksum ends the sentence and is verified even when a comment follows. Its fields are read one by one, so a short sentence keeps what it has; a coordinate needs a degree digit and minutes under 60; GGA's quality is one digit; a proprietary sentence such as `$PGRMC` is not read as RMC.
+- Mic-E: the Rev 0 data type identifiers 0x1C and 0x1D get an `ObsoleteFormat` info. A PHG straight after the type code is lifted before an altitude is looked for later in the status text, and a `!DAO!` is never joined across a removed altitude.
+- Positions: a latitude's or longitude's range is checked before its hemisphere letter. A late PHG, RNG or DFS is the first well-formed one, so `PHG12` no longer hides a real PHG after it. A garbled timestamp, in an object or a `/` or `@` report, is judged on the position after it, not on the whole report.
+- Weather: the wind is decided where the extension belongs, before any field. A `c` with a value is the wind direction wherever it comes before the wind is known; a bare `c` is not; a direction without a speed is incomplete wind; `L` and `l` are one field, so a second luminosity ends the fields.
+- Messages and queries: a query type is upper-case letters (`?IGAT7?` is `invalid-general-query`, `?APRS000` a plain message); a directed query's target is 1-9 letters, digits or `-`, one space before it is a separator and spaces after it are padding. A general query footprint beyond 90 or 180 degrees is `invalid-general-query`.
+- Telemetry: a value or an `EQNS.` coefficient has no `+`, a coefficient must be a finite number (`0eN` is 0), and only spaces around one are padding.
+- Capabilities: only spaces (U+0020) are trimmed, so a CR is a control character and makes the report free text.
+- Agrelo DF: exactly `%bbb/q`, with a bearing of 000 to 360.
+- The encoder never writes bytes that read back as different data: it writes an equivalent form or refuses. New refusals: course and speed together with a range in compressed cs bytes, a compression type with nothing for the cs bytes to carry, a GGA type with anything but the altitude, a `{` in a telemetry project title, a capability value that starts or ends with a space, a third-party packet whose inner header had a tolerated defect, message data that would read back as something else (an ack, metadata, a query or a bulletin), a telemetry sequence that would not read back, a weather report with a course, speed or data extension other than its wind, a report with the weather station symbol but no weather, and raw weather data that is not printable ASCII.
+- The encoder now writes what it used to refuse: PHG and DFS height codes above 9, a GGA altitude under 1 foot (as cs `!!` and a `/A=`), NWS bulletins longer than 67 characters, a digit `!DAO!` datum with no added precision, and user-defined data with any bytes. A directed query of a type the spec does not define has its target after a space (`?FOO N0QBF`), and an APRSH target is padded to 9 characters.
+- Fixed: a compressed course or wind direction was cut down to the 4-degree step below (103 degrees written as 100); it is now rounded to the nearest (104).
+
 ## 0.2.1
 
 - Mic-E Rev 0 binary telemetry (0x1D and five bytes after the symbol) is read into `MicEReport::legacy_telemetry`, with an `ObsoleteFormat` info, and written back; it was left in the comment. A value of 255 is refused on encoding. The ruling is shared by all five implementations (packet-net/aprs-vectors, "Mic-E Rev 0 binary telemetry").

@@ -12,7 +12,8 @@ use crate::{Code, Data, Diagnostic, ParseOptions, Severity};
 ///
 /// On APRS-IS an address is 1-9 letters, digits or hyphens. Over the air (AX.25) it must also be a
 /// callsign of at most six upper-case letters and digits with an SSID of 0-15;
-/// [`Address::is_ax25`] says whether it is.
+/// [`Address::is_ax25`] says whether it is. The source of a packet inside a third-party packet may
+/// be more: see [`Address::third_party_source`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Address(String);
 
@@ -25,6 +26,18 @@ impl Address {
 
     pub(crate) fn is_valid(text: &str) -> bool {
         (1..=9).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }
+
+    /// The source address of a packet carried inside a third-party packet ([`Data::ThirdParty`]).
+    /// APRS12c ch. 17 lets it be any 1-9 printable ASCII characters other than `>` and `:`
+    /// (`PY2SP_R-R`, say), since it "does not need to adhere to the AX.25 address restrictions".
+    /// Fails for anything else. Such an address is not an APRS-IS address, so use it only there.
+    pub fn third_party_source(text: &str) -> Result<Address, InvalidAddress> {
+        if Address::is_third_party_source(text) { Ok(Address(text.to_string())) } else { Err(InvalidAddress(text.to_string())) }
+    }
+
+    pub(crate) fn is_third_party_source(text: &str) -> bool {
+        (1..=9).contains(&text.len()) && text.bytes().all(|b| (0x20..=0x7E).contains(&b) && b != b'>' && b != b':')
     }
 
     /// An address taken as it came, without checks (an AX.25 address the decoder tolerated).
@@ -176,6 +189,16 @@ pub struct Packet {
 impl Packet {
     /// Decodes a TNC2 / APRS-IS text line, `SOURCE>DEST,PATH:information`.
     pub fn decode_tnc2(line: &[u8], options: ParseOptions) -> Result<Packet, HeaderError> {
+        Packet::decode_tnc2_line(line, options, false)
+    }
+
+    /// Decodes the TNC2 packet inside a third-party packet, whose source need not be an APRS-IS
+    /// address (APRS12c ch. 17; [`Address::third_party_source`]).
+    pub(crate) fn decode_third_party(line: &[u8], options: ParseOptions) -> Result<Packet, HeaderError> {
+        Packet::decode_tnc2_line(line, options, true)
+    }
+
+    fn decode_tnc2_line(line: &[u8], options: ParseOptions, third_party: bool) -> Result<Packet, HeaderError> {
         let mut ctx = Context::new(options);
         let Some(colon) = line.iter().position(|&b| b == b':') else {
             ctx.error(Code::InvalidHeader, "no ':' ends the header (SOURCE>DEST[,PATH]:)", None);
@@ -197,7 +220,11 @@ impl Packet {
 
         let mut fields = rest.split(',');
         let destination = fields.next().unwrap_or("");
-        let source = header_address(&mut ctx, source)?;
+        let source = if third_party && Address::is_third_party_source(source) {
+            Address::unchecked(source.to_string())
+        } else {
+            header_address(&mut ctx, source)?
+        };
         let destination = if destination.is_empty() {
             if !ctx.tolerate(Code::EmptyDestination, "the destination address is empty (UAP 5.2)", None) {
                 return Err(ctx.header_error());

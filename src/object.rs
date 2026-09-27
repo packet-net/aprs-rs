@@ -3,7 +3,7 @@
 use alloc::string::String;
 
 use crate::context::Context;
-use crate::{Code, Data, ItemReport, ObjectReport, Timestamp, decode, text};
+use crate::{Code, Data, ItemReport, ObjectReport, Timestamp, decode, position, text};
 
 /// `;` + name (9, space-padded) + `*` alive or `_` killed + timestamp + position.
 pub(crate) fn object(ctx: &mut Context, info: &[u8]) -> Option<Data> {
@@ -61,10 +61,13 @@ pub(crate) fn object(ctx: &mut Context, info: &[u8]) -> Option<Data> {
     Some(Data::Object(ObjectReport { name, killed, timestamp, fields }))
 }
 
+/// Seven timestamp-shaped bytes with a position after them, judged on the position itself
+/// (latitude, table, longitude and symbol, or the 13 compressed bytes) under the options in
+/// force: a defect later in the report does not change what these bytes are.
 fn garbled_timestamp(ctx: &Context, info: &[u8], at: usize) -> bool {
     info.len() > at + 7
         && (text::all_digits(&info[at..at + 6]) || matches!(info[at + 6], b'z' | b'/' | b'h'))
-        && decode::body(&mut Context::new(ctx.options), info, at + 7, 0).is_some()
+        && position::decode(&mut Context::new(ctx.options), &info[at + 7..], at + 7).is_some()
 }
 
 /// `)` + name (3-9) + `!` alive or `_` killed + position.

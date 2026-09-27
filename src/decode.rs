@@ -27,7 +27,12 @@ pub(crate) fn information(ctx: &mut Context, source: &Address, destination: &Add
     let data = match dti {
         b'!' if info.starts_with(b"!!") => other::raw_weather(ctx, info, RawWeatherFormat::UltimeterLogging, 2),
         b'!' | b'=' | b'/' | b'@' => position_report(ctx, info, 0),
-        b'`' | b'\'' | 0x1C | 0x1D => mic_e::decode(ctx, destination, info),
+        b'`' | b'\'' => mic_e::decode(ctx, destination, info),
+        0x1C | 0x1D => {
+            // Given at the data type identifier, before anything else is checked (vectors README).
+            ctx.info(Code::ObsoleteFormat, "the Mic-E Rev 0 data type identifiers 0x1C and 0x1D are obsolete (APRS12c ch. 10)", Some(0));
+            mic_e::decode(ctx, destination, info)
+        }
         b';' => object::object(ctx, info),
         b')' => object::item(ctx, info),
         b':' => message::decode(ctx, info),
@@ -93,11 +98,15 @@ pub(crate) fn position_report(ctx: &mut Context, info: &[u8], offset: usize) -> 
 
 /// A `/` or `@` report whose timestamp is missing or garbled, a tolerated defect (UAP 5.8). A
 /// position straight after the DTI (the timestamp is missing) is tried first: a timestamp starts
-/// with six digits, so it cannot be mistaken for one. Then seven garbled bytes are skipped.
+/// with six digits, so it cannot be mistaken for one. Then seven garbled bytes are skipped. Where
+/// the position is is judged on the position itself, under the options in force, not on anything
+/// after it (vectors README, "Timestamps that are not there").
 fn bad_timestamp(ctx: &mut Context, info: &[u8], offset: usize, messaging: bool) -> Option<Data> {
     for at in [1, 8] {
         let mut probe = Context::new(ctx.options);
-        let Some(fields) = body(&mut probe, info, at, offset) else { continue };
+        if position::decode(&mut probe, info.get(at..).unwrap_or_default(), offset + at).is_none() {
+            continue;
+        }
         let why = if at == 1 {
             "the timestamp is missing: the position follows the data type identifier (UAP 5.8)"
         } else {
@@ -106,7 +115,7 @@ fn bad_timestamp(ctx: &mut Context, info: &[u8], offset: usize, messaging: bool)
         if !ctx.tolerate(Code::MalformedTimestamp, why, Some(offset + 1)) {
             return None;
         }
-        ctx.diagnostics.extend(probe.diagnostics);
+        let fields = body(ctx, info, at, offset)?;
         return Some(Data::Position(PositionReport { timestamp: None, messaging, fields }));
     }
     ctx.error(Code::MalformedTimestamp, "the timestamp is not timestamp-shaped and no position follows it (UAP 5.8)", Some(offset + 1));

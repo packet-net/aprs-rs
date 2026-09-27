@@ -84,6 +84,12 @@ fn uncompressed(ctx: &mut Context, bytes: &[u8], offset: usize) -> Option<Decode
         ctx.error(Code::InvalidLatitude, "the latitude minutes are 60 or more", Some(offset));
         return None;
     }
+    // The digits and the range come before the hemisphere letter (vectors README, Positions).
+    let latitude = lat_deg + lat_min / 60.0;
+    if latitude > 90.0 {
+        ctx.error(Code::InvalidLatitude, "the latitude is beyond 90 degrees", Some(offset));
+        return None;
+    }
     let north = match lat[7] {
         b'N' => true,
         b'S' => false,
@@ -98,11 +104,6 @@ fn uncompressed(ctx: &mut Context, bytes: &[u8], offset: usize) -> Option<Decode
             return None;
         }
     };
-    let latitude = lat_deg + lat_min / 60.0;
-    if latitude > 90.0 {
-        ctx.error(Code::InvalidLatitude, "the latitude is beyond 90 degrees", Some(offset));
-        return None;
-    }
 
     // The symbol table sits between latitude and longitude.
     let table_ok = matches!(bytes[8], b'/' | b'\\' | b'0'..=b'9' | b'A'..=b'Z');
@@ -130,6 +131,11 @@ fn uncompressed(ctx: &mut Context, bytes: &[u8], offset: usize) -> Option<Decode
         ctx.error(Code::InvalidLongitude, "the longitude minutes are 60 or more", Some(offset + 9));
         return None;
     }
+    let longitude = lon_deg + (lon_min + half_box) / 60.0;
+    if longitude > 180.0 {
+        ctx.error(Code::InvalidLongitude, "the longitude is beyond 180 degrees", Some(offset + 9));
+        return None;
+    }
     let east = match lon[8] {
         b'E' => true,
         b'W' => false,
@@ -144,11 +150,6 @@ fn uncompressed(ctx: &mut Context, bytes: &[u8], offset: usize) -> Option<Decode
             return None;
         }
     };
-    let longitude = lon_deg + (lon_min + half_box) / 60.0;
-    if longitude > 180.0 {
-        ctx.error(Code::InvalidLongitude, "the longitude is beyond 180 degrees", Some(offset + 9));
-        return None;
-    }
 
     let symbol = symbol(ctx, bytes[8], bytes[18], offset + 8, offset + 18, false)?;
     Some(Decoded {
