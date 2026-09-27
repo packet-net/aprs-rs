@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Mic-E Rev 0 binary telemetry (0x1D and five bytes after the symbol) is read into `MicEReport::legacy_telemetry`, with an `ObsoleteFormat` info, and written back; it was left in the comment. A value of 255 is refused on encoding. The ruling is shared by all five implementations (packet-net/aprs-vectors, "Mic-E Rev 0 binary telemetry").
+
 ## 0.2.0
 
 - `Station`: a fluent builder for the packets an application sends, as the C#, Python and TypeScript implementations have. `Station::new("M0LTE-9")?.position(lat, lon).symbol(Symbol::CAR).speed(36.0).build()?`, and the same for objects, items, Mic-E, weather, messages, acks and rejects, bulletins, status and telemetry.
