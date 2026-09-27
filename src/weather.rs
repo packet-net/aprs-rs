@@ -155,6 +155,11 @@ fn value(
     let minus = letter == b't' && avail > 0 && bytes[at + 1] == b'-';
     let from = at + 1 + usize::from(minus);
     let run = bytes[from..].iter().take_while(|&&b| if dots { b == b'.' } else { b.is_ascii_digit() }).count();
+    // A short run of dots is an unknown snowfall only when no digit follows it: `s..6` and
+    // `s.0.050` are not fields (vectors README, Weather).
+    if snow && dots && run < width && bytes.get(from + run).is_some_and(u8::is_ascii_digit) {
+        return Some(None);
+    }
     let len = run + usize::from(minus);
     // A snowfall value (which may have a decimal point) keeps its width unless it is unknown.
     if run >= 1 && len != width && len <= width + 1 && (dots || !snow) {
