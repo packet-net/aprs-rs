@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Brought into line with the rulings from differential fuzzing of all five implementations (packet-net/aprs-vectors, 133 new cases in two rounds, the rules in its README and interpretations.md). The vectors submodule moves to them.
+Brought into line with the rulings from differential fuzzing of all five implementations (packet-net/aprs-vectors, 134 new cases in two rounds, the rules in its README and interpretations.md). The vectors submodule moves to them.
 
 **Breaking:** `Nmea` has a new field, `comment`: the text after a sentence's checksum, kept as sent (TinyTrack and FreeTrak send one). `sentence` now ends at the checksum. Code that builds an `Nmea` with a struct literal must set `comment`, or use `..Nmea::default()`.
 
