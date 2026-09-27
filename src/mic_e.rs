@@ -256,6 +256,12 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
     comment::tail(ctx, &mut report.fields, &s, offset, joined)
 }
 
+/// Whether two numbers are the same value, as the vectors compare them: within 1e-9, relative
+/// for values of 1 or more.
+fn same_number(x: f64, y: f64) -> bool {
+    (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0)
+}
+
 /// A Mic-E altitude, `xxx}`, at the start of `s`, in feet.
 fn altitude(s: &[u8]) -> Option<f64> {
     if s.len() >= 4 && s[3] == b'}' {
@@ -408,11 +414,13 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         }
         out.push(t as u8);
     }
-    // Mic-E altitude is whole metres; one that is not (a /A= altitude in feet) goes in the text as /A=.
+    // Mic-E altitude is whole metres; one that is not exactly (a /A= altitude in feet, such as
+    // 30105, which is 9176 metres less 0.01 foot) goes in the text as /A=, so that it reads back
+    // the same (vectors README, Encoding).
     let mut altitude_in_text = None;
     if let Some(feet) = f.altitude_feet {
         let metres = libm::round(feet / METRES_TO_FEET);
-        if (metres * METRES_TO_FEET - feet).abs() > 1e-6 * feet.abs().max(1.0) {
+        if !same_number(metres * METRES_TO_FEET, feet) {
             altitude_in_text = Some(feet);
         } else {
             let datum = metres + 10_000.0;
@@ -528,7 +536,7 @@ fn reads_back(r: &MicEReport, status_bytes: &[u8]) -> bool {
     let (a, b) = (&back.fields, &r.fields);
     let close = |x: Option<f64>, y: Option<f64>| match (x, y) {
         (None, None) => true,
-        (Some(x), Some(y)) => (x - y).abs() <= 1e-6 * x.abs().max(1.0),
+        (Some(x), Some(y)) => same_number(x, y),
         _ => false,
     };
     let freq = |v: &Option<crate::VoiceFrequency>| v.as_ref().map(|x| (x.tone, x.tone_value, x.offset_khz, x.range, x.range_km, x.narrow));
