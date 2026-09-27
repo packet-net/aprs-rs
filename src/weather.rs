@@ -143,8 +143,11 @@ fn value(
     let avail = bytes.len() - at - 1;
     let exact = if avail >= width { exact_value(&bytes[at + 1..at + 1 + width], letter, snow) } else { None };
     let followed_by_digit = avail > width && bytes[at + 1 + width].is_ascii_digit();
+    // Snowfall keeps its width: a value of three characters that holds a digit is a number, and
+    // a digit after it is not a fourth figure (vectors interpretations.md, "Which weather field a
+    // letter is").
     if let Some(v) = exact {
-        if !followed_by_digit {
+        if !followed_by_digit || snow {
             return Some(Some((v, width)));
         }
     }

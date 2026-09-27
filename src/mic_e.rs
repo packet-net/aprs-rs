@@ -430,6 +430,19 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         }
         out.extend_from_slice(b);
         out.extend_from_slice(b"/G");
+        // Anything after the locator and its symbol comes after a space (APRS12c ch. 10), a data
+        // extension included; the device suffix is read off the end first, so it needs none.
+        let follows = altitude_in_text.is_some()
+            || f.phg.is_some()
+            || f.range_miles.is_some()
+            || f.dfs.is_some()
+            || f.frequency.is_some()
+            || !f.comment.is_empty()
+            || f.telemetry.is_some()
+            || f.dao.is_some();
+        if follows {
+            out.push(b' ');
+        }
     }
     let before_extension = out.len();
     if let Some(ph) = f.phg {
@@ -488,7 +501,7 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     let suffix = r.device_suffix.as_bytes();
 
     let text_at = out.len();
-    let needs_space = !text.is_empty() && (r.locator.is_some() || f.frequency.is_some());
+    let needs_space = !text.is_empty() && f.frequency.is_some();
     let separators: &[&[u8]] = if needs_space { &[b" ", b"", b" /"] } else { &[b"", b"/"] };
     for separator in separators {
         out.truncate(text_at);

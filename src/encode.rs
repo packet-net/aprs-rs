@@ -311,11 +311,15 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError>
         if f.range_miles.is_some() {
             return Err(EncodeError::new("the cs bytes carry the wind or a range, not both"));
         }
-        let dir = w.wind_direction_degrees.unwrap_or(0);
+        // The cs bytes carry a direction and a speed together; one without the other would read
+        // back as 0.
+        let (Some(dir), Some(mph)) = (w.wind_direction_degrees, w.wind_speed_mph) else {
+            return Err(EncodeError::new("the cs bytes carry the wind as a direction and a speed together, so both are needed"));
+        };
         if dir > 360 {
             return Err(EncodeError::new("wind direction must be 0-360 degrees"));
         }
-        let knots = w.wind_speed_mph.unwrap_or(0.0) / KNOTS_TO_MPH;
+        let knots = mph / KNOTS_TO_MPH;
         (direction_code(dir), speed_code(knots)?, false)
     } else if let Some(range) = f.range_miles {
         if course_speed {
