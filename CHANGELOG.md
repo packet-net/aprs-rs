@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.1
+
 - Mic-E Rev 0 binary telemetry (0x1D and five bytes after the symbol) is read into `MicEReport::legacy_telemetry`, with an `ObsoleteFormat` info, and written back; it was left in the comment. A value of 255 is refused on encoding. The ruling is shared by all five implementations (packet-net/aprs-vectors, "Mic-E Rev 0 binary telemetry").
 
 ## 0.2.0
