@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Brought into line with the rulings from differential fuzzing of all five implementations (packet-net/aprs-vectors, 154 new cases in five rounds, the rules in its README and interpretations.md). The vectors submodule moves to them.
+Brought into line with the rulings from differential fuzzing of all five implementations (packet-net/aprs-vectors, 156 new cases in six rounds, the rules in its README and interpretations.md). The vectors submodule moves to them.
 
 **Breaking:** `Nmea` has a new field, `comment`: the text after a sentence's checksum, kept as sent (TinyTrack and FreeTrak send one). `sentence` now ends at the checksum. Code that builds an `Nmea` with a struct literal must set `comment`, or use `..Nmea::default()`. `Packet` has a new field, `third_party`, set on the packet inside a third-party packet, whose header is kept as sent: `Packet::q_construct` finds no q-construct there, since one is read only in the outer header. Code that builds a `Packet` with a struct literal must set it.
 
