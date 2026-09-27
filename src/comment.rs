@@ -249,29 +249,32 @@ fn finish(ctx: &mut Context, fields: &mut Positioned, mut c: Vec<u8>, offset: us
 }
 
 /// Signpost text `{ttt}` on the `\m` symbol, or a corridor width `{www}` on a line area object:
-/// the first `{` followed by 1-3 characters and a `}`, wherever it is in the comment (APRS12c ch.
-/// 11: "enclosing the 1-3 characters in braces in the comment field"), so `{5Wm{55}` holds `55`.
+/// the first well-formed braces in the comment, wherever they are (APRS12c ch. 11: "enclosing the
+/// 1-3 characters in braces in the comment field"). Well formed is `{`, 1-3 characters that are
+/// not braces, and `}`, the characters printable ASCII for a signpost or digits for a corridor;
+/// braces that are not are comment text and do not stop the search, so `{5Wm{55}` and `{{5}`
+/// hold `55` and `5`.
 fn braces(fields: &mut Positioned, c: &mut Vec<u8>) {
     let signpost = is_signpost_symbol(fields);
     let corridor = fields.area.is_some_and(|a| matches!(a.shape, AreaShape::LineDownRight | AreaShape::LineDownLeft));
     if !signpost && !corridor {
         return;
     }
+    let well_formed = |inner: &[u8]| {
+        (1..=3).contains(&inner.len())
+            && !inner.iter().any(|&b| b == b'{' || b == b'}')
+            && if signpost { text::is_printable_ascii(inner) } else { text::all_digits(inner) }
+    };
     let found = (0..c.len()).filter(|&i| c[i] == b'{').find_map(|open| {
-        let close = open + c[open..].iter().position(|&b| b == b'}')?;
-        (2..=4).contains(&(close - open)).then_some((open, close))
+        let close = open + 1 + c[open + 1..].iter().position(|&b| b == b'}')?;
+        well_formed(&c[open + 1..close]).then_some((open, close))
     });
     let Some((open, close)) = found else { return };
     let inner = &c[open + 1..close];
-    if signpost && text::is_printable_ascii(inner) {
+    if signpost {
         fields.signpost = Some(String::from(core::str::from_utf8(inner).unwrap_or_default()));
-    } else if corridor && text::all_digits(inner) {
-        let width = text::digits(inner) as u16;
-        if let Some(area) = fields.area.as_mut() {
-            area.corridor_width_miles = Some(width);
-        }
-    } else {
-        return;
+    } else if let Some(area) = fields.area.as_mut() {
+        area.corridor_width_miles = Some(text::digits(inner) as u16);
     }
     c.drain(open..=close);
 }
