@@ -57,7 +57,8 @@ pub enum Code {
     NotAprs,
     /// A reserved data type identifier with no defined format (APRS12c ch. 5).
     ReservedDataType,
-    /// A format the spec marks obsolete or not recommended, e.g. raw NMEA or raw weather.
+    /// A format the spec marks obsolete or not recommended, e.g. raw NMEA, raw weather, or the Rev 0
+    /// Mic-E data type identifiers 0x1C and 0x1D.
     ObsoleteFormat,
     /// A value in a well-formed field is out of range and was dropped.
     OutOfRangeValue,
@@ -99,7 +100,8 @@ pub enum Code {
     InvalidMicEDestination,
     /// The Mic-E information field is malformed (APRS12c ch. 10).
     InvalidMicEInformation,
-    /// Kenwood TM-D710 0xFF padding was removed (UAP 5.10).
+    /// Kenwood TM-D710 0xFF padding was removed from Mic-E status text, after the destination and the
+    /// nine fixed bytes decoded (UAP 5.10).
     KenwoodFfPadding,
     /// A Mic-E report without a device type prefix (UAP 5.4).
     MicEMissingDeviceType,
@@ -119,19 +121,21 @@ pub enum Code {
     InvalidStatus,
     /// A Maidenhead locator is malformed.
     InvalidLocator,
-    /// An NMEA sentence is malformed.
+    /// The text after `$` is not an NMEA 0183 sentence: not printable ASCII, no valid address field,
+    /// or a reserved character in a field.
     InvalidNmea,
     /// An NMEA sentence's checksum does not match, so the sentence is corrupt and is not decoded.
     NmeaChecksumMismatch,
-    /// A third-party header is malformed (APRS12c ch. 17).
+    /// A third-party header is malformed, or (strict) its inner header has a defect a lenient decoder
+    /// tolerates (APRS12c ch. 17).
     InvalidThirdParty,
-    /// A general query is malformed (APRS12c ch. 15).
+    /// A general query is malformed, or its footprint is out of range (APRS12c ch. 15).
     InvalidGeneralQuery,
     /// A station capabilities report is malformed (APRS12c ch. 15).
     InvalidCapabilities,
     /// A user-defined packet is shorter than its 3-byte header (APRS12c ch. 19).
     InvalidUserDefined,
-    /// An Agrelo DF report is malformed.
+    /// An Agrelo DF report is not exactly `%`, a bearing of 000 to 360, `/` and a quality digit.
     InvalidAgreloDf,
     /// A grid-locator status report lacks the mandatory space before its text (UAP 5.17).
     MissingSpaceAfterLocator,
@@ -149,13 +153,16 @@ pub enum Code {
     WindExtensionAfterCompressed,
     /// A Mic-E altitude after other status text instead of first (APRS12c ch. 10).
     MicEAltitudeNotFirst,
-    /// Message text contains a { that does not start a valid message ID (APRS12c ch. 14).
+    /// Message, bulletin or telemetry metadata text contains a { that does not start a valid message
+    /// ID, including the reply-ack form on a bulletin or metadata (APRS12c ch. 14).
     BraceInMessageText,
     /// A message addressee contains a space or : (APRS12c ch. 14).
     InvalidAddresseeCharacters,
     /// A bulletin addressee has a group name after a letter, e.g. BLNCNET; group bulletins use a digit (APRS12c ch. 14).
     LetterGroupBulletin,
-    /// A < station capabilities packet holds free text rather than TOKEN / TOKEN=VALUE items (APRS12c ch. 15).
+    /// A < station capabilities packet holds free text rather than TOKEN / TOKEN=VALUE items: a token
+    /// that is empty or holds a space or a control character, or a value that holds a control
+    /// character (APRS12c ch. 15).
     FreeTextCapabilities,
 }
 

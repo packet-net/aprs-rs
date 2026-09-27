@@ -12,7 +12,8 @@ use crate::{Code, Data, Diagnostic, ParseOptions, Severity};
 ///
 /// On APRS-IS an address is 1-9 letters, digits or hyphens. Over the air (AX.25) it must also be a
 /// callsign of at most six upper-case letters and digits with an SSID of 0-15;
-/// [`Address::is_ax25`] says whether it is.
+/// [`Address::is_ax25`] says whether it is. The source of a packet inside a third-party packet may
+/// be more: see [`Address::third_party_source`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Address(String);
 
@@ -25,6 +26,18 @@ impl Address {
 
     pub(crate) fn is_valid(text: &str) -> bool {
         (1..=9).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    }
+
+    /// The source address of a packet carried inside a third-party packet ([`Data::ThirdParty`]).
+    /// APRS12c ch. 17 lets it be any 1-9 printable ASCII characters other than `>` and `:`
+    /// (`PY2SP_R-R`, say), since it "does not need to adhere to the AX.25 address restrictions".
+    /// Fails for anything else. Such an address is not an APRS-IS address, so use it only there.
+    pub fn third_party_source(text: &str) -> Result<Address, InvalidAddress> {
+        if Address::is_third_party_source(text) { Ok(Address(text.to_string())) } else { Err(InvalidAddress(text.to_string())) }
+    }
+
+    pub(crate) fn is_third_party_source(text: &str) -> bool {
+        (1..=9).contains(&text.len()) && text.bytes().all(|b| (0x20..=0x7E).contains(&b) && b != b'>' && b != b':')
     }
 
     /// An address taken as it came, without checks (an AX.25 address the decoder tolerated).
@@ -171,11 +184,25 @@ pub struct Packet {
     pub data: Data,
     /// What the decoder noticed, header first.
     pub diagnostics: Vec<Diagnostic>,
+    /// This packet was carried inside a third-party packet ([`Data::ThirdParty`]). Its header is
+    /// kept as sent: an APRS-IS q-construct is read only in the outer header, so
+    /// [`Packet::q_construct`] finds none here.
+    pub third_party: bool,
 }
 
 impl Packet {
     /// Decodes a TNC2 / APRS-IS text line, `SOURCE>DEST,PATH:information`.
     pub fn decode_tnc2(line: &[u8], options: ParseOptions) -> Result<Packet, HeaderError> {
+        Packet::decode_tnc2_line(line, options, false)
+    }
+
+    /// Decodes the TNC2 packet inside a third-party packet, whose source need not be an APRS-IS
+    /// address (APRS12c ch. 17; [`Address::third_party_source`]).
+    pub(crate) fn decode_third_party(line: &[u8], options: ParseOptions) -> Result<Packet, HeaderError> {
+        Packet::decode_tnc2_line(line, options, true)
+    }
+
+    fn decode_tnc2_line(line: &[u8], options: ParseOptions, third_party: bool) -> Result<Packet, HeaderError> {
         let mut ctx = Context::new(options);
         let Some(colon) = line.iter().position(|&b| b == b':') else {
             ctx.error(Code::InvalidHeader, "no ':' ends the header (SOURCE>DEST[,PATH]:)", None);
@@ -197,7 +224,11 @@ impl Packet {
 
         let mut fields = rest.split(',');
         let destination = fields.next().unwrap_or("");
-        let source = header_address(&mut ctx, source)?;
+        let source = if third_party && Address::is_third_party_source(source) {
+            Address::unchecked(source.to_string())
+        } else {
+            header_address(&mut ctx, source)?
+        };
         let destination = if destination.is_empty() {
             if !ctx.tolerate(Code::EmptyDestination, "the destination address is empty (UAP 5.2)", None) {
                 return Err(ctx.header_error());
@@ -235,7 +266,9 @@ impl Packet {
             }
         }
 
-        Ok(Packet::decode_with_context(ctx, source, destination, path, info))
+        let mut packet = Packet::decode_with_context(ctx, source, destination, path, info);
+        packet.third_party = third_party;
+        Ok(packet)
     }
 
     /// Decodes an AX.25 UI frame in KISS form: addresses, control and PID, information; no flags, no FCS.
@@ -287,7 +320,7 @@ impl Packet {
 
     fn decode_with_context(mut ctx: Context, source: Address, destination: Address, path: Vec<PathEntry>, information: &[u8]) -> Packet {
         let data = crate::decode::information(&mut ctx, &source, &destination, &path, information);
-        Packet { source, destination, path, information: information.to_vec(), data, diagnostics: ctx.diagnostics }
+        Packet { source, destination, path, information: information.to_vec(), data, diagnostics: ctx.diagnostics, third_party: false }
     }
 
     /// Builds a packet from data, encoding its information field. For Mic-E data use
@@ -298,7 +331,7 @@ impl Packet {
         }
         let information = data.encode()?;
         let decoded = Packet::decode(source.clone(), destination.clone(), path.clone(), &information, ParseOptions::STRICT);
-        Ok(Packet { source, destination, path, information, data, diagnostics: decoded.diagnostics })
+        Ok(Packet { source, destination, path, information, data, diagnostics: decoded.diagnostics, third_party: false })
     }
 
     /// Builds a Mic-E packet: the information field and the destination address that carries the
@@ -306,7 +339,15 @@ impl Packet {
     pub fn create_mic_e(source: Address, report: crate::MicEReport, path: Vec<PathEntry>) -> Result<Packet, EncodeError> {
         let (destination, information) = crate::mic_e::encode(&report)?;
         let decoded = Packet::decode(source.clone(), destination.clone(), path.clone(), &information, ParseOptions::STRICT);
-        Ok(Packet { source, destination, path, information, data: Data::MicE(report), diagnostics: decoded.diagnostics })
+        Ok(Packet {
+            source,
+            destination,
+            path,
+            information,
+            data: Data::MicE(report),
+            diagnostics: decoded.diagnostics,
+            third_party: false,
+        })
     }
 
     /// Whether any diagnostic is a warning.
@@ -319,8 +360,13 @@ impl Packet {
         self.diagnostics.iter().any(|d| d.severity == Severity::Error)
     }
 
-    /// The first APRS-IS q-construct in the path, and the station after it.
+    /// The first APRS-IS q-construct in the path, and the station after it. `None` for a packet
+    /// carried inside a third-party packet, whose path is kept as sent: a q-construct is read only
+    /// in the outer header.
     pub fn q_construct(&self) -> Option<QConstruct<'_>> {
+        if self.third_party {
+            return None;
+        }
         let i = self.path.iter().position(|e| is_q_construct(e.address.as_str()))?;
         Some(QConstruct { construct: self.path[i].address.as_str(), station: self.path.get(i + 1).map(|e| &e.address) })
     }

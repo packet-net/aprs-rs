@@ -769,18 +769,20 @@ pub enum RawWeatherFormat {
     UltimeterLogging,
 }
 
-/// A raw NMEA sentence.
+/// A raw NMEA 0183 sentence (APRS12c ch. 5 and 7).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Nmea {
-    /// The whole sentence as sent.
+    /// The sentence as sent, without the `$`, up to and including any `*hh` checksum.
     pub sentence: String,
     /// The sentence ends in a `*hh` checksum (which matched).
     pub has_checksum: bool,
-    /// Latitude, if the sentence type carries one.
+    /// Latitude, if the sentence type carries one. The fields below are read from GGA, GLL, RMC,
+    /// VTG and WPL sentences only, and each is left out when it is missing or does not parse; a
+    /// position needs both coordinates.
     pub latitude: Option<f64>,
     /// Longitude.
     pub longitude: Option<f64>,
-    /// Whether the fix is valid, for the types that say.
+    /// Whether the fix is valid: RMC's or GLL's status (`A` or `V`), or GGA's quality digit.
     pub fix_valid: Option<bool>,
     /// Course over ground, degrees.
     pub course_degrees: Option<f64>,
@@ -788,10 +790,13 @@ pub struct Nmea {
     pub speed_knots: Option<f64>,
     /// Altitude, metres.
     pub altitude_m: Option<f64>,
-    /// UTC time as sent, `hhmmss`.
+    /// UTC time, `HH:MM:SS`, with any fraction of a second as sent (less trailing zeros).
     pub time: Option<String>,
     /// A waypoint name.
     pub waypoint: Option<String>,
+    /// Text after the checksum, kept as sent (TinyTrack and FreeTrak send one). Only a sentence
+    /// with a checksum can have one, since the checksum is what ends the sentence.
+    pub comment: String,
 }
 
 /// A Maidenhead locator beacon.

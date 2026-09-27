@@ -6,7 +6,8 @@ use alloc::vec::Vec;
 
 use crate::context::Context;
 use crate::{
-    Ack, Bulletin, Code, Data, DirectedQuery, EncodeError, Message, Reject, TelemetryBits, TelemetryCoefficients, TelemetryLabels, text,
+    Ack, Address, Bulletin, Code, Data, DirectedQuery, EncodeError, Message, ParseOptions, Reject, TelemetryBits, TelemetryCoefficients,
+    TelemetryLabels, text,
 };
 
 /// Message text senders may write (APRS12c ch. 14); receivers accept more.
@@ -212,10 +213,11 @@ fn telemetry_metadata(ctx: &mut Context, addressee: &str, body: &[u8], offset: u
             if kind == b"PARM." { Data::TelemetryNames(t) } else { Data::TelemetryUnits(t) }
         }
         b"EQNS." => {
-            // "The list may stop at any field" (APRS12c ch. 13): trailing empty entries are the list stopping.
+            // "The list may stop at any field" (APRS12c ch. 13): trailing commas and spaces are the
+            // list stopping. Spaces (U+0020 only) around a coefficient are padding.
             let mut coefficients = Vec::new();
-            for part in s.trim_end_matches(' ').trim_end_matches(',').split(',') {
-                let part = part.trim();
+            for part in s.trim_end_matches([' ', ',']).split(',') {
+                let part = part.trim_matches(' ');
                 if !is_coefficient(part) {
                     ctx.info(
                         Code::InvalidTelemetryMetadata,
@@ -256,34 +258,41 @@ fn telemetry_metadata(ctx: &mut Context, addressee: &str, body: &[u8], offset: u
     Some(Some(data))
 }
 
-/// A telemetry equation coefficient: a decimal number with an optional sign and exponent.
+/// A telemetry equation coefficient: a number as a telemetry value is written ([`is_decimal`]),
+/// optionally with an exponent (`e` or `E`, an optional sign, digits), that is a finite number
+/// (`0eN` is 0 however large N is; `1e400` is not a coefficient). Vectors interpretations.md,
+/// "Numbers in telemetry".
 pub(crate) fn is_coefficient(t: &str) -> bool {
     let (mantissa, exponent) = match t.find(['e', 'E']) {
         Some(i) => (&t[..i], Some(&t[i + 1..])),
         None => (t, None),
     };
-    let unsigned = |t: &str| t.strip_prefix(['-', '+']).unwrap_or(t).to_string();
-    let m = unsigned(mantissa);
-    let (whole, frac) = m.split_once('.').unwrap_or((&m, ""));
-    let digits = |t: &str| t.bytes().all(|b| b.is_ascii_digit());
-    !(whole.is_empty() && frac.is_empty())
-        && digits(whole)
-        && digits(frac)
-        && exponent.is_none_or(|e| {
-            let e = unsigned(e);
-            !e.is_empty() && digits(&e)
-        })
+    let exponent_ok = exponent.is_none_or(|e| {
+        let e = e.strip_prefix(['-', '+']).unwrap_or(e);
+        !e.is_empty() && e.bytes().all(|b| b.is_ascii_digit())
+    });
+    if !is_decimal(mantissa) || !exponent_ok {
+        return false;
+    }
+    // A mantissa of zero is zero whatever the exponent; otherwise the value must be finite.
+    let zero = mantissa.bytes().all(|b| matches!(b, b'0' | b'.' | b'-'));
+    zero || t.parse::<f64>().is_ok_and(f64::is_finite)
 }
 
+/// A telemetry value: an optional `-`, then digits with an optional decimal point, with at least
+/// one digit (APRS12c ch. 13); no `+`, no spaces, nothing else.
 pub(crate) fn is_decimal(t: &str) -> bool {
-    let t = t.strip_prefix(['-', '+']).unwrap_or(t);
+    let t = t.strip_prefix('-').unwrap_or(t);
     let (whole, frac) = t.split_once('.').unwrap_or((t, ""));
     !(whole.is_empty() && frac.is_empty()) && whole.bytes().all(|b| b.is_ascii_digit()) && frac.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// A directed query: `?` and a query type, optionally the one callsign some types ask about
-/// (APRS12c ch. 15). An upper-case type the spec does not define is still a query, which the
-/// recipient ignores. `None` (with an `Info` for what looked like a query) when it is a plain message.
+/// (APRS12c ch. 15). A query type is upper-case letters, apart from the spec's own `PING?`; one
+/// the spec does not define is still a query, which the recipient ignores. A defined type's
+/// target comes straight after it, and an undefined type's after one space; one space between
+/// the type and the target is a separator, and spaces after the target are padding. `None` (with
+/// an `Info` for what looked like a query) when it is a plain message.
 fn directed_query(ctx: &mut Context, addressee: &str, body: &[u8], offset: usize) -> Option<Data> {
     let s: String = body[1..].iter().map(|&b| b as char).collect();
     let not_a_query = |ctx: &mut Context, why: &str| {
@@ -293,8 +302,12 @@ fn directed_query(ctx: &mut Context, addressee: &str, body: &[u8], offset: usize
     if s.contains('{') {
         return not_a_query(ctx, "a directed query never has a message ID; read as a message (UAP 5.18)");
     }
-    let target_ok = |t: &str| t.chars().count() <= 9 && t.chars().all(|c| ('!'..='~').contains(&c));
-    let query = |query_type: &str, target: &str| {
+    let query = |ctx: &mut Context, query_type: &str, rest: &str| {
+        let target = rest.trim_end_matches(' ');
+        let target = target.strip_prefix(' ').unwrap_or(target);
+        if !target.is_empty() && !Address::is_valid(target) {
+            return not_a_query(ctx, "a query target is one callsign, 1-9 letters, digits or -; read as a message");
+        }
         Some(Data::DirectedQuery(DirectedQuery {
             addressee: addressee.to_string(),
             query_type: query_type.to_string(),
@@ -303,25 +316,27 @@ fn directed_query(ctx: &mut Context, addressee: &str, body: &[u8], offset: usize
     };
     for t in QUERY_TYPES {
         if let Some(rest) = s.strip_prefix(t) {
-            let target = rest.trim();
-            if !target_ok(target) {
-                return not_a_query(ctx, "a query target is one callsign of up to 9 characters; read as a message");
-            }
-            return query(t, target);
+            return query(ctx, t, rest);
         }
         if s.len() >= t.len() && s.as_bytes()[..t.len()].eq_ignore_ascii_case(t.as_bytes()) {
             return not_a_query(ctx, "query types are upper case; read as a message (UAP 5.18)");
         }
     }
-    let end = s.bytes().take_while(|b| b.is_ascii_uppercase() || b.is_ascii_digit()).count();
+    // A type the spec does not define: upper-case letters, then a space or the end.
+    let end = s.bytes().take_while(u8::is_ascii_uppercase).count();
     if end == 0 || (end < s.len() && s.as_bytes()[end] != b' ') {
         return None;
     }
-    let target = s[end..].trim();
-    if !target_ok(target) {
-        return not_a_query(ctx, "a query target is one callsign of up to 9 characters; read as a message");
+    query(ctx, &s[..end], &s[end..])
+}
+
+/// Whether a directed query of this type, written as the encoder writes it, reads back as that
+/// type: upper-case letters (or `PING?`), and not one that starts with a type the spec defines.
+fn query_type_ok(t: &str) -> bool {
+    if QUERY_TYPES.contains(&t) {
+        return true;
     }
-    query(&s[..end], target)
+    !t.is_empty() && t.bytes().all(|b| b.is_ascii_uppercase()) && !QUERY_TYPES.iter().any(|q| t.starts_with(q))
 }
 
 // ------------------------------------------------------------------ encoding
@@ -331,7 +346,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
     match data {
         Data::Message(m) => {
             addressee(&mut out, &m.addressee)?;
-            message_text(&mut out, &m.text)?;
+            message_text(&mut out, &m.text, true)?;
             id_and_reply(&mut out, &m.message_id, &m.reply_ack)?;
         }
         Data::Ack(a) => {
@@ -362,7 +377,8 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                 }
             }
             addressee(&mut out, &b.addressee)?;
-            message_text(&mut out, &b.text)?;
+            // NWS bulletin text has no length limit; the 67 characters are for messages and other bulletins.
+            message_text(&mut out, &b.text, !nws)?;
             id_and_reply(&mut out, &b.message_id, &None)?;
         }
         Data::TelemetryNames(t) | Data::TelemetryUnits(t) => {
@@ -389,10 +405,11 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             if t.bits.len() != 8
                 || !t.bits.bytes().all(|b| b == b'0' || b == b'1')
                 || t.project.chars().count() > 23
+                || t.project.contains('{')
                 || crate::text::has_line_break(t.project.as_bytes())
             {
                 return Err(EncodeError::new(
-                    "telemetry bit sense is eight 0 or 1 characters, and the project title up to 23 (APRS12c ch. 13)",
+                    "telemetry bit sense is eight 0 or 1 characters, and the project title up to 23, without a { (APRS12c ch. 13)",
                 ));
             }
             addressee(&mut out, &t.addressee)?;
@@ -405,22 +422,39 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             id_and_reply(&mut out, &t.message_id, &None)?;
         }
         Data::DirectedQuery(q) => {
-            if q.query_type.is_empty() || !q.query_type.bytes().all(|b| b.is_ascii_graphic() && b != b'{' && !b.is_ascii_lowercase()) {
+            if !query_type_ok(&q.query_type) {
                 return Err(EncodeError::new(
-                    "a directed query type is upper-case printable ASCII: ?APRSD, ?APRSH, ?APRSM, ?APRSO, ?APRSP, ?APRSS, ?APRST, ?PING? (APRS12c ch. 15)",
+                    "a directed query type is upper-case letters: ?APRSD, ?APRSH, ?APRSM, ?APRSO, ?APRSP, ?APRSS, ?APRST, ?PING? or one the spec does not define (APRS12c ch. 15)",
                 ));
             }
             addressee(&mut out, &q.addressee)?;
             out.push(b'?');
             out.extend_from_slice(q.query_type.as_bytes());
             if let Some(t) = &q.target {
-                if t.is_empty() || t.len() > 9 || !t.bytes().all(|b| b.is_ascii_graphic()) {
-                    return Err(EncodeError::new("a directed query's target is one callsign"));
+                if !Address::is_valid(t) {
+                    return Err(EncodeError::new("a directed query's target is one callsign: 1-9 letters, digits or -"));
+                }
+                // Straight after a type the spec defines, APRSH's padded to 9 characters ("APRSH:
+                // callsigns must be padded to 9 characters", APRS12c's 1.2 notes); after one space
+                // for any other type, which has no fixed length.
+                if !QUERY_TYPES.contains(&q.query_type.as_str()) {
+                    out.push(b' ');
                 }
                 out.extend_from_slice(t.as_bytes());
+                if q.query_type == "APRSH" {
+                    out.extend(core::iter::repeat_n(b' ', 9 - t.len()));
+                }
             }
         }
         _ => return Err(EncodeError::new("not a message")),
+    }
+    // What was written must read back as what was given: a message whose text looks like an ack,
+    // telemetry metadata or a query, or whose addressee makes it a bulletin, would not.
+    let mut ctx = Context::new(ParseOptions::LENIENT);
+    if decode(&mut ctx, &out).as_ref() != Some(data) {
+        return Err(EncodeError::new(
+            "it would read back as something else: text that reads as an ack, telemetry metadata or a query, or an addressee that makes it a bulletin",
+        ));
     }
     Ok(out)
 }
@@ -437,8 +471,8 @@ fn addressee(out: &mut Vec<u8>, a: &str) -> Result<(), EncodeError> {
     Ok(())
 }
 
-fn message_text(out: &mut Vec<u8>, t: &str) -> Result<(), EncodeError> {
-    if t.chars().count() > MAX_TEXT {
+fn message_text(out: &mut Vec<u8>, t: &str, limited: bool) -> Result<(), EncodeError> {
+    if limited && t.chars().count() > MAX_TEXT {
         return Err(EncodeError::new("message text is limited to 67 characters (APRS12c ch. 14)"));
     }
     if t.contains('{') {

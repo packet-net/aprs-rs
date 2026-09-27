@@ -9,8 +9,8 @@ use crate::context::Context;
 use crate::position::Cs;
 use crate::weather;
 use crate::{
-    AreaColor, AreaObject, AreaShape, Code, CommentTelemetry, Dao, DaoPrecision, DfBearing, DfSignalStrength, NmeaSource, Phg, Positioned,
-    Storm, StormKind, Tone, VoiceFrequency, Weather, base91, text,
+    AreaColor, AreaObject, AreaShape, Code, CommentTelemetry, Dao, DaoPrecision, DfBearing, DfSignalStrength, NmeaSource, ParseOptions,
+    Phg, Positioned, Storm, StormKind, Tone, VoiceFrequency, Weather, base91, text,
 };
 
 pub(crate) const KNOTS_TO_MPH: f64 = 1.150_779_448_023_543;
@@ -66,8 +66,7 @@ pub(crate) fn decode(ctx: &mut Context, fields: &mut Positioned, cs: Option<Cs>,
     if weather_symbol {
         // A weather station's report is weather, whatever else it holds: the wind, then the fields.
         let mut at = 0;
-        let mut wind_as_fields = false;
-        if bytes.len() >= 7 && is_course_speed(&bytes[..7]) {
+        let wind = if bytes.len() >= 7 && is_course_speed(&bytes[..7]) {
             if fields.compressed
                 && !ctx.tolerate(
                     Code::WindExtensionAfterCompressed,
@@ -90,25 +89,46 @@ pub(crate) fn decode(ctx: &mut Context, fields: &mut Positioned, cs: Option<Cs>,
             };
             weather.wind_speed_mph = speed.map(f64::from);
             at = 7;
-        } else if !cs_is_wind && bytes.len() >= 4 && bytes[0] == b'c' {
-            // c/s fields where the extension (or, compressed, the cs bytes) should carry the wind.
-            if !ctx.tolerate(Code::WindFieldsInsteadOfExtension, "wind sent as c/s fields instead of the DDD/SSS extension", Some(offset)) {
+            weather::Wind::Known
+        } else if cs_is_wind {
+            weather::Wind::Known
+        } else {
+            // The wind is decided here, where the extension belongs, before any field is read
+            // (vectors README, "The order of checks"): sent as c and s fields in its place, or
+            // missing. After a compressed position the cs bytes say it is unknown, not missing.
+            let probe =
+                weather::fields(&mut Context::new(ParseOptions::LENIENT), bytes, offset, &mut Weather::default(), weather::Wind::AsFields);
+            // The wind comes as fields once a c field is read (an s is only the speed after one).
+            let (direction, speed) = probe.map_or((false, false), |r| (r.direction, r.speed));
+            if direction
+                && !ctx.tolerate(
+                    Code::WindFieldsInsteadOfExtension,
+                    "wind sent as c/s fields instead of the DDD/SSS extension",
+                    Some(offset),
+                )
+            {
                 return false;
             }
-            wind_as_fields = true;
-        } else if !fields.compressed
-            && !ctx.tolerate(
-                Code::IncompleteWeather,
-                "the weather report has no wind direction/speed extension (APRS12c ch. 12)",
-                Some(offset),
-            )
-        {
-            return false;
-        }
-        let Some(len) = weather::fields(ctx, &bytes[at..], offset + at, &mut weather, false, wind_as_fields) else {
+            let wind_complete = fields.compressed || (direction && speed);
+            if !wind_complete
+                && !ctx.tolerate(
+                    Code::IncompleteWeather,
+                    if direction {
+                        "the wind needs both a direction and a speed (APRS12c ch. 12)"
+                    } else {
+                        "the weather report has no wind direction/speed extension (APRS12c ch. 12)"
+                    },
+                    Some(offset),
+                )
+            {
+                return false;
+            }
+            weather::Wind::AsFields
+        };
+        let Some(run) = weather::fields(ctx, &bytes[at..], offset + at, &mut weather, wind) else {
             return false;
         };
-        at += len;
+        at += run.len;
         // Wind read from the bytes after a compressed position is written back into its cs bytes,
         // under the default type byte.
         if fields.compressed
@@ -133,20 +153,17 @@ pub(crate) fn decode(ctx: &mut Context, fields: &mut Positioned, cs: Option<Cs>,
             Some(n) => at = n,
         }
     }
-    tail(ctx, fields, &bytes[at..], offset + at)
+    tail(ctx, fields, &bytes[at..], offset + at, None)
 }
 
-/// After a position's weather data: the software and unit, or else text that a weather report
-/// should not have, from which telemetry and a `!DAO!` are still lifted.
+/// After a position's weather data: base-91 telemetry and a `!DAO!` are lifted out first, and
+/// what is left is the software type and unit, or else text that a weather report should not have.
 fn weather_tail(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], offset: usize) -> bool {
-    if bytes.is_empty() || weather::software_and_unit(bytes, fields.weather.get_or_insert_with(Weather::default)) {
-        return true;
-    }
     let mut c: Vec<u8> = bytes.to_vec();
-    if !lift_telemetry_and_dao(ctx, fields, &mut c, offset) {
+    if !lift_telemetry_and_dao(ctx, fields, &mut c, offset, None) {
         return false;
     }
-    if c.is_empty() {
+    if c.is_empty() || weather::software_and_unit(&c, fields.weather.get_or_insert_with(Weather::default)) {
         return true;
     }
     if !ctx.tolerate(Code::WeatherComment, "text after the weather data; a weather report has no comment (UAP 2.7.1)", Some(offset)) {
@@ -156,10 +173,12 @@ fn weather_tail(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], offset
 }
 
 /// Lifts base-91 telemetry and a `!DAO!` out of `c`. The telemetry block is located first, so a
-/// DAO-shaped run inside it is not taken for a DAO.
-fn lift_telemetry_and_dao(ctx: &mut Context, fields: &mut Positioned, c: &mut Vec<u8>, offset: usize) -> bool {
+/// DAO-shaped run inside it is not taken for a DAO. A `!DAO!` is five bytes as sent, so one that
+/// spans `joined` (where bytes were taken out before, bringing the bytes on either side together)
+/// is not one.
+fn lift_telemetry_and_dao(ctx: &mut Context, fields: &mut Positioned, c: &mut Vec<u8>, offset: usize, joined: Option<usize>) -> bool {
     let telemetry = find_telemetry(c);
-    let dao = find_dao(c, telemetry.as_ref().map(|t| t.0.clone()));
+    let dao = find_dao(c, telemetry.as_ref().map(|t| t.0.clone()), joined);
     let mut removals: Vec<core::ops::Range<usize>> = Vec::new();
     if let Some((range, t)) = telemetry {
         fields.telemetry = Some(t);
@@ -181,10 +200,11 @@ fn lift_telemetry_and_dao(ctx: &mut Context, fields: &mut Positioned, c: &mut Ve
 /// The comment after any data extension: lifts out telemetry and a `!DAO!` (from the end), then an
 /// altitude, signpost or corridor braces, a data extension found later in the text, and a voice
 /// frequency at the start, in the order that keeps one from being taken for another; the rest,
-/// less one leading delimiter, is the comment.
-pub(crate) fn tail(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], offset: usize) -> bool {
+/// less one leading delimiter, is the comment. `joined`: where bytes were already taken out of
+/// the text (a Mic-E altitude), which a `!DAO!` does not span.
+pub(crate) fn tail(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], offset: usize, joined: Option<usize>) -> bool {
     let mut c: Vec<u8> = bytes.to_vec();
-    if !lift_telemetry_and_dao(ctx, fields, &mut c, offset) {
+    if !lift_telemetry_and_dao(ctx, fields, &mut c, offset, joined) {
         return false;
     }
 
@@ -229,40 +249,50 @@ fn finish(ctx: &mut Context, fields: &mut Positioned, mut c: Vec<u8>, offset: us
 }
 
 /// Signpost text `{ttt}` on the `\m` symbol, or a corridor width `{www}` on a line area object:
-/// the first braces in the comment, holding 1-3 characters.
+/// the first well-formed braces in the comment, wherever they are (APRS12c ch. 11: "enclosing the
+/// 1-3 characters in braces in the comment field"). Well formed is `{`, 1-3 characters that are
+/// not braces, and `}`, the characters printable ASCII for a signpost or digits for a corridor;
+/// braces that are not are comment text and do not stop the search, so `{5Wm{55}` and `{{5}`
+/// hold `55` and `5`.
 fn braces(fields: &mut Positioned, c: &mut Vec<u8>) {
     let signpost = is_signpost_symbol(fields);
     let corridor = fields.area.is_some_and(|a| matches!(a.shape, AreaShape::LineDownRight | AreaShape::LineDownLeft));
     if !signpost && !corridor {
         return;
     }
-    let Some(open) = c.iter().position(|&b| b == b'{') else { return };
-    let Some(close) = c[open..].iter().position(|&b| b == b'}').map(|i| open + i) else { return };
+    let well_formed = |inner: &[u8]| {
+        (1..=3).contains(&inner.len())
+            && !inner.iter().any(|&b| b == b'{' || b == b'}')
+            && if signpost { text::is_printable_ascii(inner) } else { text::all_digits(inner) }
+    };
+    let found = (0..c.len()).filter(|&i| c[i] == b'{').find_map(|open| {
+        let close = open + 1 + c[open + 1..].iter().position(|&b| b == b'}')?;
+        well_formed(&c[open + 1..close]).then_some((open, close))
+    });
+    let Some((open, close)) = found else { return };
     let inner = &c[open + 1..close];
-    if !(1..=3).contains(&inner.len()) {
-        return;
-    }
-    if signpost && text::is_printable_ascii(inner) {
+    if signpost {
         fields.signpost = Some(String::from(core::str::from_utf8(inner).unwrap_or_default()));
-    } else if corridor && text::all_digits(inner) {
-        let width = text::digits(inner) as u16;
-        if let Some(area) = fields.area.as_mut() {
-            area.corridor_width_miles = Some(width);
-        }
-    } else {
-        return;
+    } else if let Some(area) = fields.area.as_mut() {
+        area.corridor_width_miles = Some(text::digits(inner) as u16);
     }
     c.drain(open..=close);
 }
 
 /// A PHG, RNG or DFS extension after other comment text instead of straight after the symbol:
-/// the first `PHG`, else the first `RNG`, else the first `DFS`, if that one is well formed.
-/// Strictly that is free text (UAP 5.15); recognising it is an extra reading the options allow.
+/// the first well-formed `PHG`, else the first well-formed `RNG`, else the first well-formed
+/// `DFS`. A malformed one such as `PHG12` is comment text and does not stop the search (vectors
+/// interpretations.md, "A late data extension is the first well-formed one"). Strictly that is
+/// free text (UAP 5.15); recognising it is an extra reading the options allow.
 fn late_extension(ctx: &mut Context, fields: &mut Positioned, c: &mut Vec<u8>, offset: usize) {
     for tag in [&b"PHG"[..], b"RNG", b"DFS"] {
-        let Some(at) = c.windows(3).position(|w| w == tag) else { continue };
         let mut found = Positioned::default();
-        let Some(len) = station_extension(&mut found, &c[at..]) else { continue };
+        let Some((at, len)) = (0..c.len().saturating_sub(2))
+            .filter(|&i| &c[i..i + 3] == tag)
+            .find_map(|i| station_extension(&mut found, &c[i..]).map(|len| (i, len)))
+        else {
+            continue;
+        };
         if ctx.allows(
             Code::DataExtensionInComment,
             "a data extension found later in the comment; the spec puts it straight after the symbol (UAP 5.15)",
@@ -310,7 +340,15 @@ fn extension_at_start(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], 
         fields.speed_knots = speed.map(f64::from);
         if is_df_symbol(fields) {
             if let Some(b) = bytes.get(7..15).and_then(df_bearing) {
-                fields.df_bearing = Some(b);
+                // The bearing is degrees: one over 360 drops the whole /BRG/NRQ, as an
+                // out-of-range course is dropped (vectors README, Positions).
+                if b.bearing_degrees > 360 {
+                    if !ctx.tolerate(Code::OutOfRangeValue, "a DF bearing over 360 degrees was dropped", Some(offset + 7)) {
+                        return None;
+                    }
+                } else {
+                    fields.df_bearing = Some(b);
+                }
                 return Some(15);
             }
         } else if is_storm_symbol(fields) {
@@ -409,9 +447,6 @@ pub(crate) fn beacon_rate_char(rate: u8) -> Option<u8> {
 /// `/BRG/NRQ` after the course and speed of a DF report.
 fn df_bearing(bytes: &[u8]) -> Option<DfBearing> {
     if bytes.len() < 8 || bytes[0] != b'/' || bytes[4] != b'/' || !text::all_digits(&bytes[1..4]) || !text::all_digits(&bytes[5..8]) {
-        return None;
-    }
-    if text::digits(&bytes[1..4]) > 360 {
         return None;
     }
     Some(DfBearing {
@@ -563,12 +598,12 @@ struct FoundDao {
     lon: f64,
 }
 
-/// The last `!DAO!` outside the telemetry block: `!Wdd!` (an upper-case datum, a digit each:
-/// thousandths of a minute), `!wBB!` (a lower-case datum, a base-91 character each: v/91
-/// hundredths of a minute) or `!D  !` (datum only).
-fn find_dao(c: &[u8], telemetry: Option<core::ops::Range<usize>>) -> Option<(core::ops::Range<usize>, FoundDao)> {
+/// The last `!DAO!` outside the telemetry block, and not across `joined`: `!Wdd!` (an upper-case
+/// datum, a digit each: thousandths of a minute), `!wBB!` (a lower-case datum, a base-91
+/// character each: v/91 hundredths of a minute) or `!D  !` (datum only; a letter or a digit).
+fn find_dao(c: &[u8], telemetry: Option<core::ops::Range<usize>>, joined: Option<usize>) -> Option<(core::ops::Range<usize>, FoundDao)> {
     (0..c.len().saturating_sub(4)).rev().find_map(|i| {
-        if telemetry.as_ref().is_some_and(|t| i + 4 >= t.start && i < t.end) {
+        if telemetry.as_ref().is_some_and(|t| i + 4 >= t.start && i < t.end) || joined.is_some_and(|j| i < j && j < i + 5) {
             return None;
         }
         let w = &c[i..i + 5];

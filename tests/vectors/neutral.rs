@@ -208,6 +208,7 @@ pub fn data(d: &Data) -> Value {
             .put("altitude_m", json!(n.altitude_m))
             .put("time", json!(n.time))
             .put("waypoint", json!(n.waypoint))
+            .put("comment", json!(n.comment))
             .done(),
         Data::MaidenheadBeacon(m) => Obj::new("maidenhead-beacon").put("locator", json!(m.locator)).put("comment", json!(m.comment)).done(),
         Data::Query(q) => {
@@ -233,8 +234,11 @@ pub fn data(d: &Data) -> Value {
             )
             .done(),
         Data::ThirdParty(p) => {
+            // A header's source and destination are always written, even when empty.
             let mut inner = Obj::new("");
-            inner.put("source", json!(p.source.as_str())).put("destination", json!(p.destination.as_str())).put("path", path(&p.path));
+            inner.0.insert("source".into(), json!(p.source.as_str()));
+            inner.0.insert("destination".into(), json!(p.destination.as_str()));
+            inner.put("path", path(&p.path));
             inner.put("data", data(&p.data)).put("diagnostics", json!(diagnostics(&p.diagnostics)));
             Obj::new("third-party").put("packet", inner.done()).done()
         }
@@ -493,6 +497,7 @@ pub fn read_data(v: &Value) -> Data {
             altitude_m: o.get("altitude_m").and_then(Value::as_f64),
             time: s("time"),
             waypoint: s("waypoint"),
+            comment: string("comment"),
         }),
         "maidenhead-beacon" => Data::MaidenheadBeacon(MaidenheadBeacon { locator: string("locator"), comment: string("comment") }),
         "query" => Data::Query(Query {
@@ -519,17 +524,21 @@ pub fn read_data(v: &Value) -> Data {
                 .unwrap_or_default(),
         }),
         "third-party" => {
+            // The inner packet as the neutral form gives it: its source may be any third-party
+            // source (APRS12c ch. 17), and its diagnostics are part of the data.
             let p = &o["packet"];
             let path: Vec<PathEntry> = strings(p.get("path")).iter().map(|e| read_path_entry(e)).collect();
-            let inner = read_data(&p["data"]);
-            let packet = Packet::create(
-                Address::new(p["source"].as_str().unwrap()).unwrap(),
-                Address::new(p["destination"].as_str().unwrap()).unwrap(),
+            let data = read_data(&p["data"]);
+            let information = data.encode().unwrap_or_default();
+            Data::ThirdParty(Box::new(Packet {
+                source: Address::third_party_source(p["source"].as_str().unwrap()).unwrap(),
+                destination: read_destination(p["destination"].as_str().unwrap()),
                 path,
-                inner,
-            )
-            .expect("third-party inner packet encodes");
-            Data::ThirdParty(Box::new(packet))
+                information,
+                data,
+                diagnostics: strings(p.get("diagnostics")).iter().map(|d| read_diagnostic(d)).collect(),
+                third_party: true,
+            }))
         }
         "user-defined" => Data::UserDefined(UserDefined {
             user_id: string("user_id").chars().next().unwrap(),
@@ -542,6 +551,30 @@ pub fn read_data(v: &Value) -> Data {
             quality: o["quality"].as_u64().unwrap() as u8,
         }),
         other => panic!("cannot read data of type {other}"),
+    }
+}
+
+/// A destination address; an empty one (a tolerated defect, UAP 5.2) is only made by decoding
+/// a header that has one.
+fn read_destination(text: &str) -> Address {
+    if text.is_empty() {
+        return Packet::decode_tnc2(b"N0CALL>:", ParseOptions::LENIENT).expect("an empty destination is tolerated").destination;
+    }
+    Address::new(text).unwrap()
+}
+
+/// A diagnostic from its neutral form, `severity:code`; the message and offset are not part of it.
+fn read_diagnostic(text: &str) -> Diagnostic {
+    let (severity, code) = text.split_once(':').expect("a diagnostic is severity:code");
+    Diagnostic {
+        severity: match severity {
+            "info" => Severity::Info,
+            "warning" => Severity::Warning,
+            _ => Severity::Error,
+        },
+        code: Code::from_id(code).unwrap_or_else(|| panic!("unknown diagnostic code {code}")),
+        message: String::new(),
+        offset: None,
     }
 }
 

@@ -205,19 +205,12 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
     report.device_suffix = String::from_utf8_lossy(&s[s.len() - suffix..]).into_owned();
     s.truncate(s.len() - suffix);
 
-    // Altitude: xxx} first, or (a tolerated reading) later in the text.
-    if let Some(feet) = altitude(&s) {
+    // Altitude: xxx} first. One later in the text (a tolerated reading) is looked for once a
+    // locator and a data extension at the start have taken their bytes.
+    let altitude_first = altitude(&s);
+    if let Some(feet) = altitude_first {
         report.fields.altitude_feet = Some(feet);
         s.drain(..4);
-    } else if let Some(i) = (1..s.len().saturating_sub(3)).find(|&i| altitude(&s[i..]).is_some()) {
-        if ctx.allows(
-            Code::MicEAltitudeNotFirst,
-            "a Mic-E altitude after other status text instead of first (APRS12c ch. 10)",
-            Some(offset + i),
-        ) {
-            report.fields.altitude_feet = altitude(&s[i..]);
-            s.drain(i..i + 4);
-        }
     }
 
     // A grid locator and the /G symbol, then a space before any text.
@@ -237,16 +230,39 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
         }
     }
 
-    // A data extension at the start of the text; one later on is found by the comment's rules.
-    let mut extension = false;
+    // A data extension at the start of the text, lifted before an altitude is looked for later
+    // on, so its bytes are never read as one (`0PH}` in `PHG3330PH}`); one later on is found by
+    // the comment's rules.
     if let Some(len) = comment::mic_e_extension(&mut report.fields, &s) {
         s.drain(..len);
-        extension = true;
     }
-    let _ = extension;
-    comment::tail(ctx, &mut report.fields, &s, offset)
+
+    // An altitude later in the text, when none came first: a tolerated reading. Taking it out
+    // brings the bytes either side of it together, and a !DAO! across that join is not one.
+    let mut joined = None;
+    if altitude_first.is_none() {
+        if let Some(i) = (0..s.len().saturating_sub(3)).find(|&i| altitude(&s[i..]).is_some()) {
+            if ctx.allows(
+                Code::MicEAltitudeNotFirst,
+                "a Mic-E altitude after other status text instead of first (APRS12c ch. 10)",
+                Some(offset + i),
+            ) {
+                report.fields.altitude_feet = altitude(&s[i..]);
+                s.drain(i..i + 4);
+                joined = Some(i);
+            }
+        }
+    }
+    comment::tail(ctx, &mut report.fields, &s, offset, joined)
 }
 
+/// Whether two numbers are the same value, as the vectors compare them: within 1e-9, relative
+/// for values of 1 or more.
+fn same_number(x: f64, y: f64) -> bool {
+    (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0)
+}
+
+/// A Mic-E altitude, `xxx}`, at the start of `s`, in feet.
 fn altitude(s: &[u8]) -> Option<f64> {
     if s.len() >= 4 && s[3] == b'}' {
         let metres = f64::from(base91::decode(&s[..3])?) - 10_000.0;
@@ -398,11 +414,13 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         }
         out.push(t as u8);
     }
-    // Mic-E altitude is whole metres; one that is not (a /A= altitude in feet) goes in the text as /A=.
+    // Mic-E altitude is whole metres; one that is not exactly (a /A= altitude in feet, such as
+    // 30105, which is 9176 metres less 0.01 foot) goes in the text as /A=, so that it reads back
+    // the same (vectors README, Encoding).
     let mut altitude_in_text = None;
     if let Some(feet) = f.altitude_feet {
         let metres = libm::round(feet / METRES_TO_FEET);
-        if (metres * METRES_TO_FEET - feet).abs() > 1e-6 * feet.abs().max(1.0) {
+        if !same_number(metres * METRES_TO_FEET, feet) {
             altitude_in_text = Some(feet);
         } else {
             let datum = metres + 10_000.0;
@@ -420,14 +438,23 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         }
         out.extend_from_slice(b);
         out.extend_from_slice(b"/G");
+        // Anything after the locator and its symbol comes after a space (APRS12c ch. 10), a data
+        // extension included; the device suffix is read off the end first, so it needs none.
+        let follows = altitude_in_text.is_some()
+            || f.phg.is_some()
+            || f.range_miles.is_some()
+            || f.dfs.is_some()
+            || f.frequency.is_some()
+            || !f.comment.is_empty()
+            || f.telemetry.is_some()
+            || f.dao.is_some();
+        if follows {
+            out.push(b' ');
+        }
     }
     let before_extension = out.len();
     if let Some(ph) = f.phg {
-        if ph.power > 9 || ph.height > 9 || ph.gain > 9 || ph.directivity > 9 {
-            return Err(EncodeError::new("PHG codes are single digits"));
-        }
-        out.extend_from_slice(b"PHG");
-        out.extend_from_slice(&[b'0' + ph.power, b'0' + ph.height, b'0' + ph.gain, b'0' + ph.directivity]);
+        encode::phg_codes(&mut out, ph)?;
         if let Some(rate) = ph.beacons_per_hour {
             out.push(comment::beacon_rate_char(rate).ok_or_else(|| EncodeError::new("PHGR beacons per hour is 1-35"))?);
             out.push(b'/');
@@ -439,7 +466,7 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         }
         out.extend_from_slice(format!("RNG{:04}", n as u32).as_bytes());
     } else if let Some(dfs) = f.dfs {
-        out.extend_from_slice(&[b'D', b'F', b'S', b'0' + dfs.strength, b'0' + dfs.height, b'0' + dfs.gain, b'0' + dfs.directivity]);
+        encode::dfs_codes(&mut out, dfs)?;
     }
     let extension = out.len() > before_extension;
     if let Some(feet) = altitude_in_text {
@@ -470,9 +497,7 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         encode::telemetry_into(&mut trailer, t)?;
     }
     if let Some(d) = f.dao {
-        if !d.datum.is_ascii_uppercase() {
-            return Err(EncodeError::new("the !DAO! datum is an upper-case letter, e.g. W for WGS84"));
-        }
+        encode::check_dao_datum(d)?;
         trailer.push(b'!');
         match d.precision {
             DaoPrecision::Thousandths => trailer.extend_from_slice(&[d.datum as u8, b'0' + lat_extra, b'0' + lon_extra]),
@@ -484,7 +509,7 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     let suffix = r.device_suffix.as_bytes();
 
     let text_at = out.len();
-    let needs_space = !text.is_empty() && (r.locator.is_some() || f.frequency.is_some());
+    let needs_space = !text.is_empty() && f.frequency.is_some();
     let separators: &[&[u8]] = if needs_space { &[b" ", b"", b" /"] } else { &[b"", b"/"] };
     for separator in separators {
         out.truncate(text_at);
@@ -511,7 +536,7 @@ fn reads_back(r: &MicEReport, status_bytes: &[u8]) -> bool {
     let (a, b) = (&back.fields, &r.fields);
     let close = |x: Option<f64>, y: Option<f64>| match (x, y) {
         (None, None) => true,
-        (Some(x), Some(y)) => (x - y).abs() <= 1e-6 * x.abs().max(1.0),
+        (Some(x), Some(y)) => same_number(x, y),
         _ => false,
     };
     let freq = |v: &Option<crate::VoiceFrequency>| v.as_ref().map(|x| (x.tone, x.tone_value, x.offset_khz, x.range, x.range_km, x.narrow));

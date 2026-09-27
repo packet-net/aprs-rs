@@ -10,8 +10,8 @@ use alloc::vec::Vec;
 use crate::context::Context;
 use crate::weather;
 use crate::{
-    AgreloDf, Capabilities, Code, Data, EncodeError, Footprint, MaidenheadBeacon, Nmea, Packet, Query, RawWeather, RawWeatherFormat,
-    TestData, Timestamp, UserDefined, Weather, WeatherReport, status, telemetry, text,
+    AgreloDf, Capabilities, Code, Data, EncodeError, Footprint, MaidenheadBeacon, Nmea, Packet, ParseOptions, Query, RawWeather,
+    RawWeatherFormat, TestData, Timestamp, UserDefined, Weather, WeatherReport, status, telemetry, text,
 };
 
 pub(crate) fn raw_weather(ctx: &mut Context, info: &[u8], format: RawWeatherFormat, skip: usize) -> Option<Data> {
@@ -36,7 +36,7 @@ pub(crate) fn positionless_weather(ctx: &mut Context, info: &[u8]) -> Option<Dat
         return None;
     }
     let mut weather = Weather::default();
-    let at = 9 + weather::fields(ctx, &info[9..], 9, &mut weather, true, false)?;
+    let at = 9 + weather::fields(ctx, &info[9..], 9, &mut weather, weather::Wind::Positionless)?.len;
     let rest = &info[at..];
     let mut comment = String::new();
     if !weather::software_and_unit(rest, &mut weather) && !rest.is_empty() {
@@ -48,84 +48,141 @@ pub(crate) fn positionless_weather(ctx: &mut Context, info: &[u8]) -> Option<Dat
     Some(Data::Weather(WeatherReport { timestamp: Some(timestamp), weather, comment }))
 }
 
-/// Raw NMEA: `$GPRMC`, `$GPGGA`, `$GPGLL`, `$GPVTG`, `$GPWPL` are read; other sentences are kept as
-/// text. A field that does not parse (an empty position before a fix, say) is left out.
+/// Raw NMEA: after `$`, an NMEA 0183 sentence (vectors interpretations.md, "What `$` text is an
+/// NMEA sentence"): printable ASCII, an address field of five upper-case letters or digits (or
+/// `P` and three or more, a proprietary sentence) and at least one field, with no `$` in it and
+/// no `*` except the one that starts a checksum. The checksum, `*` and two hex digits, ends the
+/// sentence; any text after it is the comment. The structure is checked before the checksum.
+/// GGA, GLL, RMC, VTG and WPL are read, field by field; a field that is missing or does not
+/// parse is left out.
 pub(crate) fn nmea(ctx: &mut Context, info: &[u8]) -> Option<Data> {
     ctx.info(Code::ObsoleteFormat, "raw NMEA, which APRS12c ch. 7 does not recommend", Some(0));
     let body = &info[1..];
-    let Some(sentence) = core::str::from_utf8(body).ok().filter(|s| s.len() >= 5 && s.bytes().all(|b| (0x20..=0x7F).contains(&b))) else {
-        ctx.error(Code::InvalidNmea, "an NMEA sentence is printable ASCII, starting with the talker and sentence type", Some(1));
+    let Some(sentence) = nmea_sentence(body) else {
+        ctx.error(
+            Code::InvalidNmea,
+            "not an NMEA 0183 sentence: printable ASCII, an address field such as GPRMC, then fields, with * only before a checksum",
+            Some(1),
+        );
         return None;
     };
-    let (content, has_checksum) = match checksum(sentence) {
-        Checksum::None => (sentence, false),
-        Checksum::Matches(body) => (body, true),
-        Checksum::Mismatch => {
-            ctx.error(Code::NmeaChecksumMismatch, "the NMEA checksum does not match, so the sentence is corrupt", Some(1));
-            return None;
-        }
-    };
-    let f: Vec<&str> = content.split(',').collect();
-    let mut n = Nmea { sentence: sentence.to_string(), has_checksum, ..Nmea::default() };
-    let number = |t: &str| t.trim().parse::<f64>().ok().filter(|v| v.is_finite());
-    let position = |n: &mut Nmea, lat: &str, ns: &str, lon: &str, ew: &str| {
-        if let Some((la, lo)) = nmea_position(lat, ns, lon, ew) {
-            (n.latitude, n.longitude) = (Some(la), Some(lo));
-        }
-    };
-    match f[0].get(2..5).unwrap_or("") {
-        "GGA" if f.len() >= 10 => {
-            n.time = time(f[1]);
-            position(&mut n, f[2], f[3], f[4], f[5]);
-            n.fix_valid = f[6].trim().parse::<i32>().ok().map(|q| q > 0);
-            n.altitude_m = number(f[9]);
-        }
-        "RMC" if f.len() >= 9 => {
-            n.time = time(f[1]);
-            n.fix_valid = status_letter(f[2]);
-            position(&mut n, f[3], f[4], f[5], f[6]);
-            n.speed_knots = number(f[7]);
-            n.course_degrees = number(f[8]);
-        }
-        "GLL" if f.len() >= 5 => {
-            position(&mut n, f[1], f[2], f[3], f[4]);
-            n.time = f.get(5).and_then(|t| time(t));
-            n.fix_valid = f.get(6).and_then(|s| status_letter(s));
-        }
-        "VTG" if f.len() >= 6 => {
-            n.course_degrees = number(f[1]);
-            n.speed_knots = number(f[5]);
-        }
-        "WPL" if f.len() >= 6 => {
-            position(&mut n, f[1], f[2], f[3], f[4]);
-            n.waypoint = Some(f[5].to_string()).filter(|w| !w.is_empty());
-        }
-        _ => {}
+    if sentence.checksum.is_some_and(|sum| sum != nmea_checksum(sentence.content)) {
+        ctx.error(Code::NmeaChecksumMismatch, "the NMEA checksum does not match, so the sentence is corrupt", Some(1));
+        return None;
     }
+    let comment_at = 1 + sentence.len;
+    let comment = text::decode(ctx, &body[sentence.len..], comment_at)?;
+    let mut n = nmea_fields(sentence.content);
+    n.sentence = String::from_utf8_lossy(&body[..sentence.len]).into_owned();
+    n.has_checksum = sentence.checksum.is_some();
+    n.comment = comment;
     Some(Data::Nmea(n))
 }
 
-enum Checksum<'a> {
-    None,
-    Matches(&'a str),
-    Mismatch,
+/// The structure of an NMEA sentence at the start of the text after `$`.
+struct NmeaSentence<'a> {
+    /// The address field and data fields: everything before any `*`.
+    content: &'a str,
+    /// The checksum sent, if any.
+    checksum: Option<u8>,
+    /// Bytes the sentence takes, checksum included; any after it are the comment.
+    len: usize,
 }
 
-fn checksum(sentence: &str) -> Checksum<'_> {
-    let Some(star) = sentence.rfind('*') else {
-        return Checksum::None;
+/// Reads the sentence structure; `None` when the text is not an NMEA sentence.
+fn nmea_sentence(body: &[u8]) -> Option<NmeaSentence<'_>> {
+    let star = body.iter().position(|&b| b == b'*');
+    let (content, checksum, len) = match star {
+        None => (body, None, body.len()),
+        Some(i) => {
+            // A * that does not start a checksum is a reserved character in a field.
+            let hex = body.get(i + 1..i + 3)?;
+            let sum = core::str::from_utf8(hex).ok().filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))?;
+            (&body[..i], Some(u8::from_str_radix(sum, 16).ok()?), i + 3)
+        }
     };
-    let hex = &sentence[star + 1..];
-    if hex.len() != 2 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Checksum::None;
+    if !text::is_printable_ascii(content) || content.contains(&b'$') {
+        return None;
     }
-    let body = &sentence[..star];
-    let sum = body.bytes().fold(0u8, |a, b| a ^ b);
-    if u8::from_str_radix(hex, 16) == Ok(sum) { Checksum::Matches(body) } else { Checksum::Mismatch }
+    let content = core::str::from_utf8(content).ok()?;
+    let (address, _) = content.split_once(',')?;
+    let upper_or_digit = |b: u8| b.is_ascii_uppercase() || b.is_ascii_digit();
+    let address_ok = address.bytes().all(upper_or_digit) && (address.len() == 5 || (address.starts_with('P') && address.len() >= 4));
+    address_ok.then_some(NmeaSentence { content, checksum, len })
 }
 
-/// `hhmmss` with any fraction of a second, as `hh:mm:ss.f`.
-fn time(t: &str) -> Option<String> {
+/// The XOR of every character between `$` and `*`.
+fn nmea_checksum(content: &str) -> u8 {
+    content.bytes().fold(0u8, |a, b| a ^ b)
+}
+
+/// The fields of a GGA, GLL, RMC, VTG or WPL sentence, by position. Only a five-character address
+/// that does not start `P` has a sentence formatter, in its last three characters.
+fn nmea_fields(content: &str) -> Nmea {
+    let f: Vec<&str> = content.split(',').collect();
+    let field = |i: usize| f.get(i).copied();
+    let mut n = Nmea::default();
+    let position = |n: &mut Nmea, at: usize| {
+        let latitude = nmea_coordinate(field(at), field(at + 1), ("N", "S"), 90.0);
+        let longitude = nmea_coordinate(field(at + 2), field(at + 3), ("E", "W"), 180.0);
+        if let (Some(la), Some(lo)) = (latitude, longitude) {
+            (n.latitude, n.longitude) = (Some(la), Some(lo));
+        }
+    };
+    let address = f[0];
+    let formatter = if address.len() == 5 && !address.starts_with('P') { &address[2..] } else { "" };
+    match formatter {
+        "GGA" => {
+            n.time = field(1).and_then(nmea_time);
+            position(&mut n, 2);
+            n.fix_valid = match field(6).map(str::as_bytes) {
+                Some([q]) if q.is_ascii_digit() => Some(*q != b'0'),
+                _ => None,
+            };
+            n.altitude_m = field(9).and_then(nmea_number);
+        }
+        "RMC" => {
+            n.time = field(1).and_then(nmea_time);
+            n.fix_valid = field(2).and_then(status_letter);
+            position(&mut n, 3);
+            n.speed_knots = field(7).and_then(nmea_number);
+            n.course_degrees = field(8).and_then(nmea_number);
+        }
+        "GLL" => {
+            position(&mut n, 1);
+            n.time = field(5).and_then(nmea_time);
+            n.fix_valid = field(6).and_then(status_letter);
+        }
+        "VTG" => {
+            n.course_degrees = field(1).and_then(nmea_number);
+            n.speed_knots = field(5).and_then(nmea_number);
+        }
+        "WPL" => {
+            position(&mut n, 1);
+            n.waypoint = field(5).filter(|w| !w.is_empty()).map(str::to_string);
+        }
+        _ => {}
+    }
+    n
+}
+
+/// Speed, course or altitude: an optional `-`, then digits with an optional `.` and fraction (the
+/// digits before or after the `.` may be left out, not both).
+fn nmea_number(t: &str) -> Option<f64> {
+    let digits = t.strip_prefix('-').unwrap_or(t);
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    if (whole.is_empty() && fraction.is_empty())
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    t.parse::<f64>().ok().filter(|v| v.is_finite())
+}
+
+/// `hhmmss` (hours 00-23, minutes and seconds 00-59) with an optional `.` and fraction, as
+/// `HH:MM:SS.f`: the fraction as sent, less trailing zeros.
+fn nmea_time(t: &str) -> Option<String> {
     let b = t.as_bytes();
     if b.len() < 6 || !b[..6].iter().all(u8::is_ascii_digit) {
         return None;
@@ -151,19 +208,28 @@ fn status_letter(s: &str) -> Option<bool> {
     }
 }
 
-/// NMEA `ddmm.mmmm,N,dddmm.mmmm,W`: the hundreds are degrees, whatever the number of digits.
-fn nmea_position(lat: &str, ns: &str, lon: &str, ew: &str) -> Option<(f64, f64)> {
-    if lat.len() < 4 || lon.len() < 5 || !matches!(ns, "N" | "S") || !matches!(ew, "E" | "W") {
+/// An NMEA coordinate, `ddmm.mm` or `dddmm.mm`: digits with an optional `.` and fraction, at least
+/// three before the `.`; the last two of those are minutes (below 60) and the rest degrees,
+/// however many digits they have. Within `limit` degrees, with the hemisphere letter exact.
+fn nmea_coordinate(value: Option<&str>, hemisphere: Option<&str>, (positive, negative): (&str, &str), limit: f64) -> Option<f64> {
+    let (value, hemisphere) = (value?, hemisphere?);
+    let sign = match hemisphere {
+        h if h == positive => 1.0,
+        h if h == negative => -1.0,
+        _ => return None,
+    };
+    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    if whole.len() < 3 || !whole.bytes().all(|b| b.is_ascii_digit()) || !fraction.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    let la: f64 = lat.trim().parse().ok().filter(|v: &f64| v.is_finite())?;
-    let lo: f64 = lon.trim().parse().ok().filter(|v: &f64| v.is_finite())?;
-    let degrees = |v: f64| libm::floor(v / 100.0) + libm::fmod(v, 100.0) / 60.0;
-    let (la, lo) = (degrees(la), degrees(lo));
-    if la > 90.0 || lo > 180.0 {
+    let (degrees, minutes) = whole.split_at(whole.len() - 2);
+    let degrees: f64 = degrees.parse().ok()?;
+    let minutes: f64 = if fraction.is_empty() { minutes.parse().ok()? } else { format!("{minutes}.{fraction}").parse().ok()? };
+    if minutes >= 60.0 {
         return None;
     }
-    Some((if ns == "S" { -la } else { la }, if ew == "W" { -lo } else { lo }))
+    let v = degrees + minutes / 60.0;
+    (v <= limit).then_some(sign * v)
 }
 
 /// `[IO91SX]` and a comment.
@@ -189,8 +255,8 @@ pub(crate) fn query(ctx: &mut Context, info: &[u8]) -> Option<Data> {
         return None;
     };
     let query_type = &info[1..end];
-    if query_type.is_empty() || !query_type.iter().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) {
-        ctx.error(Code::InvalidGeneralQuery, "the query type is upper-case letters and digits", Some(1));
+    if query_type.is_empty() || !query_type.iter().all(u8::is_ascii_uppercase) {
+        ctx.error(Code::InvalidGeneralQuery, "the query type is upper-case letters (APRS12c ch. 15)", Some(1));
         return None;
     }
     let rest = &info[end + 1..];
@@ -200,7 +266,11 @@ pub(crate) fn query(ctx: &mut Context, info: &[u8]) -> Option<Data> {
         match footprint(rest) {
             Some(f) => Some(f),
             None => {
-                ctx.error(Code::InvalidGeneralQuery, "a query footprint is lat,lon,radius (APRS12c ch. 15)", Some(end + 1));
+                ctx.error(
+                    Code::InvalidGeneralQuery,
+                    "a query footprint is a latitude (to 90) and longitude (to 180) in degrees and a 4-digit radius (APRS12c ch. 15)",
+                    Some(end + 1),
+                );
                 return None;
             }
         }
@@ -214,30 +284,41 @@ fn footprint(rest: &[u8]) -> Option<Footprint> {
     if parts.len() != 3 {
         return None;
     }
-    let signed = |t: &str| -> Option<f64> {
-        let t = t.strip_prefix(' ').unwrap_or(t);
-        if t.is_empty() || !t.bytes().all(|b| b.is_ascii_digit() || b == b'.' || b == b'-') {
+    // Degrees as a decimal number, with a minus sign or, only for a positive value, a leading
+    // space ("Note the leading space in the latitude, as its value is positive", APRS12c ch. 15).
+    let signed = |t: &str, limit: f64| -> Option<f64> {
+        let (t, digits) = match t.strip_prefix(' ') {
+            Some(positive) => (positive, positive),
+            None => (t, t.strip_prefix('-').unwrap_or(t)),
+        };
+        let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+        if (whole.is_empty() && fraction.is_empty())
+            || !whole.bytes().all(|b| b.is_ascii_digit())
+            || !fraction.bytes().all(|b| b.is_ascii_digit())
+        {
             return None;
         }
-        t.parse().ok()
+        t.parse::<f64>().ok().filter(|v| v.abs() <= limit)
     };
     let radius = parts[2];
     if radius.len() != 4 || !radius.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    Some(Footprint { latitude: signed(parts[0])?, longitude: signed(parts[1])?, radius_miles: radius.parse().ok()? })
+    Some(Footprint { latitude: signed(parts[0], 90.0)?, longitude: signed(parts[1], 180.0)?, radius_miles: radius.parse().ok()? })
 }
 
 /// `TOKEN,TOKEN=VALUE,...`.
 pub(crate) fn capabilities(ctx: &mut Context, info: &[u8]) -> Option<Data> {
     let body = text::decode(ctx, &info[1..], 1)?;
-    // TOKEN or TOKEN=VALUE items, separated by commas; the spaces around them are not part of them.
+    // TOKEN or TOKEN=VALUE items, separated by commas and split at the first '='. The spaces
+    // (U+0020 only) around an item, a token or a value are padding, not part of them.
+    let pad = |t: &str| t.trim_matches(' ').to_string();
     let items: Vec<(String, Option<String>)> = body
         .split(',')
-        .map(str::trim)
+        .map(|item| item.trim_matches(' '))
         .filter(|item| !item.is_empty())
         .map(|item| match item.split_once('=') {
-            Some((t, v)) => (t.trim().to_string(), Some(v.trim().to_string())),
+            Some((t, v)) => (pad(t), Some(pad(v))),
             None => (item.to_string(), None),
         })
         .collect();
@@ -245,7 +326,8 @@ pub(crate) fn capabilities(ctx: &mut Context, info: &[u8]) -> Option<Data> {
         ctx.error(Code::InvalidCapabilities, "a capabilities report lists at least one capability (APRS12c ch. 15)", Some(1));
         return None;
     }
-    // A token with spaces in it is free text: a beacon sent with the wrong data type identifier.
+    // An empty token, or one with a space or a control character in it, or a value with a
+    // control character, is free text: a beacon sent with the wrong data type identifier.
     let free_text = items.iter().any(|(t, v)| {
         t.is_empty() || t.chars().any(|c| c <= ' ' || c == '\x7F') || v.as_ref().is_some_and(|v| v.chars().any(|c| c < ' ' || c == '\x7F'))
     });
@@ -261,9 +343,11 @@ pub(crate) fn capabilities(ctx: &mut Context, info: &[u8]) -> Option<Data> {
     Some(Data::Capabilities(Capabilities { capabilities: items }))
 }
 
-/// `}` and a whole TNC2 packet, decoded with the same options.
+/// `}` and a whole TNC2 packet, decoded with the same options. Its source may be any 1-9
+/// printable ASCII characters other than `>` and `:` (APRS12c ch. 17); a defect its header may
+/// tolerate is a warning on the inner packet, and rejects it when not tolerated.
 pub(crate) fn third_party(ctx: &mut Context, info: &[u8]) -> Option<Data> {
-    match Packet::decode_tnc2(&info[1..], ctx.options) {
+    match Packet::decode_third_party(&info[1..], ctx.options) {
         Ok(inner) => Some(Data::ThirdParty(Box::new(inner))),
         Err(_) => {
             ctx.error(Code::InvalidThirdParty, "the third-party header is not SOURCE>DEST,PATH: (APRS12c ch. 17)", Some(1));
@@ -284,10 +368,11 @@ pub(crate) fn test_data(ctx: &mut Context, info: &[u8]) -> Option<Data> {
     Some(Data::Test(TestData { data: text::decode(ctx, &info[1..], 1)? }))
 }
 
-/// `%bbb/q`.
+/// `%bbb/q`, exactly: a bearing of 000 to 360 and a quality digit (APRS12c Appendix 1).
 pub(crate) fn agrelo(ctx: &mut Context, info: &[u8]) -> Option<Data> {
-    if info.len() < 6 || !text::all_digits(&info[1..4]) || info[4] != b'/' || !info[5].is_ascii_digit() {
-        ctx.error(Code::InvalidAgreloDf, "an Agrelo DF report is %bbb/q", Some(0));
+    if info.len() != 6 || !text::all_digits(&info[1..4]) || info[4] != b'/' || !info[5].is_ascii_digit() || text::digits(&info[1..4]) > 360
+    {
+        ctx.error(Code::InvalidAgreloDf, "an Agrelo DF report is exactly %bbb/q, with a bearing of 000 to 360", Some(0));
         return None;
     }
     Some(Data::AgreloDf(AgreloDf { bearing_degrees: text::digits(&info[1..4]) as u16, quality: info[5] - b'0' }))
@@ -314,14 +399,28 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             if !w.comment.is_empty() {
                 return Err(EncodeError::new("a weather report has no comment field (APRS12c ch. 12)"));
             }
+            if w.weather.wind_direction_degrees.is_some_and(|d| d > 360) {
+                return Err(EncodeError::new("wind direction must be 0-360 degrees"));
+            }
             out.push(b'_');
             out.extend_from_slice(&t.to_bytes());
             weather::field(&mut out, b'c', w.weather.wind_direction_degrees.map(f64::from), 3, false)?;
             weather::field(&mut out, b's', w.weather.wind_speed_mph, 3, false)?;
             weather::encode_fields(&mut out, &w.weather)?;
+            // The software type and unit, and the extra fields, must not read back as fields.
+            match positionless_weather(&mut Context::new(ParseOptions::LENIENT), &out) {
+                Some(Data::Weather(back)) if weather::text_parts(&back.weather) == weather::text_parts(&w.weather) => {}
+                _ => {
+                    return Err(EncodeError::new(
+                        "the weather does not read back as given: a software type and unit, or an extra field, that would read as weather fields",
+                    ));
+                }
+            }
         }
         Data::RawWeather(r) => {
-            printable(&r.data, "raw weather data")?;
+            if !text::is_printable_ascii(r.data.as_bytes()) {
+                return Err(EncodeError::new("raw weather station data is printable ASCII"));
+            }
             out.extend_from_slice(match r.format {
                 RawWeatherFormat::PeetBrosHash => b"#",
                 RawWeatherFormat::PeetBrosStar => b"*",
@@ -330,20 +429,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             });
             out.extend_from_slice(r.data.as_bytes());
         }
-        Data::Nmea(n) => {
-            if !n.sentence.bytes().all(|b| (0x20..=0x7E).contains(&b)) {
-                return Err(EncodeError::new("an NMEA sentence is printable ASCII"));
-            }
-            match checksum(&n.sentence) {
-                Checksum::Mismatch => return Err(EncodeError::new("the NMEA checksum does not match the sentence")),
-                Checksum::None if n.has_checksum => {
-                    return Err(EncodeError::new("has_checksum is set but the sentence has no *hh checksum"));
-                }
-                _ => {}
-            }
-            out.push(b'$');
-            out.extend_from_slice(n.sentence.as_bytes());
-        }
+        Data::Nmea(n) => return encode_nmea(n),
         Data::MaidenheadBeacon(m) => {
             if !status::is_locator(m.locator.as_bytes()) {
                 return Err(EncodeError::new("a grid locator is 4 or 6 characters, e.g. IO91 or IO91SX"));
@@ -355,8 +441,8 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             out.extend_from_slice(m.comment.as_bytes());
         }
         Data::Query(q) => {
-            if q.query_type.is_empty() || !q.query_type.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit()) {
-                return Err(EncodeError::new("a query type is upper-case letters and digits"));
+            if q.query_type.is_empty() || !q.query_type.bytes().all(|b| b.is_ascii_uppercase()) {
+                return Err(EncodeError::new("a query type is upper-case letters (APRS12c ch. 15)"));
             }
             out.push(b'?');
             out.extend_from_slice(q.query_type.as_bytes());
@@ -365,7 +451,8 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                 if !(-90.0..=90.0).contains(&f.latitude) || !(-180.0..=180.0).contains(&f.longitude) || f.radius_miles > 9999 {
                     return Err(EncodeError::new("a query footprint is within -90..90, -180..180 and a radius of up to 9999 miles"));
                 }
-                let signed = |v: f64| if v < 0.0 { format!("{v}") } else { format!(" {v}") };
+                // A space only before a positive value; a negative one (-0 included) has its sign.
+                let signed = |v: f64| if v.is_sign_negative() { format!("{v}") } else { format!(" {v}") };
                 out.extend_from_slice(format!("{},{},{:04}", signed(f.latitude), signed(f.longitude), f.radius_miles).as_bytes());
             }
         }
@@ -373,11 +460,12 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             if c.capabilities.is_empty() {
                 return Err(EncodeError::new("a capabilities report lists at least one token"));
             }
+            // What would not read back the same: spaces around a value are padding.
             let bad_token = |t: &str| t.is_empty() || t.chars().any(|c| c <= ' ' || c == '\x7F' || c == ',' || c == '=');
-            let bad_value = |v: &str| v.chars().any(|c| c < ' ' || c == '\x7F' || c == ',');
+            let bad_value = |v: &str| v.starts_with(' ') || v.ends_with(' ') || v.chars().any(|c| c < ' ' || c == '\x7F' || c == ',');
             if c.capabilities.iter().any(|(t, v)| bad_token(t) || v.as_deref().is_some_and(bad_value)) {
                 return Err(EncodeError::new(
-                    "capability tokens and values are text without ',' or control characters (and tokens without '=' or spaces)",
+                    "capability tokens and values are text without ',' or control characters, tokens without '=' or spaces, and values not starting or ending with a space",
                 ));
             }
             out.push(b'<');
@@ -392,18 +480,29 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             out.extend_from_slice(items.join(",").as_bytes());
         }
         Data::ThirdParty(p) => {
+            third_party_header(p)?;
             out.push(b'}');
             out.extend_from_slice(&p.to_tnc2());
+            // The information field is written as received; only a line break at its very end
+            // would not read back.
+            if matches!(out.last(), Some(b'\r' | b'\n')) {
+                return Err(EncodeError::new("a third-party packet's information field cannot end with a line break"));
+            }
         }
         Data::UserDefined(u) => {
-            // A space is printable ASCII too: APRS12c ch. 19 puts no limit on these two characters.
-            if !(' '..='~').contains(&u.user_id) || !(' '..='~').contains(&u.packet_type) {
-                return Err(EncodeError::new("user ID and packet type are printable ASCII"));
-            }
+            // APRS12c ch. 19 puts no restriction on user-defined data, these two characters
+            // included: any byte is written back as it came.
+            let (Ok(user_id), Ok(packet_type)) = (u8::try_from(u.user_id), u8::try_from(u.packet_type)) else {
+                return Err(EncodeError::new("the user ID and packet type are one byte each (U+0000 to U+00FF)"));
+            };
             out.push(b'{');
-            out.push(u.user_id as u8);
-            out.push(u.packet_type as u8);
+            out.push(user_id);
+            out.push(packet_type);
             out.extend_from_slice(&u.data);
+            // A line break at the very end would be taken for the end of the line and dropped.
+            if matches!(out.last(), Some(b'\r' | b'\n')) {
+                return Err(EncodeError::new("user-defined data cannot end with a line break, which would not read back"));
+            }
         }
         Data::Test(t) => {
             printable(&t.data, "test data")?;
@@ -420,4 +519,86 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
         _ => return Err(EncodeError::new("not one of the other data types")),
     }
     Ok(out)
+}
+
+/// `$`, the sentence and its comment, when they read back as given: the sentence well formed,
+/// its checksum (if any) right and ending it, a comment only after a checksum, and every field
+/// given agreeing with what the sentence says.
+fn encode_nmea(n: &Nmea) -> Result<Vec<u8>, EncodeError> {
+    let sentence = n.sentence.as_bytes();
+    // $ULTW is raw weather, not NMEA, so such a sentence would not read back.
+    let Some(structure) = nmea_sentence(sentence).filter(|s| s.len == sentence.len() && !n.sentence.starts_with("ULTW")) else {
+        return Err(EncodeError::new(
+            "not an NMEA 0183 sentence: printable ASCII, an address field such as GPRMC, then fields, and at most a *hh checksum at the end",
+        ));
+    };
+    match structure.checksum {
+        Some(sum) if sum != nmea_checksum(structure.content) => {
+            return Err(EncodeError::new("the NMEA checksum does not match the sentence"));
+        }
+        Some(_) if !n.has_checksum => return Err(EncodeError::new("the sentence has a *hh checksum but has_checksum is not set")),
+        None if n.has_checksum => return Err(EncodeError::new("has_checksum is set but the sentence has no *hh checksum")),
+        None if !n.comment.is_empty() => {
+            return Err(EncodeError::new("an NMEA comment goes after a *hh checksum, which is what ends the sentence"));
+        }
+        _ => {}
+    }
+    if text::has_line_break(n.comment.as_bytes()) {
+        return Err(EncodeError::new("an NMEA comment cannot contain a line break"));
+    }
+    let read = nmea_fields(structure.content);
+    fn agrees<T: PartialEq>(given: &Option<T>, read: &Option<T>) -> bool {
+        given.is_none() || given == read
+    }
+    if !(agrees(&n.latitude, &read.latitude)
+        && agrees(&n.longitude, &read.longitude)
+        && agrees(&n.fix_valid, &read.fix_valid)
+        && agrees(&n.course_degrees, &read.course_degrees)
+        && agrees(&n.speed_knots, &read.speed_knots)
+        && agrees(&n.altitude_m, &read.altitude_m)
+        && agrees(&n.time, &read.time)
+        && agrees(&n.waypoint, &read.waypoint))
+    {
+        return Err(EncodeError::new("a field given does not match what the NMEA sentence says"));
+    }
+    let mut out = Vec::with_capacity(1 + sentence.len() + n.comment.len());
+    out.push(b'$');
+    out.extend_from_slice(sentence);
+    out.extend_from_slice(n.comment.as_bytes());
+    Ok(out)
+}
+
+/// Checks that a third-party packet's header can be written so that it reads back the same: the
+/// source 1-9 printable ASCII characters other than `>` and `:` (APRS12c ch. 17), the destination
+/// and path APRS-IS addresses, the used entries a run from the start (the TNC2 form marks only
+/// the last), and no header defect that the inner decode tolerated: that is part of its data, and
+/// no clean form reproduces it.
+fn third_party_header(p: &Packet) -> Result<(), EncodeError> {
+    if !crate::Address::is_third_party_source(p.source.as_str()) {
+        return Err(EncodeError::new("a third-party source is 1-9 printable ASCII characters other than > and : (APRS12c ch. 17)"));
+    }
+    if !crate::Address::is_valid(p.destination.as_str()) || p.path.iter().any(|e| !crate::Address::is_valid(e.address.as_str())) {
+        return Err(EncodeError::new("a third-party destination and path entries are addresses: 1-9 letters, digits or -"));
+    }
+    if let Some(last) = p.path.iter().rposition(|e| e.used) {
+        if p.path[..last].iter().any(|e| !e.used) {
+            return Err(EncodeError::new("a used path entry after one that is not used cannot be written in TNC2 form"));
+        }
+    }
+    let header_defect = |c: Code| {
+        matches!(
+            c,
+            Code::EmptyDestination
+                | Code::EmptyPathEntry
+                | Code::MultipleUsedMarkers
+                | Code::NulPaddedAddress
+                | Code::InvalidAx25AddressCharacters
+        )
+    };
+    if p.diagnostics.iter().any(|d| header_defect(d.code)) {
+        return Err(EncodeError::new(
+            "the third-party packet's header has a defect that was tolerated, which is part of its data and cannot be written back",
+        ));
+    }
+    Ok(())
 }

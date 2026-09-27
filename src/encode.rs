@@ -105,6 +105,10 @@ pub(crate) fn check_timestamp(t: &Timestamp) -> Result<(), EncodeError> {
 /// The position, symbol, extension, weather and comment of a position, object or item.
 pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), EncodeError> {
     let weather_symbol = comment::is_weather_symbol(f);
+    if weather_symbol && f.weather.is_none() {
+        // A report with the weather station symbol reads back as weather, whatever it holds.
+        return Err(EncodeError::new("a report with the weather station symbol, _, is a weather report: give it weather (APRS12c ch. 12)"));
+    }
     if f.weather.is_some() {
         if !weather_symbol {
             return Err(EncodeError::new("weather needs the weather station symbol, _ (APRS12c ch. 12)"));
@@ -115,6 +119,20 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
         if f.telemetry.is_some() || f.frequency.is_some() || f.signpost.is_some() || (f.altitude_feet.is_some() && !f.compressed) {
             return Err(EncodeError::new(
                 "a weather report has no comment, so it cannot carry telemetry, frequency, signpost or /A= altitude (APRS12c ch. 12)",
+            ));
+        }
+        // Its data extension, or its cs bytes, are the wind.
+        if f.course_degrees.is_some()
+            || f.speed_knots.is_some()
+            || f.phg.is_some()
+            || f.dfs.is_some()
+            || f.area.is_some()
+            || f.df_bearing.is_some()
+            || f.storm.is_some()
+            || (f.range_miles.is_some() && !f.compressed)
+        {
+            return Err(EncodeError::new(
+                "a weather report's data extension is its wind, so it cannot carry a course, speed, PHG, RNG, DFS, area, DF bearing or storm data (APRS12c ch. 12)",
             ));
         }
     }
@@ -214,9 +232,7 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
         if f.position.ambiguity > 0 && d.precision != DaoPrecision::None {
             return Err(EncodeError::new("a !DAO! adds precision to an ambiguous position, which contradicts it"));
         }
-        if !d.datum.is_ascii_uppercase() {
-            return Err(EncodeError::new("the !DAO! datum is an upper-case letter, e.g. W for WGS84"));
-        }
+        check_dao_datum(d)?;
         trailer.push(b'!');
         match (d.precision, dao_digits) {
             (DaoPrecision::Thousandths, Some((lat, lon))) => trailer.extend_from_slice(&[d.datum as u8, b'0' + lat, b'0' + lon]),
@@ -246,36 +262,70 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
             return Ok(());
         }
     }
+    if f.weather.is_some() {
+        return Err(EncodeError::new(
+            "the weather does not read back as given: a software type and unit, or an extra field, that would read as weather fields",
+        ));
+    }
     Err(EncodeError::new(
         "comment text contains something that decodes as a structured element (altitude, !DAO!, |telemetry|, frequency, PHG/RNG/DFS or braces); set the property instead",
     ))
 }
 
 /// Writes the compressed cs and type bytes. `true` when they carry the altitude exactly.
+///
+/// The cs bytes carry one thing: a GGA altitude, a range, or a course and speed (the wind, for a
+/// weather station). Whatever else would have to go in them is refused, not dropped, and so is a
+/// compression type with nothing to carry, since blank cs bytes have no type byte (vectors
+/// interpretations.md, "Re-encoding into compressed bytes rounds").
 fn compressed_cs(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError> {
-    let weather_wind = f.weather.as_ref().filter(|w| w.wind_direction_degrees.is_some() || w.wind_speed_mph.is_some());
+    let wind = f.weather.as_ref().filter(|w| w.wind_direction_degrees.is_some() || w.wind_speed_mph.is_some());
+    let course_speed = f.course_degrees.is_some() || f.speed_knots.is_some();
     let t =
         f.compression.unwrap_or(CompressionType { fix: GpsFix::Current, source: NmeaSource::Other, origin: CompressionOrigin::Software });
     let log = |x: f64, base: f64| libm::log(x) / libm::log(base);
-    let (c, s, altitude) = if t.source == NmeaSource::Gga && f.altitude_feet.is_some() {
-        let feet = f.altitude_feet.unwrap_or_default();
-        if feet < 1.0 {
-            return Err(EncodeError::new("a compressed altitude must be at least 1 foot"));
+    let (c, s, altitude) = if t.source == NmeaSource::Gga {
+        // GGA cs bytes are read as an altitude, whatever else was meant.
+        let Some(feet) = f.altitude_feet else {
+            return Err(EncodeError::new("a GGA compression type carries an altitude in the cs bytes, and there is none"));
+        };
+        if course_speed || f.range_miles.is_some() || wind.is_some() {
+            return Err(EncodeError::new(
+                "the cs bytes carry the GGA altitude, so a compressed position cannot also carry a course, speed, range or wind",
+            ));
         }
-        let cs = libm::round(log(feet, 1.002)) as i64;
+        if feet.is_nan() {
+            return Err(EncodeError::new("the altitude is not a number"));
+        }
+        // 1.002^cs feet cannot be 1 foot or less: the nearest is cs 0, and /A= carries the rest.
+        let cs = if feet <= 1.0 { 0 } else { libm::round(log(feet, 1.002)) as i64 };
         if cs > 90 * 91 + 90 {
             return Err(EncodeError::new("the altitude is too high for a compressed position"));
         }
         // The cs bytes carry altitude only to 0.2%; one they cannot carry exactly is also written
         // as /A=, which the decoder prefers.
-        let exact = (libm::pow(1.002, cs as f64) - feet).abs() <= 1e-9 * feet;
+        let exact = (libm::pow(1.002, cs as f64) - feet).abs() <= 1e-9 * feet.abs();
         ((cs / 91) as u8, (cs % 91) as u8, exact)
-    } else if let Some(w) = weather_wind {
-        let dir = w.wind_direction_degrees.unwrap_or(0);
-        let knots = w.wind_speed_mph.unwrap_or(0.0) / KNOTS_TO_MPH;
-        (((dir % 360) / 4) as u8, speed_code(knots)?, false)
+    } else if let Some(w) = wind {
+        // A weather station's cs course and speed are its wind.
+        if f.range_miles.is_some() {
+            return Err(EncodeError::new("the cs bytes carry the wind or a range, not both"));
+        }
+        // The cs bytes carry a direction and a speed together; one without the other would read
+        // back as 0.
+        let (Some(dir), Some(mph)) = (w.wind_direction_degrees, w.wind_speed_mph) else {
+            return Err(EncodeError::new("the cs bytes carry the wind as a direction and a speed together, so both are needed"));
+        };
+        if dir > 360 {
+            return Err(EncodeError::new("wind direction must be 0-360 degrees"));
+        }
+        let knots = mph / KNOTS_TO_MPH;
+        (direction_code(dir), speed_code(knots)?, false)
     } else if let Some(range) = f.range_miles {
-        if range < 2.0 {
+        if course_speed {
+            return Err(EncodeError::new("the cs bytes carry a course and speed or a range, not both (APRS12c ch. 9)"));
+        }
+        if range.is_nan() || range < 2.0 {
             return Err(EncodeError::new("a compressed range must be at least 2 miles"));
         }
         let s = libm::round(log(range / 2.0, 1.08));
@@ -283,14 +333,19 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError>
             return Err(EncodeError::new("the range is too far for a compressed position"));
         }
         (b'{' - 33, s as u8, false)
-    } else if f.course_degrees.is_some() || f.speed_knots.is_some() {
+    } else if course_speed {
         let course = f.course_degrees.unwrap_or(0);
         if course > 360 {
             return Err(EncodeError::new("course must be 0-360 degrees"));
         }
-        (((course % 360) / 4) as u8, speed_code(f.speed_knots.unwrap_or(0.0))?, false)
+        (direction_code(course), speed_code(f.speed_knots.unwrap_or(0.0))?, false)
     } else {
-        // No course/speed, range or altitude: the spec's own form for that.
+        // No course/speed, range or altitude: the spec's own form for that, which has no type byte.
+        if f.compression.is_some() {
+            return Err(EncodeError::new(
+                "a compression type needs something in the cs bytes: a course and speed, range, altitude or wind",
+            ));
+        }
         out.extend_from_slice(b" sT");
         return Ok(false);
     };
@@ -298,6 +353,12 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError>
     out.push(s + 33);
     out.push(type_to_bits(t) + 33);
     Ok(altitude)
+}
+
+/// A course or wind direction in the compressed c byte's 4-degree steps: the nearest step (103
+/// degrees is written as 104), with 360 and 0 both north.
+fn direction_code(degrees: u16) -> u8 {
+    ((u32::from(degrees) + 2) / 4 % 90) as u8
 }
 
 fn speed_code(knots: f64) -> Result<u8, EncodeError> {
@@ -369,11 +430,7 @@ fn uncompressed_extension(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, Enc
         return Ok(true);
     }
     if let Some(p) = f.phg {
-        if p.power > 9 || p.height > 9 || p.gain > 9 || p.directivity > 9 {
-            return Err(EncodeError::new("PHG codes are single digits"));
-        }
-        out.extend_from_slice(b"PHG");
-        out.extend_from_slice(&[b'0' + p.power, b'0' + p.height, b'0' + p.gain, b'0' + p.directivity]);
+        phg_codes(out, p)?;
         if let Some(rate) = p.beacons_per_hour {
             let Some(c) = beacon_rate_char(rate) else {
                 return Err(EncodeError::new("PHGR beacons per hour is 1-35"));
@@ -393,11 +450,7 @@ fn uncompressed_extension(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, Enc
         return Ok(true);
     }
     if let Some(d) = f.dfs {
-        if d.strength > 9 || d.height > 9 || d.gain > 9 || d.directivity > 9 {
-            return Err(EncodeError::new("DFS codes are single digits"));
-        }
-        out.extend_from_slice(b"DFS");
-        out.extend_from_slice(&[b'0' + d.strength, b'0' + d.height, b'0' + d.gain, b'0' + d.directivity]);
+        dfs_codes(out, d)?;
         return Ok(true);
     }
     if let Some(a) = f.area {
@@ -426,6 +479,41 @@ fn uncompressed_extension(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, Enc
         return Ok(true);
     }
     Ok(false)
+}
+
+/// The highest PHG or DFS height code: `~`, the last printable character after `0` (APRS12c ch.
+/// 7: "any ASCII character 0-9 and above").
+const MAX_HEIGHT_CODE: u8 = b'~' - b'0';
+
+/// `PHGphgd` (without the PHGR rate): the power, gain and directivity codes are digits, and the
+/// height code runs on past 9 through the ASCII table (`:` is 10), for balloons and aircraft.
+pub(crate) fn phg_codes(out: &mut Vec<u8>, p: crate::Phg) -> Result<(), EncodeError> {
+    if p.power > 9 || p.gain > 9 || p.directivity > 9 || p.height > MAX_HEIGHT_CODE {
+        return Err(EncodeError::new("PHG power, gain and directivity codes are single digits, and the height code 0-78"));
+    }
+    out.extend_from_slice(b"PHG");
+    out.extend_from_slice(&[b'0' + p.power, b'0' + p.height, b'0' + p.gain, b'0' + p.directivity]);
+    Ok(())
+}
+
+/// `DFSshgd`: the height code as for PHG, the others digits.
+pub(crate) fn dfs_codes(out: &mut Vec<u8>, d: crate::DfSignalStrength) -> Result<(), EncodeError> {
+    if d.strength > 9 || d.gain > 9 || d.directivity > 9 || d.height > MAX_HEIGHT_CODE {
+        return Err(EncodeError::new("DFS strength, gain and directivity codes are single digits, and the height code 0-78"));
+    }
+    out.extend_from_slice(b"DFS");
+    out.extend_from_slice(&[b'0' + d.strength, b'0' + d.height, b'0' + d.gain, b'0' + d.directivity]);
+    Ok(())
+}
+
+/// A `!DAO!` datum the decoder reads back: an upper-case letter (`W` for WGS84), or a digit (a
+/// local datum), which has no case to say how to read added digits and so carries none.
+pub(crate) fn check_dao_datum(d: crate::Dao) -> Result<(), EncodeError> {
+    if d.datum.is_ascii_uppercase() || (d.datum.is_ascii_digit() && d.precision == DaoPrecision::None) {
+        Ok(())
+    } else {
+        Err(EncodeError::new("the !DAO! datum is an upper-case letter (W for WGS84), or a digit with no added precision"))
+    }
 }
 
 fn whole(v: Option<f64>, what: &str) -> Result<Option<u32>, EncodeError> {
@@ -559,7 +647,7 @@ fn reads_back(written: &[u8], f: &Positioned) -> bool {
         && frequency_fields(&back.frequency) == frequency_fields(&f.frequency)
         && back.signpost == f.signpost
         && back.dao.map(|d| d.datum) == f.dao.map(|d| d.datum)
-        && back.weather.is_some() == f.weather.is_some()
+        && back.weather.as_ref().map(weather::text_parts) == f.weather.as_ref().map(weather::text_parts)
         && close(back.altitude_feet, f.altitude_feet, 0.01)
         && close(back.range_miles, f.range_miles, 0.1)
 }
