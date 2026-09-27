@@ -183,6 +183,13 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
         s.retain(|&b| b != 0xFF);
     }
 
+    // Rev 0 binary telemetry, looked for once the 0xFF padding is gone (vectors interpretations.md).
+    if s.len() >= 6 && s[0] == 0x1D {
+        ctx.info(Code::ObsoleteFormat, "obsolete Mic-E binary telemetry (APRS12c ch. 10)", Some(offset));
+        report.legacy_telemetry = s[1..6].to_vec();
+        s.drain(..6);
+    }
+
     let type_code = match s.first() {
         Some(&b @ (b'`' | b'\'' | b'>' | b']' | b' ')) => Some(b),
         _ => None,
@@ -377,6 +384,14 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     out.push(f.symbol.table as u8);
 
     let status_start = out.len();
+    if !r.legacy_telemetry.is_empty() {
+        // A 255 would be taken for Kenwood 0xFF padding and removed on the way back in.
+        if r.legacy_telemetry.len() != 5 || r.legacy_telemetry.contains(&255) {
+            return Err(EncodeError::new("obsolete Mic-E binary telemetry is 5 values, each 0-254"));
+        }
+        out.push(0x1D);
+        out.extend_from_slice(&r.legacy_telemetry);
+    }
     if let Some(t) = r.type_code {
         if !matches!(t, '`' | '\'' | '>' | ']' | ' ') {
             return Err(EncodeError::new("a Mic-E type code is `, ', >, ] or a space"));
@@ -501,6 +516,7 @@ fn reads_back(r: &MicEReport, status_bytes: &[u8]) -> bool {
     };
     let freq = |v: &Option<crate::VoiceFrequency>| v.as_ref().map(|x| (x.tone, x.tone_value, x.offset_khz, x.range, x.range_km, x.narrow));
     back.type_code == r.type_code
+        && back.legacy_telemetry == r.legacy_telemetry
         && back.device_suffix == r.device_suffix
         && back.locator.as_deref().map(str::to_ascii_uppercase) == r.locator.as_deref().map(str::to_ascii_uppercase)
         && a.comment == b.comment
