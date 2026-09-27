@@ -234,8 +234,11 @@ pub fn data(d: &Data) -> Value {
             )
             .done(),
         Data::ThirdParty(p) => {
+            // A header's source and destination are always written, even when empty.
             let mut inner = Obj::new("");
-            inner.put("source", json!(p.source.as_str())).put("destination", json!(p.destination.as_str())).put("path", path(&p.path));
+            inner.0.insert("source".into(), json!(p.source.as_str()));
+            inner.0.insert("destination".into(), json!(p.destination.as_str()));
+            inner.put("path", path(&p.path));
             inner.put("data", data(&p.data)).put("diagnostics", json!(diagnostics(&p.diagnostics)));
             Obj::new("third-party").put("packet", inner.done()).done()
         }
@@ -529,7 +532,7 @@ pub fn read_data(v: &Value) -> Data {
             let information = data.encode().unwrap_or_default();
             Data::ThirdParty(Box::new(Packet {
                 source: Address::third_party_source(p["source"].as_str().unwrap()).unwrap(),
-                destination: Address::new(p["destination"].as_str().unwrap()).unwrap(),
+                destination: read_destination(p["destination"].as_str().unwrap()),
                 path,
                 information,
                 data,
@@ -548,6 +551,15 @@ pub fn read_data(v: &Value) -> Data {
         }),
         other => panic!("cannot read data of type {other}"),
     }
+}
+
+/// A destination address; an empty one (a tolerated defect, UAP 5.2) is only made by decoding
+/// a header that has one.
+fn read_destination(text: &str) -> Address {
+    if text.is_empty() {
+        return Packet::decode_tnc2(b"N0CALL>:", ParseOptions::LENIENT).expect("an empty destination is tolerated").destination;
+    }
+    Address::new(text).unwrap()
 }
 
 /// A diagnostic from its neutral form, `severity:code`; the message and offset are not part of it.

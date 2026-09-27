@@ -262,6 +262,11 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
             return Ok(());
         }
     }
+    if f.weather.is_some() {
+        return Err(EncodeError::new(
+            "the weather does not read back as given: a software type and unit, or an extra field, that would read as weather fields",
+        ));
+    }
     Err(EncodeError::new(
         "comment text contains something that decodes as a structured element (altitude, !DAO!, |telemetry|, frequency, PHG/RNG/DFS or braces); set the property instead",
     ))
@@ -638,7 +643,7 @@ fn reads_back(written: &[u8], f: &Positioned) -> bool {
         && frequency_fields(&back.frequency) == frequency_fields(&f.frequency)
         && back.signpost == f.signpost
         && back.dao.map(|d| d.datum) == f.dao.map(|d| d.datum)
-        && back.weather.is_some() == f.weather.is_some()
+        && back.weather.as_ref().map(weather::text_parts) == f.weather.as_ref().map(weather::text_parts)
         && close(back.altitude_feet, f.altitude_feet, 0.01)
         && close(back.range_miles, f.range_miles, 0.1)
 }

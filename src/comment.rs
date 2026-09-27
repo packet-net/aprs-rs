@@ -156,17 +156,14 @@ pub(crate) fn decode(ctx: &mut Context, fields: &mut Positioned, cs: Option<Cs>,
     tail(ctx, fields, &bytes[at..], offset + at, None)
 }
 
-/// After a position's weather data: the software and unit, or else text that a weather report
-/// should not have, from which telemetry and a `!DAO!` are still lifted.
+/// After a position's weather data: base-91 telemetry and a `!DAO!` are lifted out first, and
+/// what is left is the software type and unit, or else text that a weather report should not have.
 fn weather_tail(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], offset: usize) -> bool {
-    if bytes.is_empty() || weather::software_and_unit(bytes, fields.weather.get_or_insert_with(Weather::default)) {
-        return true;
-    }
     let mut c: Vec<u8> = bytes.to_vec();
     if !lift_telemetry_and_dao(ctx, fields, &mut c, offset, None) {
         return false;
     }
-    if c.is_empty() {
+    if c.is_empty() || weather::software_and_unit(&c, fields.weather.get_or_insert_with(Weather::default)) {
         return true;
     }
     if !ctx.tolerate(Code::WeatherComment, "text after the weather data; a weather report has no comment (UAP 2.7.1)", Some(offset)) {
@@ -339,7 +336,15 @@ fn extension_at_start(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], 
         fields.speed_knots = speed.map(f64::from);
         if is_df_symbol(fields) {
             if let Some(b) = bytes.get(7..15).and_then(df_bearing) {
-                fields.df_bearing = Some(b);
+                // The bearing is degrees: one over 360 drops the whole /BRG/NRQ, as an
+                // out-of-range course is dropped (vectors README, Positions).
+                if b.bearing_degrees > 360 {
+                    if !ctx.tolerate(Code::OutOfRangeValue, "a DF bearing over 360 degrees was dropped", Some(offset + 7)) {
+                        return None;
+                    }
+                } else {
+                    fields.df_bearing = Some(b);
+                }
                 return Some(15);
             }
         } else if is_storm_symbol(fields) {
@@ -438,9 +443,6 @@ pub(crate) fn beacon_rate_char(rate: u8) -> Option<u8> {
 /// `/BRG/NRQ` after the course and speed of a DF report.
 fn df_bearing(bytes: &[u8]) -> Option<DfBearing> {
     if bytes.len() < 8 || bytes[0] != b'/' || bytes[4] != b'/' || !text::all_digits(&bytes[1..4]) || !text::all_digits(&bytes[5..8]) {
-        return None;
-    }
-    if text::digits(&bytes[1..4]) > 360 {
         return None;
     }
     Some(DfBearing {

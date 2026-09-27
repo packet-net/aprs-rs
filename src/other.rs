@@ -10,8 +10,8 @@ use alloc::vec::Vec;
 use crate::context::Context;
 use crate::weather;
 use crate::{
-    AgreloDf, Capabilities, Code, Data, EncodeError, Footprint, MaidenheadBeacon, Nmea, Packet, Query, RawWeather, RawWeatherFormat,
-    TestData, Timestamp, UserDefined, Weather, WeatherReport, status, telemetry, text,
+    AgreloDf, Capabilities, Code, Data, EncodeError, Footprint, MaidenheadBeacon, Nmea, Packet, ParseOptions, Query, RawWeather,
+    RawWeatherFormat, TestData, Timestamp, UserDefined, Weather, WeatherReport, status, telemetry, text,
 };
 
 pub(crate) fn raw_weather(ctx: &mut Context, info: &[u8], format: RawWeatherFormat, skip: usize) -> Option<Data> {
@@ -404,6 +404,15 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             weather::field(&mut out, b'c', w.weather.wind_direction_degrees.map(f64::from), 3, false)?;
             weather::field(&mut out, b's', w.weather.wind_speed_mph, 3, false)?;
             weather::encode_fields(&mut out, &w.weather)?;
+            // The software type and unit, and the extra fields, must not read back as fields.
+            match positionless_weather(&mut Context::new(ParseOptions::LENIENT), &out) {
+                Some(Data::Weather(back)) if weather::text_parts(&back.weather) == weather::text_parts(&w.weather) => {}
+                _ => {
+                    return Err(EncodeError::new(
+                        "the weather does not read back as given: a software type and unit, or an extra field, that would read as weather fields",
+                    ));
+                }
+            }
         }
         Data::RawWeather(r) => {
             if !text::is_printable_ascii(r.data.as_bytes()) {

@@ -251,6 +251,13 @@ pub(crate) fn software_and_unit(rest: &[u8], weather: &mut Weather) -> bool {
     true
 }
 
+/// The parts of weather that are text rather than numbers: the software type, the unit and the
+/// extra fields. Written back, they must read back the same, and not as fields (`h89b1` as a
+/// software type and unit would read back as humidity).
+pub(crate) fn text_parts(w: &Weather) -> (Option<char>, Option<&str>, &[WeatherField]) {
+    (w.software, w.unit.as_deref(), &w.extra)
+}
+
 /// Writes the fields after the wind (gust, temperature, rain, humidity, pressure, luminosity, snow,
 /// raw rain, extra fields), then software and unit. Gust and temperature are mandatory, written as
 /// dots when unknown.
@@ -281,7 +288,10 @@ pub(crate) fn encode_fields(out: &mut Vec<u8>, w: &Weather) -> Result<(), Encode
             _ => return Err(EncodeError::new("luminosity must be 0-1999 W/m2")),
         }
     }
-    optional(out, b's', w.snow_24h_in, 3)?;
+    if let Some(snow) = w.snow_24h_in {
+        out.push(b's');
+        snowfall(out, snow)?;
+    }
     if let Some(r) = w.rain_raw {
         if r > 999 {
             return Err(EncodeError::new("the raw rain counter must be 0-999"));
@@ -349,6 +359,27 @@ fn number_field(out: &mut Vec<u8>, value: f64, width: usize, signed: bool) -> Re
     } else {
         push_digits(out, n as u32, width);
     }
+    Ok(())
+}
+
+/// Snowfall in its three characters, which may include one decimal point (APRS12c ch. 12: "A
+/// decimal point is allowed for non-integer values"): `012`, `1.5` or `.25`. A value those cannot
+/// hold exactly is refused.
+fn snowfall(out: &mut Vec<u8>, inches: f64) -> Result<(), EncodeError> {
+    let exact = |scale: f64| {
+        let n = libm::round(inches * scale);
+        ((n - inches * scale).abs() <= 1e-6).then_some(n as u32)
+    };
+    if !(0.0..=999.0).contains(&inches) {
+        return Err(EncodeError::new("snowfall must be 0-999 inches"));
+    }
+    let text = match (exact(1.0), exact(10.0), exact(100.0)) {
+        (Some(n), _, _) => alloc::format!("{n:03}"),
+        (None, Some(n), _) if n < 100 => alloc::format!("{}.{}", n / 10, n % 10),
+        (None, None, Some(n)) if n < 100 => alloc::format!(".{n:02}"),
+        _ => return Err(EncodeError::new("snowfall is three characters with at most one decimal point, which cannot hold this value")),
+    };
+    out.extend_from_slice(text.as_bytes());
     Ok(())
 }
 
