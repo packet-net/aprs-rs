@@ -24,7 +24,7 @@ jobs:
       - uses: actions/checkout@v7
         with:
           submodules: true
-      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: dtolnay/rust-toolchain@1.120
       - name: The tag matches Cargo.toml
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
