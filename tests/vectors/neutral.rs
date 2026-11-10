@@ -480,6 +480,27 @@ impl<'a> Keys<'a> {
             .ok_or_else(|| Unreadable::Unsupported(format!("{}: not a whole number in the range this crate holds", self.name(k))))
     }
 
+    /// A number this crate holds in whole steps (a course, a humidity), rounded to the nearest as
+    /// the encoder rounds any value between its field's steps (vectors README, Encoding). One that
+    /// rounds outside what `T` holds is outside the field, so the data is refused.
+    fn stepped<T: TryFrom<i128>>(&self, k: &str) -> Read<Option<T>> {
+        let Some(v) = self.get(k) else { return Ok(None) };
+        if let Some(n) = whole(v) {
+            return T::try_from(n).map(Some).map_err(|_| Unreadable::Refused(format!("{}: outside its field", self.name(k))));
+        }
+        let Some(x) = v.as_f64().filter(|x| x.is_finite()) else {
+            return unsupported(format!("{}: not a number", self.name(k)));
+        };
+        T::try_from(round_steps(x) as i128)
+            .map(Some)
+            .map_err(|_| Unreadable::Refused(format!("{}: outside its field once rounded", self.name(k))))
+    }
+
+    fn required_stepped<T: TryFrom<i128>>(&self, k: &str) -> Read<T> {
+        self.stepped(k)?
+            .ok_or_else(|| Unreadable::Unsupported(format!("{}: missing, and this crate has no value for its absence", self.name(k))))
+    }
+
     fn required_int<T: TryFrom<i128>>(&self, k: &str) -> Read<T> {
         self.int(k)?
             .ok_or_else(|| Unreadable::Unsupported(format!("{}: missing, and this crate has no value for its absence", self.name(k))))
@@ -525,6 +546,15 @@ impl<'a> Keys<'a> {
     }
 }
 
+/// A value measured in steps rounded to the nearest, halves (within 1e-6) away from zero, as the
+/// crate's encoder rounds.
+fn round_steps(v: f64) -> f64 {
+    let floor = v.abs().floor();
+    let fraction = v.abs() - floor;
+    let rounded = if fraction > 0.5 || (fraction - 0.5).abs() <= 1e-6 { floor + 1.0 } else { floor };
+    if v < 0.0 { -rounded } else { rounded }
+}
+
 /// A JSON number that is a whole number, as an integer.
 fn whole(v: &Value) -> Option<i128> {
     if let Some(n) = v.as_i64() {
@@ -537,16 +567,29 @@ fn whole(v: &Value) -> Option<i128> {
     (f.fract() == 0.0 && f.abs() < 1e30).then_some(f as i128)
 }
 
-/// A number in the neutral form as the text this crate keeps as sent: as the JSON gives it, or in
-/// full where the JSON would use an exponent, which APRS numbers do not.
+/// A number in the neutral form as the text this crate keeps as sent: a string as it is, and a
+/// number, which has no text, as the shortest decimal that reads back as the same number, with no
+/// exponent, no `+` and no trailing `.0` (vectors interpretations.md, "Numbers given without
+/// their text").
 fn number_as_text(v: &Value) -> Option<String> {
     match v {
-        Value::Number(n) => {
-            let t = n.to_string();
-            Some(if t.contains(['e', 'E']) { format!("{}", n.as_f64()?) } else { t })
-        }
+        Value::Number(n) if n.is_i64() || n.is_u64() => Some(n.to_string()),
+        // Rust writes the shortest decimal that reads back the same, never with an exponent.
+        Value::Number(n) => n.as_f64().map(|x| if x == 0.0 { "0".to_string() } else { format!("{x}") }),
         Value::String(s) => Some(s.clone()),
         _ => None,
+    }
+}
+
+/// A telemetry value or sequence as [`number_as_text`], except that a number that is a whole
+/// number from 0 to 999 is three digits, as APRS12c ch. 13 writes `aaa` and `sss`.
+fn telemetry_number(v: &Value) -> Option<String> {
+    match v {
+        Value::Number(n) => match n.as_f64() {
+            Some(x) if (0.0..=999.0).contains(&x) && x.fract() == 0.0 => Some(format!("{:03}", x as u32)),
+            _ => number_as_text(v),
+        },
+        _ => number_as_text(v),
     }
 }
 
@@ -732,12 +775,15 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             text: o.text("text")?,
         }),
         "telemetry" => Data::Telemetry(Telemetry {
-            sequence: o.text("sequence")?,
+            sequence: match o.get("sequence") {
+                None => String::new(),
+                Some(v) => telemetry_number(v).ok_or_else(|| Unreadable::Unsupported("sequence: not text or a number".into()))?,
+            },
             analog: o
                 .array("analog")?
                 .map(|a| {
                     a.iter()
-                        .map(|x| if x.is_null() { Some(None) } else { number_as_text(x).map(Some) })
+                        .map(|x| if x.is_null() { Some(None) } else { telemetry_number(x).map(Some) })
                         .collect::<Option<Vec<Option<String>>>>()
                 })
                 .unwrap_or(Some(Vec::new()))
@@ -794,7 +840,7 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
                     Some(Footprint {
                         latitude: text("latitude")?,
                         longitude: text("longitude")?,
-                        radius_miles: f.required_int("radius_miles")?,
+                        radius_miles: f.required_stepped("radius_miles")?,
                     })
                 }
             },
@@ -1012,7 +1058,7 @@ fn read_positioned(o: &Keys) -> Read<Positioned> {
                 )?,
             }),
         },
-        course_degrees: o.int("course_degrees")?,
+        course_degrees: o.stepped("course_degrees")?,
         speed_knots: o.float("speed_knots")?,
         altitude_feet: o.float("altitude_feet")?,
         phg: match o.object("phg", &["power", "height", "gain", "directivity", "beacons_per_hour"])? {
@@ -1176,17 +1222,17 @@ fn read_weather(o: &Keys) -> Read<Option<Weather>> {
             .collect::<Read<Vec<WeatherField>>>()?,
     };
     Ok(Some(Weather {
-        wind_direction_degrees: w.int("wind_direction_degrees")?,
+        wind_direction_degrees: w.stepped("wind_direction_degrees")?,
         wind_speed_mph: w.float("wind_speed_mph")?,
         wind_gust_mph: w.float("wind_gust_mph")?,
         temperature_f: w.float("temperature_f")?,
         rain_1h_in: w.float("rain_1h_in")?,
         rain_24h_in: w.float("rain_24h_in")?,
         rain_midnight_in: w.float("rain_midnight_in")?,
-        rain_raw: w.int("rain_raw")?,
-        humidity_percent: w.int("humidity_percent")?,
+        rain_raw: w.stepped("rain_raw")?,
+        humidity_percent: w.stepped("humidity_percent")?,
         pressure_mbar: w.float("pressure_mbar")?,
-        luminosity_w_m2: w.int("luminosity_w_m2")?,
+        luminosity_w_m2: w.stepped("luminosity_w_m2")?,
         snow_24h_in: w.float("snow_24h_in")?,
         software: w.char("software")?,
         unit: w.string("unit")?,
