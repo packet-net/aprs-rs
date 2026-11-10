@@ -153,12 +153,9 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
             ));
         }
         position::encode_compressed(out, &f.position, f.symbol)?;
+        // A compressed weather report has no comment, so an altitude the cs bytes cannot carry
+        // exactly is rounded to their step and has no /A= (vectors README, Encoding).
         altitude_in_cs = compressed_cs(out, f)?;
-        if f.weather.is_some() && f.altitude_feet.is_some() && !altitude_in_cs {
-            return Err(EncodeError::new(
-                "a weather report has no comment, so an altitude the cs bytes cannot carry exactly has nowhere to go",
-            ));
-        }
     } else {
         let count = [
             f.course_degrees.is_some() || f.speed_knots.is_some(),
@@ -216,7 +213,7 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
             out.extend_from_slice(format!("{{{w}}}").as_bytes());
         }
         if let Some(feet) = f.altitude_feet.filter(|_| !altitude_in_cs) {
-            let n = libm::round(feet);
+            let n = crate::steps::round(feet);
             if !(-99_999.0..=999_999.0).contains(&n) {
                 return Err(EncodeError::new("/A= altitude must fit in 6 digits (or - and 5 digits)"));
             }
@@ -240,8 +237,9 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
         telemetry_into(&mut trailer, t)?;
     }
     if let Some(d) = f.dao {
-        if f.position.ambiguity > 0 && d.precision != DaoPrecision::None {
-            return Err(EncodeError::new("a !DAO! adds precision to an ambiguous position, which contradicts it"));
+        // Whatever its precision: even `!W  !` reads back as `dao-with-ambiguity`.
+        if f.position.ambiguity > 0 {
+            return Err(EncodeError::new("a !DAO! on an ambiguous position contradicts it, whatever its precision"));
         }
         check_dao_datum(d)?;
         trailer.push(b'!');
@@ -268,6 +266,7 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
     // Write the text as it is (after a frequency, a space first); if it does not read back
     // unchanged, try it without the space, then after a '/' delimiter.
     let separators: &[&[u8]] = if f.frequency.is_some() && !text.is_empty() { &[b" ", b"", b" /"] } else { &[b"", b"/"] };
+    let mut differs = "";
     for separator in separators {
         out.truncate(text_at);
         if f.weather.is_some() && !separator.is_empty() {
@@ -276,8 +275,9 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
         out.extend_from_slice(separator);
         out.extend_from_slice(text);
         out.extend_from_slice(&trailer);
-        if reads_back(&out[start..], f) {
-            return Ok(());
+        match reads_back(&out[start..], f) {
+            Ok(()) => return Ok(()),
+            Err(what) => differs = what,
         }
     }
     if f.weather.is_some() {
@@ -285,9 +285,12 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
             "the weather does not read back as given: a software type and unit, or an extra field, that would read as weather fields",
         ));
     }
-    Err(EncodeError::new(
-        "comment text contains something that decodes as a structured element (altitude, !DAO!, |telemetry|, frequency, PHG/RNG/DFS or braces); set the property instead",
-    ))
+    if text.is_empty() {
+        return Err(EncodeError::new(format!("the report does not read back as given: its {differs} differs")));
+    }
+    Err(EncodeError::new(format!(
+        "comment text contains something that decodes as a structured element (altitude, !DAO!, |telemetry|, frequency, PHG/RNG/DFS or braces), so the {differs} reads back differently; set the property instead",
+    )))
 }
 
 /// Writes the compressed cs and type bytes. `true` when they carry the altitude exactly.
@@ -316,7 +319,7 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError>
             return Err(EncodeError::new("the altitude is not a number"));
         }
         // 1.002^cs feet cannot be 1 foot or less: the nearest is cs 0, and /A= carries the rest.
-        let cs = if feet <= 1.0 { 0 } else { libm::round(log(feet, 1.002)) as i64 };
+        let cs = if feet <= 1.0 { 0 } else { crate::steps::round(log(feet, 1.002)) as i64 };
         if cs > 90 * 91 + 90 {
             return Err(EncodeError::new("the altitude is too high for a compressed position"));
         }
@@ -346,17 +349,25 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError>
         if range.is_nan() || range < 2.0 {
             return Err(EncodeError::new("a compressed range must be at least 2 miles"));
         }
-        let s = libm::round(log(range / 2.0, 1.08));
+        let s = crate::steps::round(log(range / 2.0, 1.08));
         if s > 90.0 {
             return Err(EncodeError::new("the range is too far for a compressed position"));
         }
         (b'{' - 33, s as u8, false)
     } else if course_speed {
-        let course = f.course_degrees.unwrap_or(0);
+        // The cs bytes hold a course and a speed together, so writing one alone would add a value
+        // the data does not have; and they have no unknown course, since a c of 0 reads back as
+        // 360 (vectors README, Encoding).
+        let (Some(course), Some(knots)) = (f.course_degrees, f.speed_knots) else {
+            return Err(EncodeError::new("the cs bytes carry a course and a speed together, so a compressed report needs both"));
+        };
+        if course == 0 {
+            return Err(EncodeError::new("a compressed course of 0 would read back as 360, and the cs bytes have no unknown course"));
+        }
         if course > 360 {
             return Err(EncodeError::new("course must be 0-360 degrees"));
         }
-        (direction_code(course), speed_code(f.speed_knots.unwrap_or(0.0))?, false)
+        (direction_code(course), speed_code(knots)?, false)
     } else {
         // No course/speed, range or altitude: the spec's own form for that, which has no type byte.
         if f.compression.is_some() {
@@ -380,10 +391,14 @@ fn direction_code(degrees: u16) -> u8 {
 }
 
 fn speed_code(knots: f64) -> Result<u8, EncodeError> {
-    if knots < 0.0 {
+    // A small negative speed rounds to 0, the first step; one that rounds below it is refused.
+    if knots.is_nan() || crate::steps::round(knots) < 0.0 {
         return Err(EncodeError::new("speed cannot be negative"));
     }
-    let s = libm::round(libm::log(knots + 1.0) / libm::log(1.08));
+    if knots < 0.0 {
+        return Ok(0);
+    }
+    let s = crate::steps::round(libm::log(knots + 1.0) / libm::log(1.08));
     if s > 90.0 {
         return Err(EncodeError::new("the speed is too high for a compressed position"));
     }
@@ -459,7 +474,7 @@ fn uncompressed_extension(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, Enc
         return Ok(true);
     }
     if let Some(r) = f.range_miles {
-        let n = libm::round(r);
+        let n = crate::steps::round(r);
         if !(0.0..=9999.0).contains(&n) {
             return Err(EncodeError::new("RNG range is 0-9999 miles"));
         }
@@ -532,7 +547,8 @@ pub(crate) fn check_dao_datum(d: crate::Dao) -> Result<(), EncodeError> {
 fn whole(v: Option<f64>, what: &str) -> Result<Option<u32>, EncodeError> {
     match v {
         None => Ok(None),
-        Some(x) if x >= 0.0 => Ok(Some(libm::round(x) as u32)),
+        // Rounded first, so -0.3 is 0.
+        Some(x) if crate::steps::round(x) >= 0.0 => Ok(Some(crate::steps::round(x) as u32)),
         Some(_) => Err(EncodeError::new(format!("{what} cannot be negative"))),
     }
 }
@@ -551,7 +567,7 @@ pub(crate) fn frequency(out: &mut Vec<u8>, f: &crate::VoiceFrequency) -> Result<
         return Err(EncodeError::new("the frequency must be below 24300 MHz"));
     }
     let (per_mhz, decimals) = if f.ten_khz_resolution { (100u64, 2usize) } else { (1000, 3) };
-    let units = libm::round(f.mhz * per_mhz as f64) as u64;
+    let units = crate::steps::round(f.mhz * per_mhz as f64) as u64;
     let (whole, fraction) = (units / per_mhz, units % per_mhz);
     let head = if whole < 1000 {
         format!("{whole:03}")
@@ -632,35 +648,43 @@ pub(crate) fn telemetry_into(out: &mut Vec<u8>, t: &crate::CommentTelemetry) -> 
 }
 
 /// Whether what was written for `f` (from the position on) decodes back to the same comment and
-/// structured elements.
-fn reads_back(written: &[u8], f: &Positioned) -> bool {
+/// structured elements; if not, which one differs.
+fn reads_back(written: &[u8], f: &Positioned) -> Result<(), &'static str> {
     let mut ctx = Context::new(ParseOptions::LENIENT);
     let Some(decoded) = position::decode(&mut ctx, written, 0) else {
-        return false;
+        return Err("position");
     };
     let mut back =
         Positioned { position: decoded.position, symbol: decoded.symbol, compressed: decoded.compressed, ..Positioned::default() };
     if !comment::decode(&mut ctx, &mut back, decoded.cs, &written[decoded.len..], decoded.len) || ctx.has_errors() {
-        return false;
+        return Err("comment");
     }
     let close = |a: Option<f64>, b: Option<f64>, tolerance: f64| match (a, b) {
         (None, None) => true,
         (Some(x), Some(y)) => (x - y).abs() <= tolerance * x.abs().max(1.0),
         _ => false,
     };
+    // A /A= or RNG value is written rounded to its whole step.
+    let rounded = |a: Option<f64>, b: Option<f64>| a.is_some() && a == b.map(crate::steps::round);
     let frequency_fields =
         |v: &Option<crate::VoiceFrequency>| v.as_ref().map(|x| (x.tone, x.tone_value, x.offset_khz, x.range, x.range_km, x.narrow));
-    back.comment == f.comment
-        && back.phg == f.phg
-        && back.dfs == f.dfs
-        && back.area == f.area
-        && back.df_bearing == f.df_bearing
-        && back.storm == f.storm
-        && back.telemetry == f.telemetry
-        && frequency_fields(&back.frequency) == frequency_fields(&f.frequency)
-        && back.signpost == f.signpost
-        && back.dao.map(|d| d.datum) == f.dao.map(|d| d.datum)
-        && back.weather.as_ref().map(weather::text_parts) == f.weather.as_ref().map(weather::text_parts)
-        && close(back.altitude_feet, f.altitude_feet, 0.01)
-        && close(back.range_miles, f.range_miles, 0.1)
+    let checks = [
+        (back.comment == f.comment, "comment"),
+        (back.phg == f.phg, "PHG"),
+        (back.dfs == f.dfs, "DFS"),
+        (back.area == f.area, "area"),
+        (back.df_bearing == f.df_bearing, "DF bearing"),
+        (back.storm == f.storm, "storm data"),
+        (back.telemetry == f.telemetry, "telemetry"),
+        (frequency_fields(&back.frequency) == frequency_fields(&f.frequency), "frequency"),
+        (back.signpost == f.signpost, "signpost"),
+        (back.dao.map(|d| d.datum) == f.dao.map(|d| d.datum), "DAO"),
+        (back.weather.as_ref().map(weather::text_parts) == f.weather.as_ref().map(weather::text_parts), "weather"),
+        (close(back.altitude_feet, f.altitude_feet, 0.01) || rounded(back.altitude_feet, f.altitude_feet), "altitude"),
+        (close(back.range_miles, f.range_miles, 0.1) || rounded(back.range_miles, f.range_miles), "range"),
+    ];
+    match checks.iter().find(|(same, _)| !same) {
+        Some((_, what)) => Err(what),
+        None => Ok(()),
+    }
 }

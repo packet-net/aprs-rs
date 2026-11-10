@@ -23,6 +23,7 @@ mod other;
 mod packet;
 mod position;
 mod status;
+mod steps;
 mod symbols;
 mod telemetry;
 mod text;

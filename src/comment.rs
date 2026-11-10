@@ -197,6 +197,19 @@ fn lift_telemetry_and_dao(ctx: &mut Context, fields: &mut Positioned, c: &mut Ve
     true
 }
 
+/// `c` with its base-91 telemetry and `!DAO!` taken out, as [`tail`] would lift them.
+pub(crate) fn without_telemetry_and_dao(c: &[u8]) -> Vec<u8> {
+    let telemetry = find_telemetry(c).map(|t| t.0);
+    let dao = find_dao(c, telemetry.clone(), None).map(|d| d.0);
+    let mut removals: Vec<core::ops::Range<usize>> = telemetry.into_iter().chain(dao).collect();
+    removals.sort_by_key(|r| core::cmp::Reverse(r.start));
+    let mut rest = c.to_vec();
+    for r in removals {
+        rest.drain(r);
+    }
+    rest
+}
+
 /// The comment after any data extension: lifts out telemetry and a `!DAO!` (from the end), then an
 /// altitude, signpost or corridor braces, a data extension found later in the text, and a voice
 /// frequency at the start, in the order that keeps one from being taken for another; the rest,

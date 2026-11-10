@@ -337,7 +337,7 @@ fn coordinate(value: f64, degree_digits: usize, ambiguity: u8, dao: Option<bool>
     };
     // Rounding then blanking keeps the box the position is in, and a decoded position (the centre of
     // its box) writes back the same digits.
-    let mut units = libm::round(value * 60.0 * per_minute) as u64;
+    let mut units = crate::steps::round(value * 60.0 * per_minute) as u64;
     let extra = (units % extra_base) as u8;
     units /= extra_base;
     // units is now hundredths of a minute.
@@ -379,8 +379,8 @@ pub(crate) fn encode_compressed(out: &mut Vec<u8>, position: &Position, symbol: 
 /// The compressed latitude and longitude steps for a position.
 fn compressed_steps(position: &Position) -> (u32, u32) {
     // Round, rather than truncate as APRS12c's worked example does (interpretations.md).
-    let y = libm::round(380_926.0 * (90.0 - position.latitude)) as u32;
-    let x = libm::round(190_463.0 * (180.0 + position.longitude)) as u32;
+    let y = crate::steps::round(380_926.0 * (90.0 - position.latitude)) as u32;
+    let x = crate::steps::round(190_463.0 * (180.0 + position.longitude)) as u32;
     (y.min(91u32.pow(4) - 1), x.min(91u32.pow(4) - 1))
 }
 

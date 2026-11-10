@@ -337,7 +337,18 @@ impl Packet {
     /// Builds a Mic-E packet: the information field and the destination address that carries the
     /// latitude, message code and digipeat path (APRS12c ch. 10).
     pub fn create_mic_e(source: Address, report: crate::MicEReport, path: Vec<PathEntry>) -> Result<Packet, EncodeError> {
-        let (destination, information) = crate::mic_e::encode(&report)?;
+        Packet::create_mic_e_with(source, report, path, false)
+    }
+
+    /// As [`Packet::create_mic_e`]; with `feet_in_text`, an altitude goes in a `/A=` even when it is
+    /// whole metres.
+    pub(crate) fn create_mic_e_with(
+        source: Address,
+        report: crate::MicEReport,
+        path: Vec<PathEntry>,
+        feet_in_text: bool,
+    ) -> Result<Packet, EncodeError> {
+        let (destination, information) = crate::mic_e::encode_with(&report, feet_in_text)?;
         let decoded = Packet::decode(source.clone(), destination.clone(), path.clone(), &information, ParseOptions::STRICT);
         Ok(Packet {
             source,

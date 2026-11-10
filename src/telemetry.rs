@@ -75,6 +75,10 @@ pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
     if !seq_ok || t.analog.len() != 5 || !bits_ok || !t.analog.iter().flatten().all(|v| is_decimal(v)) {
         return Err(EncodeError::new("a telemetry report carries 5 analog values and the 8 digital bits (APRS12c ch. 13)"));
     }
+    // No form reads back with the first channel empty after MIC (vectors README, Encoding).
+    if t.sequence == "MIC" && t.analog[0].is_none() {
+        return Err(EncodeError::new("T#MIC with an empty first channel does not read back as given, so it cannot be sent"));
+    }
     if crate::text::has_line_break(t.comment.as_bytes()) {
         return Err(EncodeError::new("telemetry comment text cannot contain a line break"));
     }

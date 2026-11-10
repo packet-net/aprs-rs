@@ -351,10 +351,12 @@ fn optional(out: &mut Vec<u8>, letter: u8, value: Option<f64>, width: usize) -> 
     Ok(())
 }
 
+/// A value in its field's steps, rounded to the nearest (vectors README, Encoding), in `width`
+/// digits.
 fn number_field(out: &mut Vec<u8>, value: f64, width: usize, signed: bool) -> Result<(), EncodeError> {
-    let n = libm::round(value);
-    if (n - value).abs() > 1e-6 {
-        return Err(EncodeError::new("a weather value is outside what its fixed-width field can carry"));
+    let n = crate::steps::round(value);
+    if n.is_nan() {
+        return Err(EncodeError::new("a weather value is not a number"));
     }
     let max = libm::pow(10.0, width as f64) - 1.0;
     let min = if signed { -(libm::pow(10.0, width as f64 - 1.0) - 1.0) } else { 0.0 };
@@ -371,22 +373,30 @@ fn number_field(out: &mut Vec<u8>, value: f64, width: usize, signed: bool) -> Re
 }
 
 /// Snowfall in its three characters, which may include one decimal point (APRS12c ch. 12: "A
-/// decimal point is allowed for non-integer values"): a whole number as three digits (`012`), one
-/// under 1 as `.` and two digits (`.50`, `.25`), and any other as a digit, `.` and a digit (`1.5`).
-/// A value those cannot hold exactly is refused.
+/// decimal point is allowed for non-integer values"): rounded to hundredths if that leaves it under
+/// 1, else to tenths if that leaves it under 10, else to a whole number; then a whole number as
+/// three digits (`012`, and 0.995 as `001`), one under 1 as `.` and two digits (`.50`), and any
+/// other as a digit, `.` and a digit (`1.5`). One that rounds past 999 is refused.
 fn snowfall(out: &mut Vec<u8>, inches: f64) -> Result<(), EncodeError> {
-    let exact = |scale: f64| {
-        let n = libm::round(inches * scale);
-        ((n - inches * scale).abs() <= 1e-6).then_some(n as u32)
-    };
-    if !(0.0..=999.0).contains(&inches) {
+    if inches.is_nan() || crate::steps::round(inches * 100.0) < 0.0 {
         return Err(EncodeError::new("snowfall must be 0-999 inches"));
     }
-    let text = match (exact(1.0), exact(10.0), exact(100.0)) {
-        (Some(n), _, _) => alloc::format!("{n:03}"),
-        (None, _, Some(n)) if n < 100 => alloc::format!(".{n:02}"),
-        (None, Some(n), _) if n < 100 => alloc::format!("{}.{}", n / 10, n % 10),
-        _ => return Err(EncodeError::new("snowfall is three characters with at most one decimal point, which cannot hold this value")),
+    let hundredths = crate::steps::round(inches * 100.0) as u32;
+    let tenths = crate::steps::round(inches * 10.0) as u32;
+    let text = if hundredths < 100 && hundredths % 100 != 0 {
+        alloc::format!(".{hundredths:02}")
+    } else if hundredths < 100 {
+        alloc::format!("{:03}", hundredths / 100)
+    } else if tenths < 100 && tenths % 10 != 0 {
+        alloc::format!("{}.{}", tenths / 10, tenths % 10)
+    } else if tenths < 100 {
+        alloc::format!("{:03}", tenths / 10)
+    } else {
+        let whole = crate::steps::round(inches);
+        if whole > 999.0 {
+            return Err(EncodeError::new("snowfall must be 0-999 inches"));
+        }
+        alloc::format!("{:03}", whole as u32)
     };
     out.extend_from_slice(text.as_bytes());
     Ok(())
