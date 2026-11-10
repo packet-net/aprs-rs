@@ -346,10 +346,15 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError>
         if course_speed {
             return Err(EncodeError::new("the cs bytes carry a course and speed or a range, not both (APRS12c ch. 9)"));
         }
-        if range.is_nan() || range < 2.0 {
+        // The steps are 2 x 1.08^s miles for every whole s, and a range rounds to the nearest;
+        // one whose s is below the byte's 0 is refused (1.95 miles is s 0, 1.9 is s -1).
+        if range.is_nan() || range <= 0.0 {
             return Err(EncodeError::new("a compressed range must be at least 2 miles"));
         }
         let s = crate::steps::round(log(range / 2.0, 1.08));
+        if s < 0.0 {
+            return Err(EncodeError::new("a compressed range must round to at least 2 miles"));
+        }
         if s > 90.0 {
             return Err(EncodeError::new("the range is too far for a compressed position"));
         }
@@ -391,14 +396,15 @@ fn direction_code(degrees: u16) -> u8 {
 }
 
 fn speed_code(knots: f64) -> Result<u8, EncodeError> {
-    // A small negative speed rounds to 0, the first step; one that rounds below it is refused.
-    if knots.is_nan() || crate::steps::round(knots) < 0.0 {
+    // The steps are 1.08^s - 1 knots for every whole s, and a value rounds to the nearest; one
+    // whose s is below the byte's 0 is refused (-0.03 knots is s 0, -0.3 is s -5).
+    if knots.is_nan() || knots <= -1.0 {
         return Err(EncodeError::new("speed cannot be negative"));
     }
-    if knots < 0.0 {
-        return Ok(0);
-    }
     let s = crate::steps::round(libm::log(knots + 1.0) / libm::log(1.08));
+    if s < 0.0 {
+        return Err(EncodeError::new("speed cannot be negative"));
+    }
     if s > 90.0 {
         return Err(EncodeError::new("the speed is too high for a compressed position"));
     }
