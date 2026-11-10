@@ -895,9 +895,15 @@ impl StatusBuilder {
         self
     }
 
-    /// A 4- or 6-character Maidenhead locator and a symbol at the start, e.g. `IO91SX/-`.
-    pub fn locator(mut self, maidenhead_locator: &str, symbol: Symbol) -> Self {
+    /// A 4- or 6-character Maidenhead locator at the start, e.g. `IO91SX`. It goes with a
+    /// [`symbol`](Self::symbol): one without the other is refused when built.
+    pub fn locator(mut self, maidenhead_locator: &str) -> Self {
         self.status.locator = Some(maidenhead_locator.to_string());
+        self
+    }
+
+    /// The symbol after the locator, e.g. [`Symbol::HOUSE`]. Only with a [`locator`](Self::locator).
+    pub fn symbol(mut self, symbol: Symbol) -> Self {
         self.status.symbol = Some(symbol);
         self
     }

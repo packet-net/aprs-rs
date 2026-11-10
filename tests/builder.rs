@@ -226,7 +226,16 @@ fn a_weather_report_needs_a_position_for_a_symbol_or_compression() {
 fn status_reports() {
     assert_eq!(sent(me().status("Net Control").build().unwrap()), "M0LTE>APZ001:>Net Control");
     assert_eq!(sent(me().status("Net Control").timestamp(Timestamp::dhm(26, 14, 5)).build().unwrap()), "M0LTE>APZ001:>261405zNet Control");
-    assert_eq!(sent(me().status("On the air").locator("IO91SX", Symbol::HOUSE).build().unwrap()), "M0LTE>APZ001:>IO91SX/- On the air");
+    assert_eq!(
+        sent(me().status("On the air").locator("IO91SX").symbol(Symbol::HOUSE).build().unwrap()),
+        "M0LTE>APZ001:>IO91SX/- On the air"
+    );
+}
+
+#[test]
+fn a_status_locator_and_symbol_go_together() {
+    assert!(me().status("Hi").locator("IO91SX").build().is_err());
+    assert!(me().status("Hi").symbol(Symbol::HOUSE).build().is_err());
 }
 
 #[test]

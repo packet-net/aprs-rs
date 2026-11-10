@@ -20,6 +20,7 @@ Migrating from 0.4.0:
 - `WeatherBuilder`: `wind(direction, speed)` is removed, use `wind_direction_degrees` and the new `wind_speed_mph`. `gust` is `wind_gust_mph`, `temperature` is `temperature_f`, `temperature_celsius` is `temperature_c`, `humidity` is `humidity_percent`, `pressure` is `pressure_mbar`, `rain_last_hour` is `rain_1h_in`, `rain_last_24_hours` is `rain_24h_in`, `rain_since_midnight` is `rain_midnight_in`, and the `_mm` ones are `rain_1h_mm`, `rain_24h_mm`, `rain_midnight_mm`. `luminosity` is `luminosity_w_m2`, `snowfall` is `snow_24h_in`.
 - `MessageBuilder::id` is `message_id`. `MicEBuilder::message` is `mic_e_message`, and so is the field `MicEReport::message`.
 - `TelemetryBuilder`: `analog(&[f64])` is removed and `channels(&[Option<f64>])` is now `analog(&[Option<f64>])`. `digital(u8)` is `bits(&str)`, eight `0` or `1` characters, B1 first.
+- `StatusBuilder::locator(locator, symbol)` is two setters, `locator(locator)` and `symbol(symbol)`; one without the other is refused when built.
 - `Station::telemetry_bits(bits: u8, project)` takes the bits as `&str`.
 - `GpsFix` and `NmeaSource` are `CompressionFix` and `CompressionSource`.
 - `TelemetryLabels` is two types, `TelemetryNames` (field `names`) and `TelemetryUnits` (field `units`), as `Data::TelemetryNames` and `Data::TelemetryUnits` carry.

@@ -500,10 +500,10 @@ fn build(input: &Value) -> Built<Packet> {
                 b = b.timestamp(t);
             }
             if let Some(locator) = args.text("locator")? {
-                let Some(symbol) = symbol(args.text("symbol")?)? else {
-                    return unsupported("locator: the builder takes a locator with a symbol");
-                };
-                b = b.locator(locator, symbol);
+                b = b.locator(locator);
+            }
+            if let Some(symbol) = symbol(args.text("symbol")?)? {
+                b = b.symbol(symbol);
             }
             if let Some(beam) = args.get("beam") {
                 let code = |k: &str| {
