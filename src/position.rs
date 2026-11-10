@@ -317,6 +317,14 @@ pub(crate) fn encode_uncompressed(
     Ok(dao.map(|_| (lat_extra, lon_extra)))
 }
 
+/// The `!DAO!` digits for a position: latitude, then longitude, each the digit (`base91`: the
+/// base-91 value, 0-90) a DAO of that precision gives the position written uncompressed. A
+/// decoder does not apply them to a compressed position, so there they are written to agree with
+/// it: a reader that did apply them lands on the position reported.
+pub(crate) fn dao_digits(position: &Position, base91: bool) -> (u8, u8) {
+    (coordinate(position.latitude, 2, 0, Some(base91)).1, coordinate(position.longitude, 3, 0, Some(base91)).1)
+}
+
 /// Degrees and minutes to hundredths (`DDMM.hh` or `DDDMM.hh`), with ambiguity blanks, plus the
 /// `!DAO!` digit for the next place when asked for (`Some(base91)`).
 fn coordinate(value: f64, degree_digits: usize, ambiguity: u8, dao: Option<bool>) -> (Vec<u8>, u8) {
@@ -329,7 +337,7 @@ fn coordinate(value: f64, degree_digits: usize, ambiguity: u8, dao: Option<bool>
     };
     // Rounding then blanking keeps the box the position is in, and a decoded position (the centre of
     // its box) writes back the same digits.
-    let mut units = libm::round(value * 60.0 * per_minute) as u64;
+    let mut units = crate::steps::round(value * 60.0 * per_minute) as u64;
     let extra = (units % extra_base) as u8;
     units /= extra_base;
     // units is now hundredths of a minute.
@@ -357,15 +365,27 @@ pub(crate) fn encode_compressed(out: &mut Vec<u8>, position: &Position, symbol: 
     if !(-90.0..=90.0).contains(&position.latitude) || !(-180.0..=180.0).contains(&position.longitude) {
         return Err(EncodeError::new("the position is out of range"));
     }
-    // Round, rather than truncate as APRS12c's worked example does (interpretations.md).
-    let y = libm::round(380_926.0 * (90.0 - position.latitude)) as u32;
-    let x = libm::round(190_463.0 * (180.0 + position.longitude)) as u32;
+    let (y, x) = compressed_steps(position);
     out.push(match symbol.table {
         d @ '0'..='9' => b'a' + (d as u8 - b'0'),
         t => t as u8,
     });
-    base91::encode(y.min(91u32.pow(4) - 1), 4, out);
-    base91::encode(x.min(91u32.pow(4) - 1), 4, out);
+    base91::encode(y, 4, out);
+    base91::encode(x, 4, out);
     out.push(symbol.code as u8);
     Ok(())
+}
+
+/// The compressed latitude and longitude steps for a position.
+fn compressed_steps(position: &Position) -> (u32, u32) {
+    // Round, rather than truncate as APRS12c's worked example does (interpretations.md).
+    let y = crate::steps::round(380_926.0 * (90.0 - position.latitude)) as u32;
+    let x = crate::steps::round(190_463.0 * (180.0 + position.longitude)) as u32;
+    (y.min(91u32.pow(4) - 1), x.min(91u32.pow(4) - 1))
+}
+
+/// The position a compressed report of `position` reads back as, which its `!DAO!` digits follow.
+pub(crate) fn compressed_reported(position: &Position) -> Position {
+    let (y, x) = compressed_steps(position);
+    Position { latitude: 90.0 - f64::from(y) / 380_926.0, longitude: -180.0 + f64::from(x) / 190_463.0, ambiguity: 0 }
 }

@@ -77,6 +77,25 @@ fn ambiguity_blanks_digits() {
 }
 
 #[test]
+fn a_mic_e_longitude_holds_the_centre_where_ambiguity_ignores_it() {
+    // 83 degrees 34.494 minutes west; ambiguity 2 makes a decoder ignore the tenths and hundredths,
+    // so they hold the centre it reports, 34.50 (vectors README, Mic-E): hundredths 50 + 28, `N`.
+    let line = sent(me().mic_e(32.525, -83.5749).ambiguity(2).symbol(Symbol::CAR).build().unwrap());
+    let info = &line.as_bytes()[line.find(':').unwrap() + 1..];
+    assert_eq!(&info[1..4], b"o>N", "{line}");
+    let Data::MicE(report) = heard(&line) else { panic!("{line}") };
+    assert!((report.fields.position.longitude + (83.0 + 34.5 / 60.0)).abs() < 1e-9);
+}
+
+#[test]
+fn a_dao_on_a_compressed_position_follows_the_position_reported() {
+    // The digits a decoder ignores on a compressed position are those of the compressed position,
+    // not of the one given: `f9` here, where the position given would have `f8`.
+    let line = sent(me().position(57.45846, -17.883209).symbol(Symbol::CAR).compressed().dao().build().unwrap());
+    assert!(line.ends_with("!wf9!"), "{line}");
+}
+
+#[test]
 fn messages() {
     assert_eq!(sent(me().message("G3NRW", "Hi Ian").id("01").build().unwrap()), "M0LTE>APZ001::G3NRW    :Hi Ian{01");
     assert_eq!(sent(me().message("G3NRW", "Hi Ian").id("02").reply_ack("17").build().unwrap()), "M0LTE>APZ001::G3NRW    :Hi Ian{02}17");
@@ -108,6 +127,22 @@ fn an_object_announcing_a_repeater() {
         .tone(118.8)
         .offset_khz(-600);
     assert_eq!(sent(repeater.build().unwrap()), "M0LTE>APZ001:;MYRPTR   *251830z5127.00N/00058.80Wr145.725MHz T118 -060");
+}
+
+#[test]
+fn a_voice_frequency_comes_first_in_the_comment() {
+    // Radios read the frequency in the first bytes of the comment (APRS12c ch. 18). After a data
+    // extension it follows a `/`, which a PHGR already ends in; the altitude and the text come after.
+    let at = (49.0 + 3.50 / 60.0, -(72.0 + 1.75 / 60.0));
+    let phg = Phg { power: 5, height: 1, gain: 3, directivity: 2, beacons_per_hour: None };
+    let repeater = me().position(at.0, at.1).symbol(Symbol::REPEATER).frequency(146.52).tone(100.0).altitude(1234.0).comment("Net 8pm");
+    assert_eq!(sent(repeater.clone().build().unwrap()), "M0LTE>APZ001:!4903.50N/07201.75Wr146.520MHz T100/A=001234 Net 8pm");
+    assert_eq!(
+        sent(repeater.clone().phg(phg).build().unwrap()),
+        "M0LTE>APZ001:!4903.50N/07201.75WrPHG5132/146.520MHz T100/A=001234 Net 8pm"
+    );
+    let phgr = Phg { beacons_per_hour: Some(4), ..phg };
+    assert_eq!(sent(repeater.phg(phgr).build().unwrap()), "M0LTE>APZ001:!4903.50N/07201.75WrPHG51324/146.520MHz T100/A=001234 Net 8pm");
 }
 
 #[test]
@@ -240,6 +275,74 @@ fn what_the_spec_forbids_is_refused_when_built() {
     let phg = Phg { power: 5, height: 3, gain: 6, directivity: 0, beacons_per_hour: None };
     assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().phg(phg).build().is_err());
     assert!(me().telemetry(1).analog(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).build().is_err());
+    assert!(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).course(360).build().is_ok());
+    // Out of range is refused, never wrapped.
+    assert!(me().telemetry(1000).analog(&[1.0]).build().is_err());
+    assert!(me().telemetry(999).analog(&[1.0]).build().is_ok());
+}
+
+/// A builder's course of 0 is the spec's unknown course: `000` uncompressed, 0 in Mic-E (no
+/// course), and refused compressed, whose cs bytes have no unknown course.
+#[test]
+fn a_course_of_0_is_unknown() {
+    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course(0).speed(10.0).build().unwrap());
+    assert_eq!(line, "M0LTE>APZ001:!5127.26N/00058.69W>000/010");
+    let mic_e = me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).course(0).speed(10.0).build().unwrap();
+    let Data::MicE(m) = heard(&sent(mic_e)) else { panic!("a Mic-E report") };
+    assert_eq!(m.fields.course_degrees, None);
+    assert_eq!(m.fields.speed_knots, Some(10.0));
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course(0).speed(10.0).build().is_err());
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course(360).speed(10.0).build().is_ok());
+    // The cs bytes hold a course and a speed together.
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().speed(10.0).build().is_err());
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course(90).build().is_err());
+}
+
+/// The Mic-E type code says whether the station can message.
+#[test]
+fn the_mic_e_type_code_says_whether_the_station_can_message() {
+    let quiet = sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).build().unwrap());
+    let Data::MicE(m) = heard(&quiet) else { panic!("a Mic-E report") };
+    assert_eq!(m.type_code, Some('\''));
+    let talkative = sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).messaging().build().unwrap());
+    let Data::MicE(m) = heard(&talkative) else { panic!("a Mic-E report") };
+    assert_eq!(m.type_code, Some('`'));
+}
+
+/// A Mic-E altitude in metres goes in its altitude bytes, rounded to the metre; one in feet in a
+/// `/A=`, rounded to the foot.
+#[test]
+fn a_mic_e_altitude_in_metres_stays_in_metres() {
+    let line = sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).altitude_metres(100.5).build().unwrap());
+    let Data::MicE(m) = heard(&line) else { panic!("a Mic-E report") };
+    assert!(!line.contains("/A="), "{line}");
+    assert!((m.fields.altitude_feet.unwrap() - 101.0 / 0.3048).abs() < 1e-6, "{line}");
+    let line = sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).altitude(-12.5).build().unwrap());
+    assert!(line.ends_with("/A=-00013"), "{line}");
+    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).altitude_metres(30.48).build().unwrap());
+    assert!(line.ends_with("/A=000100"), "{line}");
+}
+
+/// Ambiguity reports the box the position is in: its digits are cut, not rounded.
+#[test]
+fn ambiguity_cuts_the_digits() {
+    // 49 degrees 03.596 minutes is in the box 03.5x, not 03.6x.
+    let line = sent(me().position(49.0 + 3.596 / 60.0, -(72.0 + 1.759 / 60.0)).symbol(Symbol::CAR).ambiguity(1).build().unwrap());
+    assert_eq!(line, "M0LTE>APZ001:!4903.5 N/07201.7 W>");
+    // Near the pole and the antimeridian the box stays a valid one.
+    let line = sent(me().position(89.99999, 179.99999).symbol(Symbol::CAR).ambiguity(4).build().unwrap());
+    assert_eq!(line, "M0LTE>APZ001:!89  .  N/179  .  E>");
+}
+
+/// Values between the steps a field holds are rounded once, halves away from zero.
+#[test]
+fn values_between_steps_are_rounded() {
+    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course(90).speed(29.75).altitude(-0.6).build().unwrap());
+    assert_eq!(line, "M0LTE>APZ001:!5127.26N/00058.69W>090/030/A=-00001");
+    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).range(1.5).build().unwrap());
+    assert_eq!(line, "M0LTE>APZ001:!5127.26N/00058.69W>RNG0002");
+    let weather = me().weather().at(51.4543, -0.9781).wind(220, 4.0).gust(5.4).temperature_celsius(25.0).rain_last_hour(0.005);
+    assert_eq!(sent(weather.build().unwrap()), "M0LTE>APZ001:!5127.26N/00058.69W_220/004g005t077r001");
 }
 
 #[test]

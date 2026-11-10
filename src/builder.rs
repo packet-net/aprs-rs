@@ -228,6 +228,8 @@ struct Common {
     fields: Positioned,
     tone: Option<f64>,
     offset_khz: Option<i32>,
+    /// An altitude given in metres, which a Mic-E report carries in metres and any other in feet.
+    altitude_metres: Option<f64>,
 }
 
 impl Common {
@@ -236,13 +238,35 @@ impl Common {
     }
 
     /// The shared fields, checked for what the builder itself needs; the encoder checks the rest.
-    fn positioned(&self, what: &str) -> Result<Positioned, EncodeError> {
+    fn positioned(&self, what: &str, mic_e: bool) -> Result<Positioned, EncodeError> {
         let position = self.position.ok_or_else(|| EncodeError::new(format!("{what} needs a position: call at(latitude, longitude)")))?;
         let symbol =
             self.symbol.ok_or_else(|| EncodeError::new(format!("{what} needs a symbol: call symbol(...), e.g. symbol(Symbol::CAR)")))?;
         let mut fields = self.fields.clone();
-        fields.position = Position { ambiguity: self.ambiguity, ..position };
+        // An ambiguous position reports the box that holds it: its digits cut, not rounded, then
+        // blanked, and the box's centre is what a decoder reads (vectors README, Builder rules).
+        fields.position = if (1..=4).contains(&self.ambiguity) {
+            Position {
+                latitude: box_centre(position.latitude, self.ambiguity),
+                longitude: box_centre(position.longitude, self.ambiguity),
+                ambiguity: self.ambiguity,
+            }
+        } else {
+            Position { ambiguity: self.ambiguity, ..position }
+        };
         fields.symbol = symbol;
+        if let Some(metres) = self.altitude_metres {
+            // Mic-E carries its altitude in whole metres (APRS12c ch. 10); a /A= is in feet.
+            fields.altitude_feet = Some(if mic_e {
+                crate::steps::round(metres) * crate::comment::METRES_TO_FEET
+            } else {
+                metres * crate::comment::METRES_TO_FEET
+            });
+        }
+        // A course of 0 is the spec's unknown course, which Mic-E sends as 0 (APRS12c ch. 10).
+        if mic_e && fields.course_degrees == Some(0) {
+            fields.course_degrees = None;
+        }
         if self.tone.is_some() || self.offset_khz.is_some() {
             let frequency = fields
                 .frequency
@@ -260,6 +284,19 @@ impl Common {
     }
 }
 
+/// The centre of the box that holds `degrees` once `ambiguity` (1-4) digits are blanked: the
+/// digits are cut to the box, not rounded, so the box is the one the position is in.
+fn box_centre(degrees: f64, ambiguity: u8) -> f64 {
+    // The box size in hundredths of a minute: a hundredth's digit, a tenth's, a minute's, ten
+    // minutes', or a degree.
+    let size = [1.0, 10.0, 100.0, 1000.0, 6000.0][usize::from(ambiguity)];
+    // A value within 1e-6 of a box's edge, measured in boxes, is on the edge: 80.49 degrees is
+    // 80 degrees 29.4 minutes, though in binary it computes as 29.39999...
+    let boxes = degrees.abs() * 6000.0 / size;
+    let centre = (libm::floor(boxes + 1e-6) * size + size / 2.0) / 6000.0;
+    if degrees.is_sign_negative() { -centre } else { centre }
+}
+
 /// The methods every positioned builder shares, as inherent methods so they need no trait import.
 macro_rules! positioned_methods {
     () => {
@@ -275,7 +312,8 @@ macro_rules! positioned_methods {
             self
         }
 
-        /// Course over ground in degrees clockwise from north, 1-360 (360 is north).
+        /// Course over ground in degrees clockwise from north, 1-360: 360 is north, and 0 is the
+        /// spec's unknown course (APRS12c ch. 7 and 10), which a compressed report cannot send.
         pub fn course(mut self, degrees: u16) -> Self {
             self.common.fields.course_degrees = Some(degrees);
             self
@@ -292,15 +330,19 @@ macro_rules! positioned_methods {
             self.speed(kilometres_per_hour / 1.852)
         }
 
-        /// Altitude above mean sea level in feet (`/A=`).
+        /// Altitude above mean sea level in feet (`/A=`), sent to the nearest foot.
         pub fn altitude(mut self, feet: f64) -> Self {
             self.common.fields.altitude_feet = Some(feet);
+            self.common.altitude_metres = None;
             self
         }
 
-        /// Altitude above mean sea level in metres, sent in feet.
-        pub fn altitude_metres(self, metres: f64) -> Self {
-            self.altitude(metres / 0.3048)
+        /// Altitude above mean sea level in metres: in a Mic-E report, in its altitude bytes to the
+        /// nearest metre; otherwise converted to feet for a `/A=`, to the nearest foot.
+        pub fn altitude_metres(mut self, metres: f64) -> Self {
+            self.common.fields.altitude_feet = None;
+            self.common.altitude_metres = Some(metres);
+            self
         }
 
         /// Free text after the structured parts. May contain UTF-8.
@@ -355,7 +397,8 @@ macro_rules! positioned_methods {
         }
 
         /// Blanks the last 1-4 digits of the position to hide it: to about 0.1, 1, 10 or 60 nautical miles
-        /// (APRS12c ch. 6). Not with [`compressed`](Self::compressed).
+        /// (APRS12c ch. 6). The digits are cut, so the report gives the box the position is in, and a
+        /// decoder reads its centre. Not with [`compressed`](Self::compressed) or [`dao`](Self::dao).
         pub fn ambiguity(mut self, digits: u8) -> Self {
             self.common.ambiguity = digits;
             self
@@ -412,7 +455,7 @@ impl PositionBuilder {
         Ok(Data::Position(PositionReport {
             timestamp: self.timestamp,
             messaging: self.messaging,
-            fields: self.common.positioned("a position report")?,
+            fields: self.common.positioned("a position report", false)?,
         }))
     }
 
@@ -456,7 +499,7 @@ impl ObjectBuilder {
 
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
-        let fields = self.common.positioned("an object")?;
+        let fields = self.common.positioned("an object", false)?;
         let timestamp =
             self.timestamp.ok_or_else(|| EncodeError::new("an object needs a timestamp: call timestamp(...) or permanent()"))?;
         Ok(Data::Object(ObjectReport { name: self.name.clone(), killed: self.killed, timestamp: Some(timestamp), fields }))
@@ -488,7 +531,7 @@ impl ItemBuilder {
 
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
-        Ok(Data::Item(ItemReport { name: self.name.clone(), killed: self.killed, fields: self.common.positioned("an item")? }))
+        Ok(Data::Item(ItemReport { name: self.name.clone(), killed: self.killed, fields: self.common.positioned("an item", false)? }))
     }
 
     /// The packet: the station's header and this item, encoded.
@@ -516,7 +559,8 @@ impl MicEBuilder {
         self
     }
 
-    /// Says the station can receive APRS messages (the `` ` `` type code, APRS 1.2).
+    /// Says the station can receive APRS messages: the `` ` `` type code, where without this it is
+    /// `'` (APRS 1.2).
     pub fn messaging(mut self) -> Self {
         self.messaging = true;
         self
@@ -526,15 +570,23 @@ impl MicEBuilder {
     pub fn to_data(&self) -> Result<Data, EncodeError> {
         Ok(Data::MicE(MicEReport {
             message: self.message,
-            type_code: if self.messaging { Some('`') } else { None },
-            fields: self.common.positioned("a Mic-E report")?,
+            // The type code says whether the station can message (APRS 1.2 Mic-E type codes).
+            type_code: Some(if self.messaging { '`' } else { '\'' }),
+            fields: self.common.positioned("a Mic-E report", true)?,
             ..MicEReport::default()
         }))
     }
 
     /// The packet: the station's source and path, the destination this report computes, and the report.
+    /// An altitude given in feet goes in a `/A=`, one in metres in the Mic-E altitude bytes.
     pub fn build(&self) -> Result<Packet, EncodeError> {
-        self.station.packet(self.to_data()?)
+        match self.to_data()? {
+            Data::MicE(report) => {
+                let feet_in_text = self.common.altitude_metres.is_none() && report.fields.altitude_feet.is_some();
+                Packet::create_mic_e_with(self.station.source.clone(), report, self.station.path.clone(), feet_in_text)
+            }
+            data => self.station.packet(data),
+        }
     }
 }
 
@@ -682,8 +734,7 @@ impl WeatherBuilder {
 
     /// The data, without a header: a position report with a position, otherwise a positionless report.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
-        let mut weather = self.weather.clone();
-        weather.temperature_f = weather.temperature_f.map(libm::round);
+        let weather = self.weather.clone();
         if let Some(position) = self.position {
             let fields = Positioned {
                 position,
@@ -848,6 +899,9 @@ impl TelemetryBuilder {
 
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
+        if self.sequence > 999 {
+            return Err(EncodeError::new("a telemetry sequence is 0-999, three digits (APRS12c ch. 13)"));
+        }
         if self.analog.len() > 5 {
             return Err(EncodeError::new("a telemetry report carries at most 5 analog values (APRS12c ch. 13)"));
         }

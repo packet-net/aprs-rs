@@ -23,3 +23,13 @@ fn an_outer_packet_keeps_its_q_construct() {
     assert_eq!(q.construct, "qAR");
     assert_eq!(q.station.unwrap().as_str(), "N2CALL");
 }
+
+/// Diagnostics come in reading order: the beacon rule that finds a position after other text
+/// comes before what the position itself holds.
+#[test]
+fn a_late_position_is_noted_before_its_own_diagnostics() {
+    let line = b"N0ZO-13>APX220:-12!3309.71N/08643.18W_030/002g003t069r000000P000h080b10133";
+    let packet = pdn_aprs::Packet::decode_tnc2(line, pdn_aprs::ParseOptions::LENIENT).unwrap();
+    let codes: Vec<_> = packet.diagnostics.iter().map(|d| d.code).collect();
+    assert_eq!(codes, [pdn_aprs::Code::PositionNotAtStart, pdn_aprs::Code::WeatherComment]);
+}

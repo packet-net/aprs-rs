@@ -4,7 +4,8 @@
 //! - `lenient`: decoding with every tolerance on gives the case's `expect`;
 //! - `strict`: decoding with none gives its `strict` result;
 //! - `tolerance`: turning off only the tolerance behind a single tolerated defect gives the strict result;
-//! - `reencode`: encoding the decoded data again gives what `reencode` says;
+//! - `reencode`: encoding the decoded data again gives what `reencode` says, and writes exactly the
+//!   case's `canonical_info` when it has one;
 //! - `encode`: an encode case writes the expected information field, or refuses;
 //! - `readback`: the neutral form of decoded data reads back into this crate's types unchanged.
 //!
@@ -287,11 +288,22 @@ fn reencode(case: &Value) -> Result<(), String> {
                 out.push(format!("reencode: expected the Mic-E destination {} back, got {destination}", packet.destination));
             }
         }
-        "equivalent" => {
-            let again = Packet::decode(packet.source.clone(), destination, packet.path.clone(), &info, ParseOptions::LENIENT);
-            differences(&neutral::data(&packet.data), &neutral::data(&again.data), "reencode", &mut out);
-            if again.has_errors() || again.has_warnings() {
-                out.push(format!("reencode: {} decodes with {:?}", show(&info), neutral::diagnostics(&again.diagnostics)));
+        "equivalent" | "rounded" => {
+            // A rounded value reads back as the nearest step, so only the bytes are compared.
+            if expected == "equivalent" {
+                let again = Packet::decode(packet.source.clone(), destination, packet.path.clone(), &info, ParseOptions::LENIENT);
+                differences(&neutral::data(&packet.data), &neutral::data(&again.data), "reencode", &mut out);
+                if again.has_errors() || again.has_warnings() {
+                    out.push(format!("reencode: {} decodes with {:?}", show(&info), neutral::diagnostics(&again.diagnostics)));
+                }
+            }
+            // The bytes the Encoding rule gives are binding: an encoder writes exactly those.
+            match case.get("canonical_info").and_then(Value::as_str) {
+                Some(canonical) if info != canonical.as_bytes() => {
+                    out.push(format!("reencode: expected canonical_info {}, wrote {}", Value::String(canonical.into()), show(&info)))
+                }
+                None if expected == "rounded" => out.push("reencode: a rounded case needs its canonical_info".into()),
+                _ => {}
             }
         }
         other => out.push(format!("reencode: unknown expectation '{other}'")),
@@ -302,10 +314,11 @@ fn reencode(case: &Value) -> Result<(), String> {
 fn encode(case: &Value) -> Result<(), String> {
     let input = &case["input"];
     let expect = &case["expect"];
-    let data = neutral::read_data(&input["encode"]);
-    let written = match data {
-        Data::MicE(m) => Packet::create_mic_e(source(input), m, Vec::new()),
-        data => Packet::create(source(input), destination(input), Vec::new(), data),
+    let written = match neutral::try_read_data(&input["encode"]) {
+        Err(neutral::Unreadable::Unsupported(why)) => return Err(format!("encode: this crate's data cannot hold it: {why}")),
+        Err(neutral::Unreadable::Refused(why)) => Err(pdn_aprs::EncodeError { message: why }),
+        Ok(Data::MicE(m)) => Packet::create_mic_e(source(input), m, Vec::new()),
+        Ok(data) => Packet::create(source(input), destination(input), Vec::new(), data),
     };
     let packet = match written {
         Err(e) => {
@@ -343,7 +356,13 @@ fn readback(case: &Value) -> Result<(), String> {
         return Ok(());
     }
     let written = neutral::data(&packet.data);
-    let read = neutral::data(&neutral::read_data(&written));
+    let read = match neutral::try_read_data(&written) {
+        Ok(data) => neutral::data(&data),
+        // A third-party packet keeps its inner information field, which the neutral form does not
+        // carry, so one whose inner data the encoder refuses cannot be made from it.
+        Err(neutral::Unreadable::Refused(_)) => return Ok(()),
+        Err(e) => return Err(format!("readback: {e}")),
+    };
     let mut out = Vec::new();
     differences(&written, &read, "readback", &mut out);
     result(out)

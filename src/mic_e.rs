@@ -217,7 +217,10 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
     if let Some(len) = locator_len(&s) {
         report.locator = Some(String::from_utf8_lossy(&s[..len]).to_ascii_uppercase());
         s.drain(..len + 2);
-        if !s.is_empty() {
+        // Base-91 telemetry and a !DAO! are lifted out before the locator is read, so a locator
+        // followed straight by them alone has nothing after it (vectors interpretations.md,
+        // "Where a Mic-E locator is read").
+        if !s.is_empty() && !comment::without_telemetry_and_dao(&s).is_empty() {
             if s[0] == b' ' {
                 s.remove(0);
             } else if !ctx.tolerate(
@@ -250,10 +253,38 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
                 report.fields.altitude_feet = altitude(&s[i..]);
                 s.drain(i..i + 4);
                 joined = Some(i);
+            } else if joins_into_altitude(&s) {
+                // Strictly the altitude is text and telemetry and the !DAO! are lifted as usual,
+                // unless what is left holds an altitude across a place one was taken from, which
+                // a lenient reader would then take: that reading is rejected (vectors README, Mic-E).
+                ctx.error(
+                    Code::MicEAltitudeNotFirst,
+                    "lifting telemetry and the !DAO! would join the status text into a Mic-E altitude (APRS12c ch. 10)",
+                    Some(offset + i),
+                );
+                return false;
             }
         }
     }
     comment::tail(ctx, &mut report.fields, &s, offset, joined)
+}
+
+/// Whether the text left once base-91 telemetry and the `!DAO!` are lifted out of `s` holds a
+/// Mic-E altitude, `xxx}`, across a place one was taken from.
+fn joins_into_altitude(s: &[u8]) -> bool {
+    let mut rest = s.to_vec();
+    let mut joins = Vec::new();
+    // Spans come last first, so each join's place in what is left is its span's start less the
+    // lengths of the spans before it, taken out later.
+    let spans = comment::telemetry_and_dao_spans(s);
+    for r in &spans {
+        rest.drain(r.clone());
+    }
+    for r in &spans {
+        let before: usize = spans.iter().filter(|o| o.start < r.start).map(|o| o.len()).sum();
+        joins.push(r.start - before);
+    }
+    joins.iter().any(|&join| (join.saturating_sub(3)..join).any(|j| altitude(&rest[j..]).is_some()))
 }
 
 /// Whether two numbers are the same value, as the vectors compare them: within 1e-9, relative
@@ -292,6 +323,12 @@ fn locator_len(s: &[u8]) -> Option<usize> {
 
 /// The destination address and information field for a Mic-E report.
 pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> {
+    encode_with(r, false)
+}
+
+/// As [`encode`]; with `feet_in_text`, an altitude goes in a `/A=` even when it is whole metres
+/// (a builder's altitude given in feet, vectors README, Builder rules).
+pub(crate) fn encode_with(r: &MicEReport, feet_in_text: bool) -> Result<(Address, Vec<u8>), EncodeError> {
     let f = &r.fields;
     position::check_symbol(f.symbol)?;
     let p = f.position;
@@ -318,13 +355,12 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         MicEMessage::Custom(n) => (7 - usize::from(n), true),
         m => (MESSAGES.iter().position(|x| *x == m).unwrap_or(0), false),
     };
+    // Whatever its precision: even `!W  !` reads back as `dao-with-ambiguity`.
+    if f.dao.is_some() && p.ambiguity > 0 {
+        return Err(EncodeError::new("a !DAO! on an ambiguous position contradicts it, whatever its precision"));
+    }
     let dao = match f.dao {
-        Some(d) if d.precision != DaoPrecision::None => {
-            if p.ambiguity > 0 {
-                return Err(EncodeError::new("a !DAO! adds precision to an ambiguous position, which contradicts it"));
-            }
-            Some(d.precision == DaoPrecision::Base91)
-        }
+        Some(d) if d.precision != DaoPrecision::None => Some(d.precision == DaoPrecision::Base91),
         _ => None,
     };
     let (per_minute, extra_base) = match dao {
@@ -333,15 +369,26 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         Some(true) => (9100.0, 91),
     };
 
-    // Latitude digits into the destination, blanked for ambiguity.
-    let half_box = [0.0, 0.05, 0.5, 5.0, 30.0][p.ambiguity as usize];
-    let mut lat_units = libm::round((p.latitude.abs() * 60.0 - half_box).max(0.0) * per_minute) as u64;
+    // Latitude digits into the destination, blanked for ambiguity: rounding then blanking keeps the
+    // box the position is in, and a decoded position (the centre of its box) writes back the same
+    // digits.
+    let mut lat_units = crate::steps::round(p.latitude.abs() * 60.0 * per_minute) as u64;
     let lat_extra = (lat_units % extra_base) as u8;
     lat_units /= extra_base;
+    // The box, in hundredths of a minute, that each level of ambiguity blanks.
+    let box_size = [1u64, 10, 100, 1000, 6000][p.ambiguity as usize];
+    if p.ambiguity > 0 && lat_units / box_size * box_size + box_size / 2 > 90 * 6000 {
+        return Err(EncodeError::new("an ambiguous latitude whose box is centred past 90 degrees cannot be sent"));
+    }
     let lat_text = format!("{:02}{:02}{:02}", lat_units / 6000, lat_units % 6000 / 100, lat_units % 100);
-    let mut lon_units = libm::round(p.longitude.abs() * 60.0 * per_minute) as u64;
+    let mut lon_units = crate::steps::round(p.longitude.abs() * 60.0 * per_minute) as u64;
     let lon_extra = (lon_units % extra_base) as u8;
     lon_units /= extra_base;
+    // The longitude digits the ambiguity makes a decoder ignore hold the centre it reports (vectors
+    // README, Mic-E).
+    if p.ambiguity > 0 {
+        lon_units = lon_units / box_size * box_size + box_size / 2;
+    }
     let lon_deg = (lon_units / 6000) as u32;
     let lon_min = (lon_units % 6000 / 100) as u32;
     let lon_hun = (lon_units % 100) as u32;
@@ -385,15 +432,24 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     out.push((lon_hun + 28) as u8);
     let speed = match f.speed_knots {
         None => 0,
-        Some(s) if (0.0..=799.4).contains(&s) => libm::round(s) as u32,
+        // Rounded first, so -0.3 is 0 and 799.4 is 799.
+        Some(s) if (0.0..=799.0).contains(&crate::steps::round(s)) => crate::steps::round(s) as u32,
         Some(_) => return Err(EncodeError::new("Mic-E speed is 0-799 knots")),
     };
     let course = u32::from(f.course_degrees.unwrap_or(0));
     if course > 360 {
         return Err(EncodeError::new("course must be 0-360 degrees"));
     }
-    // The encodings the spec's own examples use: speed tens from 'l', course hundreds + 4.
-    out.push((if speed < 200 { 108 + speed / 10 } else { 28 + speed / 10 }) as u8);
+    // A course of 0 is how Mic-E sends no course, so it would read back as none.
+    if f.course_degrees == Some(0) {
+        return Err(EncodeError::new(
+            "a Mic-E course of 0 means an unknown course (APRS12c ch. 10), so it cannot be sent: due north is 360",
+        ));
+    }
+    // The printable forms APRS12c ch. 10 allows, as its own examples use them: speed tens + 80 from
+    // 'l' below 190 knots, then '/' for 190-199 (the other form is DEL, a control character), and
+    // course hundreds + 4.
+    out.push((if speed < 190 { 108 + speed / 10 } else { 28 + speed / 10 }) as u8);
     out.push((32 + (speed % 10) * 10 + course / 100) as u8);
     out.push((28 + course % 100) as u8);
     out.push(f.symbol.code as u8);
@@ -419,8 +475,8 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     // the same (vectors README, Encoding).
     let mut altitude_in_text = None;
     if let Some(feet) = f.altitude_feet {
-        let metres = libm::round(feet / METRES_TO_FEET);
-        if !same_number(metres * METRES_TO_FEET, feet) {
+        let metres = crate::steps::round(feet / METRES_TO_FEET);
+        if feet_in_text || !same_number(metres * METRES_TO_FEET, feet) {
             altitude_in_text = Some(feet);
         } else {
             let datum = metres + 10_000.0;
@@ -439,15 +495,14 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         out.extend_from_slice(b);
         out.extend_from_slice(b"/G");
         // Anything after the locator and its symbol comes after a space (APRS12c ch. 10), a data
-        // extension included; the device suffix is read off the end first, so it needs none.
+        // extension included; the device suffix is read off the end first, and base-91 telemetry
+        // and a !DAO! are lifted out before the locator is read, so they need none.
         let follows = altitude_in_text.is_some()
             || f.phg.is_some()
             || f.range_miles.is_some()
             || f.dfs.is_some()
             || f.frequency.is_some()
-            || !f.comment.is_empty()
-            || f.telemetry.is_some()
-            || f.dao.is_some();
+            || !f.comment.is_empty();
         if follows {
             out.push(b' ');
         }
@@ -460,7 +515,7 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
             out.push(b'/');
         }
     } else if let Some(range) = f.range_miles {
-        let n = libm::round(range);
+        let n = crate::steps::round(range);
         if !(0.0..=9999.0).contains(&n) {
             return Err(EncodeError::new("RNG range is 0-9999 miles"));
         }
@@ -468,9 +523,9 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     } else if let Some(dfs) = f.dfs {
         encode::dfs_codes(&mut out, dfs)?;
     }
-    let extension = out.len() > before_extension;
+    let after_extension = (out.len() > before_extension).then_some(out.len());
     if let Some(feet) = altitude_in_text {
-        let n = libm::round(feet);
+        let n = crate::steps::round(feet);
         if !(-99_999.0..=999_999.0).contains(&n) {
             return Err(EncodeError::new("/A= altitude must fit in 6 digits (or - and 5 digits)"));
         }
@@ -482,7 +537,9 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     }
 
     if let Some(fr) = &f.frequency {
-        if extension {
+        // Straight after a data extension, a `/` (a PHGR already ends in one), as in a position's
+        // comment; after a /A= altitude, straight on.
+        if after_extension == Some(out.len()) && out.last() != Some(&b'/') {
             out.push(b'/');
         }
         encode::frequency(&mut out, fr)?;
@@ -510,13 +567,30 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
 
     let text_at = out.len();
     let needs_space = !text.is_empty() && f.frequency.is_some();
-    let separators: &[&[u8]] = if needs_space { &[b" ", b"", b" /"] } else { &[b"", b"/"] };
+    // Status text that would start with a type code character or 0x1D (Rev 0 telemetry) is written
+    // after a `/`, even when it would read back without one (vectors README, Encoding). Only the
+    // start of the status text counts: after a type code or telemetry, it is written straight on.
+    let status_starts_with_code = text_at == status_start && matches!(text.first(), Some(b'`' | b'\'' | b'>' | b']' | b' ' | 0x1D));
+    let separators: &[&[u8]] = if needs_space {
+        &[b" ", b"", b" /"]
+    } else if status_starts_with_code {
+        &[b"/"]
+    } else {
+        // A space last: it keeps text such as `{5}` from joining the digits before it into a
+        // Mic-E altitude (`1{5}`), where `/` would join them too (vectors README, Encoding).
+        &[b"", b"/", b" "]
+    };
     for separator in separators {
         out.truncate(text_at);
         out.extend_from_slice(separator);
         out.extend_from_slice(text);
         out.extend_from_slice(&trailer);
         out.extend_from_slice(suffix);
+        // A CR or LF at the end (the last byte of Rev 0 telemetry, say) reads back as a
+        // trailing line break, a warning.
+        if matches!(out.last(), Some(b'\r' | b'\n')) {
+            return Err(EncodeError::new("the information field would end in a CR or LF, which reads back as a trailing line break"));
+        }
         if reads_back(r, &out[status_start..]) {
             let destination = Address::new(&dest).map_err(|_| EncodeError::new("the Mic-E destination is not an address"))?;
             return Ok((destination, out));
@@ -550,6 +624,7 @@ fn reads_back(r: &MicEReport, status_bytes: &[u8]) -> bool {
         && a.telemetry == b.telemetry
         && a.dao.map(|d| d.datum) == b.dao.map(|d| d.datum)
         && freq(&a.frequency) == freq(&b.frequency)
-        && close(a.altitude_feet, b.altitude_feet)
-        && a.range_miles.map(libm::round) == b.range_miles.map(libm::round)
+        // A /A= altitude is whole feet, rounded as a position's is.
+        && (close(a.altitude_feet, b.altitude_feet) || a.altitude_feet.map(crate::steps::round) == b.altitude_feet.map(crate::steps::round))
+        && a.range_miles.map(crate::steps::round) == b.range_miles.map(crate::steps::round)
 }
