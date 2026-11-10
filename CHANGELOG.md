@@ -15,7 +15,7 @@ The encoder writes exactly the bytes the vectors' Encoding rule gives, which the
 - Snowfall under an inch is written `.` and two digits (`.50`); 0.5 was `0.5`.
 - The vectors test runner compares the bytes written with each case's `canonical_info`, and knows the new `rounded` re-encoding.
 
-Exact bytes batch 2 (rulings F1-F17, B1-B8, A1-A2); the vectors submodule moves to aprs-vectors exact-bytes `1788661`:
+Exact bytes batch 2 (rulings F1-F17, B1-B8, A1-A2); the vectors submodule moves to aprs-vectors exact-bytes `9c01dbd`:
 
 - A value between the steps its field holds is rounded to the nearest step, halves away from zero, and refused only when the rounded value is outside the field: weather values (a gust of 5.4 mph is `g005`, a pressure of 986.95 mbar `b09870`), `/A=` feet (-0.6 is `-00001`), `RNG` miles (1.5 is `RNG0002`), speeds (a Mic-E speed of -0.3 is 0), DAO digits, latitude and longitude minutes, and the cs bytes. A value within 1e-6 of a step's half, measured in steps, is the half, so a latitude whose minutes compute as 58.584999999999996 is written `58.59`. Weather values between steps, `/A=` values and RNG values were refused, the last two with a message blaming the comment text. A refusal for a report with no comment now names the field that does not read back.
 - The cs bytes' steps follow their formula for every whole s, and a value rounds to the nearest; one whose s falls below the byte is refused: a compressed speed of -0.03 knots is written as 0 and -0.3 refused, a compressed range of 1.95 miles is written as 2 and 1.9 refused (G3). A range under 2 miles was refused.
