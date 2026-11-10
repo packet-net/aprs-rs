@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+The encoder writes exactly the bytes the vectors' Encoding rule gives, which the vectors now check byte for byte (packet-net/aprs-vectors, exact bytes batch 1, rulings E1-E12).
+
+**Breaking:** `Footprint`'s `latitude` and `longitude` are now the text as sent (`String`), a leading space included, so that ` 34.0` and `-.1715` write back unchanged, as telemetry values and coefficients already do. `Footprint::latitude_degrees` and `Footprint::longitude_degrees` read them as numbers, and `Footprint::new` writes them from numbers as APRS12c does (a space before a positive value). `Footprint` is no longer `Copy`.
+
+- A position, object or item report's comment is written in one order: the voice frequency and its fields, the signpost or corridor braces, the `/A=` altitude, the free text (after a space when a frequency comes before it), base-91 telemetry and the `!DAO!`. The frequency is where radios read it, in the first bytes of the comment (APRS12c ch. 18); it was written after the altitude. Straight after a seven-byte data extension it follows a `/`, and after a PHGR, which ends in one, it follows straight on (`PHG33403/145.225MHz`, not `PHG33403//145.225MHz`); the same in Mic-E status text, where a `/A=` between them takes the `/`'s place.
+- A `!DAO!` on a compressed position carries the digits of the position reported (the compressed one), as it would on that position written uncompressed (`!sCp!`); it had `!!`.
+- Mic-E: a speed of 190-199 knots is written with `/`, the printable one of the two characters APRS12c ch. 10 gives, not DEL. Status text that would start with 0x1D (or a type code character) is written after a `/`, even when it is too short to read as Rev 0 telemetry. A course of 0, which Mic-E sends for an unknown course, is refused: due north is 360.
+- Mic-E with ambiguity: the longitude digits a decoder ignores hold the centre it reports (`34.50` for 34.494 minutes at ambiguity 2), and the latitude is the box the position is in, rounded then blanked as an uncompressed position's is; a position not at the centre of its box could land in the box below. A latitude whose box is centred past 90 degrees is refused.
+- A Mic-E `/A=` altitude in feet the Mic-E bytes cannot hold is written rounded to the foot, as a position's is; it was refused.
+- An NMEA sentence's latitude, longitude, course, speed and altitude, when given, agree with the sentence within a part in 10^9, as the vectors compare numbers; a value computed by other arithmetic was refused.
+- Snowfall under an inch is written `.` and two digits (`.50`); 0.5 was `0.5`.
+- The vectors test runner compares the bytes written with each case's `canonical_info`, and knows the new `rounded` re-encoding. The vectors submodule moves to aprs-vectors exact-bytes `bac25bd`.
+- `examples/diff_dump.rs` writes the bytes it re-encodes and the API view (what the packet's accessors say), and has `--encode` and `--build` modes for data and builder recipes from the vectors' `tools/generate.py`.
+
 ## 0.3.0
 
 Brought into line with the rulings from differential fuzzing of all five implementations (packet-net/aprs-vectors, 159 new cases in seven rounds, the rules in its README and interpretations.md). The vectors submodule moves to them.
