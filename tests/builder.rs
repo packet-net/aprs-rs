@@ -352,3 +352,79 @@ fn named_symbols_and_overlays() {
     assert_eq!(Symbol::CAR.with_overlay('I'), None);
     assert_eq!(Symbol::GATEWAY.with_overlay('a'), None);
 }
+
+#[test]
+fn a_fractional_course_is_rounded_once_to_its_step() {
+    // Whole degrees uncompressed: 88.5 is 89 (halves away from zero), 301.7 is 302.
+    assert!(sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course(88.5).speed(36.0).build().unwrap()).contains("089/036"));
+    // Compressed, 4-degree steps: 301.7 is the step nearest 301.7, 300, not the nearest to 302 (304).
+    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course(301.7).speed(36.0).build().unwrap());
+    let Data::Position(report) = heard(&line) else { panic!("{line}") };
+    assert_eq!(report.fields.course_degrees, Some(300));
+    // 359 is the step at north, 360; 1.2 is also the step at north, not the unknown course.
+    for course in [359.0, 1.2] {
+        let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course(course).speed(36.0).build().unwrap());
+        let Data::Position(report) = heard(&line) else { panic!("{line}") };
+        assert_eq!(report.fields.course_degrees, Some(360));
+    }
+    // A course that rounds to 0 whole degrees is unknown: refused compressed, 000 otherwise.
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course(0.3).speed(36.0).build().is_err());
+    // Outside the field once rounded.
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course(360.5).speed(36.0).build().is_err());
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course(f64::NAN).speed(36.0).build().is_err());
+}
+
+#[test]
+fn fractional_weather_values_are_rounded_once() {
+    let wx = me().weather().timestamp(Timestamp::mdhm(10, 9, 23, 59));
+    let line = sent(wx.clone().wind(89.5, 5.0).humidity(99.7).luminosity(412.4).temperature(72.0).build().unwrap());
+    assert!(line.contains("c090") && line.contains("h00") && line.contains("L412"), "{line}");
+    let line = sent(me().weather().at(51.4543, -0.9781).compressed().wind(301.7, 5.0).build().unwrap());
+    let Data::Position(report) = heard(&line) else { panic!("{line}") };
+    assert_eq!(report.fields.weather.unwrap().wind_direction_degrees, Some(300));
+    // A humidity that rounds to 0 is refused, since h00 is 100 percent.
+    assert!(wx.clone().humidity(0.4).build().is_err());
+    assert!(wx.humidity(100.6).build().is_err());
+}
+
+#[test]
+fn a_telemetry_channel_can_be_empty_on_its_own() {
+    let wx = me();
+    assert_eq!(
+        sent(wx.telemetry(7).channels(&[None, Some(1.5), None, Some(3.0), None]).build().unwrap()),
+        "M0LTE>APZ001:T#007,,1.5,,003,,00000000"
+    );
+}
+
+#[test]
+fn the_compressed_course_band_is_decided_in_whole_degrees() {
+    let car = || me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().speed(36.0);
+    let course = |c: f64| {
+        let line = sent(car().course(c).build().unwrap());
+        let Data::Position(r) = heard(&line) else { panic!("{line}") };
+        r.fields.course_degrees
+    };
+    // Halves of the 4-degree step go away from zero.
+    assert_eq!(course(2.0), Some(4));
+    assert_eq!(course(302.0), Some(304));
+    assert_eq!(course(1.2), Some(360));
+    assert_eq!(course(360.4), Some(360));
+    for bad in [0.3, -0.7, 360.6, 361.0] {
+        assert!(car().course(bad).build().is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn weather_halves_and_the_direction_alone() {
+    let wx = || me().weather().timestamp(Timestamp::mdhm(10, 9, 23, 59)).temperature(72.0);
+    assert!(sent(wx().humidity(0.5).build().unwrap()).contains("h01"));
+    assert!(sent(wx().wind_direction(120.0).build().unwrap()).contains("c120"));
+    // A compressed report carries the direction and speed together.
+    assert!(me().weather().at(51.4543, -0.9781).compressed().wind_direction(120.0).build().is_err());
+    // observations() replaces what was set before, the direction, humidity and luminosity included.
+    let line =
+        sent(wx().wind_direction(120.0).humidity(50.0).luminosity(300.0).observations(pdn_aprs::Weather::default()).build().unwrap());
+    assert!(!line.contains("c120") && !line.contains("h50") && !line.contains("L300"), "{line}");
+    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course(359.5).speed(1.0).build().unwrap());
+    assert!(line.contains("360/001"), "{line}");
+}

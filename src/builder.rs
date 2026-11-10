@@ -106,6 +106,9 @@ impl Station {
             messaging: false,
             compressed: false,
             dao: None,
+            wind_direction: None,
+            humidity: None,
+            luminosity: None,
         }
     }
 
@@ -230,6 +233,8 @@ struct Common {
     offset_khz: Option<i32>,
     /// An altitude given in metres, which a Mic-E report carries in metres and any other in feet.
     altitude_metres: Option<f64>,
+    /// The course as given, which is rounded once to its field's step (1 degree, or 4 when compressed).
+    course: Option<f64>,
 }
 
 impl Common {
@@ -263,6 +268,16 @@ impl Common {
                 metres * crate::comment::METRES_TO_FEET
             });
         }
+        if let Some(course) = self.course {
+            // Whether a course is unknown (0) or in range (1-360) is decided in whole degrees; a known
+            // course is then rounded once to the field's step. A compressed 1.2 is the step at north, 360.
+            let whole = degrees(course, 1.0, "course")?;
+            let mut rounded = if fields.compressed { degrees(course, 4.0, "course")? } else { whole };
+            if rounded == 0 && whole != 0 {
+                rounded = 360;
+            }
+            fields.course_degrees = Some(rounded);
+        }
         // A course of 0 is the spec's unknown course, which Mic-E sends as 0 (APRS12c ch. 10).
         if mic_e && fields.course_degrees == Some(0) {
             fields.course_degrees = None;
@@ -282,6 +297,25 @@ impl Common {
         }
         Ok(fields)
     }
+}
+
+/// `value` in whole degrees, rounded once to the nearest multiple of `step` (halves away from zero),
+/// then checked against the 0-360 the field holds.
+fn degrees(value: f64, step: f64, what: &str) -> Result<u16, EncodeError> {
+    let rounded = if value.is_finite() { crate::steps::round(value / step) * step } else { f64::NAN };
+    if !(0.0..=360.0).contains(&rounded) {
+        return Err(EncodeError::new(format!("{what} must round to 0-360 degrees")));
+    }
+    Ok(rounded as u16)
+}
+
+/// `value` rounded once to the nearest whole number (halves away from zero), which must lie in `low..=high`.
+fn whole_in(value: f64, low: f64, high: f64, what: &str) -> Result<f64, EncodeError> {
+    let rounded = if value.is_finite() { crate::steps::round(value) } else { f64::NAN };
+    if !(low..=high).contains(&rounded) {
+        return Err(EncodeError::new(format!("{what} is outside what a report holds once rounded")));
+    }
+    Ok(rounded)
 }
 
 /// The centre of the box that holds `degrees` once `ambiguity` (1-4) digits are blanked: the
@@ -313,9 +347,11 @@ macro_rules! positioned_methods {
         }
 
         /// Course over ground in degrees clockwise from north, 1-360: 360 is north, and 0 is the
-        /// spec's unknown course (APRS12c ch. 7 and 10), which a compressed report cannot send.
-        pub fn course(mut self, degrees: u16) -> Self {
-            self.common.fields.course_degrees = Some(degrees);
+        /// spec's unknown course (APRS12c ch. 7 and 10), which a compressed report cannot send. A
+        /// course between the steps the report holds (whole degrees, or 4 degrees compressed) is
+        /// rounded to the nearest, once, from the value given.
+        pub fn course(mut self, degrees: impl Into<f64>) -> Self {
+            self.common.course = Some(degrees.into());
             self
         }
 
@@ -603,6 +639,10 @@ pub struct WeatherBuilder {
     messaging: bool,
     compressed: bool,
     dao: Option<Dao>,
+    /// Wind direction, humidity and luminosity as given, rounded once to their steps when built.
+    wind_direction: Option<f64>,
+    humidity: Option<f64>,
+    luminosity: Option<f64>,
 }
 
 impl WeatherBuilder {
@@ -645,10 +685,19 @@ impl WeatherBuilder {
         self
     }
 
-    /// Wind direction in degrees clockwise from north, and sustained one-minute speed in mph.
-    pub fn wind(mut self, direction_degrees: u16, speed_mph: f64) -> Self {
-        self.weather.wind_direction_degrees = Some(direction_degrees);
-        self.weather.wind_speed_mph = Some(speed_mph);
+    /// Wind direction in degrees clockwise from north, and sustained one-minute speed in mph. A
+    /// direction between the steps the report holds (whole degrees, or 4 degrees compressed) is rounded
+    /// to the nearest, once, from the value given.
+    pub fn wind(self, direction_degrees: impl Into<f64>, speed_mph: f64) -> Self {
+        let mut b = self.wind_direction(direction_degrees);
+        b.weather.wind_speed_mph = Some(speed_mph);
+        b
+    }
+
+    /// Wind direction alone, in degrees clockwise from north, rounded as in [`wind`](Self::wind). A
+    /// compressed report needs the speed too.
+    pub fn wind_direction(mut self, degrees: impl Into<f64>) -> Self {
+        self.wind_direction = Some(degrees.into());
         self
     }
 
@@ -669,9 +718,10 @@ impl WeatherBuilder {
         self.temperature(celsius * 9.0 / 5.0 + 32.0)
     }
 
-    /// Relative humidity, 1-100 percent.
-    pub fn humidity(mut self, percent: u8) -> Self {
-        self.weather.humidity_percent = Some(percent);
+    /// Relative humidity, 1-100 percent, rounded to the nearest whole percent (99.7 is sent as 100%;
+    /// a value that rounds to 0 is refused, since the report's `h00` means 100).
+    pub fn humidity(mut self, percent: impl Into<f64>) -> Self {
+        self.humidity = Some(percent.into());
         self
     }
 
@@ -714,9 +764,9 @@ impl WeatherBuilder {
         self.rain_since_midnight(millimetres / 25.4)
     }
 
-    /// Luminosity in watts per square metre, 0-1999.
-    pub fn luminosity(mut self, watts_per_square_metre: u16) -> Self {
-        self.weather.luminosity_w_m2 = Some(watts_per_square_metre);
+    /// Luminosity in watts per square metre, 0-1999, rounded to the nearest whole number.
+    pub fn luminosity(mut self, watts_per_square_metre: impl Into<f64>) -> Self {
+        self.luminosity = Some(watts_per_square_metre.into());
         self
     }
 
@@ -729,12 +779,25 @@ impl WeatherBuilder {
     /// Every observation at once, replacing any set before.
     pub fn observations(mut self, weather: Weather) -> Self {
         self.weather = weather;
+        self.wind_direction = None;
+        self.humidity = None;
+        self.luminosity = None;
         self
     }
 
     /// The data, without a header: a position report with a position, otherwise a positionless report.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
-        let weather = self.weather.clone();
+        let mut weather = self.weather.clone();
+        if let Some(d) = self.wind_direction {
+            weather.wind_direction_degrees =
+                Some(degrees(d, if self.compressed && self.position.is_some() { 4.0 } else { 1.0 }, "wind direction")?);
+        }
+        if let Some(h) = self.humidity {
+            weather.humidity_percent = Some(whole_in(h, 0.0, 255.0, "humidity")? as u8);
+        }
+        if let Some(l) = self.luminosity {
+            weather.luminosity_w_m2 = Some(whole_in(l, 0.0, 65535.0, "luminosity")? as u16);
+        }
         if let Some(position) = self.position {
             let fields = Positioned {
                 position,
@@ -873,7 +936,7 @@ impl StatusBuilder {
 pub struct TelemetryBuilder {
     station: Station,
     sequence: u16,
-    analog: Vec<f64>,
+    analog: Vec<Option<f64>>,
     digital: u8,
     comment: String,
 }
@@ -881,6 +944,13 @@ pub struct TelemetryBuilder {
 impl TelemetryBuilder {
     /// Up to 5 analog values, A1 first; any not given are sent empty.
     pub fn analog(mut self, values: &[f64]) -> Self {
+        self.analog = values.iter().map(|&v| Some(v)).collect();
+        self
+    }
+
+    /// Up to 5 analog values, A1 first, each of which may be `None` to send that channel empty, before a
+    /// filled one or after; any not given are sent empty.
+    pub fn channels(mut self, values: &[Option<f64>]) -> Self {
         self.analog = values.to_vec();
         self
     }
@@ -905,7 +975,7 @@ impl TelemetryBuilder {
         if self.analog.len() > 5 {
             return Err(EncodeError::new("a telemetry report carries at most 5 analog values (APRS12c ch. 13)"));
         }
-        let mut analog: Vec<Option<String>> = self.analog.iter().map(|&v| Some(telemetry_value(v))).collect();
+        let mut analog: Vec<Option<String>> = self.analog.iter().map(|&v| v.map(telemetry_value)).collect();
         analog.resize(5, None);
         Ok(Data::Telemetry(Telemetry {
             sequence: format!("{:03}", self.sequence),

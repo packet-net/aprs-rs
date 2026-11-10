@@ -496,6 +496,32 @@ impl<'a> Keys<'a> {
             .map_err(|_| Unreadable::Refused(format!("{}: outside its field once rounded", self.name(k))))
     }
 
+    /// Like [`stepped`](Self::stepped) for a field held in steps of `step` units (a compressed
+    /// course or wind direction, 4 degrees): the nearest step, rounded once from the value given.
+    /// A whole number is kept, as the encoder rounds it to its step itself.
+    fn stepped_by<T: TryFrom<i128>>(&self, k: &str, step: f64, course: bool) -> Read<Option<T>> {
+        let Some(v) = self.get(k) else { return Ok(None) };
+        if let Some(n) = whole(v) {
+            return T::try_from(n).map(Some).map_err(|_| Unreadable::Refused(format!("{}: outside its field", self.name(k))));
+        }
+        let Some(x) = v.as_f64().filter(|x| x.is_finite()) else {
+            return unsupported(format!("{}: not a number", self.name(k)));
+        };
+        let mut n = (round_steps(x / step) * step) as i128;
+        if course {
+            // Unknown (0) and in range (1-360) are decided in whole degrees, then a known course is
+            // rounded once to its step; the step at north is 360.
+            let whole = round_steps(x) as i128;
+            if !(0..=360).contains(&whole) {
+                return Err(Unreadable::Refused(format!("{}: outside its field once rounded", self.name(k))));
+            }
+            if n == 0 && whole != 0 {
+                n = 360;
+            }
+        }
+        T::try_from(n).map(Some).map_err(|_| Unreadable::Refused(format!("{}: outside its field once rounded", self.name(k))))
+    }
+
     fn required_stepped<T: TryFrom<i128>>(&self, k: &str) -> Read<T> {
         self.stepped(k)?
             .ok_or_else(|| Unreadable::Unsupported(format!("{}: missing, and this crate has no value for its absence", self.name(k))))
@@ -1062,7 +1088,7 @@ fn read_positioned(o: &Keys) -> Read<Positioned> {
                 )?,
             }),
         },
-        course_degrees: if compressed { o.int("course_degrees")? } else { o.stepped("course_degrees")? },
+        course_degrees: if compressed { o.stepped_by("course_degrees", 4.0, true)? } else { o.stepped("course_degrees")? },
         speed_knots: o.float("speed_knots")?,
         altitude_feet: o.float("altitude_feet")?,
         phg: match o.object("phg", &["power", "height", "gain", "directivity", "beacons_per_hour"])? {
@@ -1226,7 +1252,11 @@ fn read_weather(o: &Keys, compressed: bool) -> Read<Option<Weather>> {
             .collect::<Read<Vec<WeatherField>>>()?,
     };
     Ok(Some(Weather {
-        wind_direction_degrees: if compressed { w.int("wind_direction_degrees")? } else { w.stepped("wind_direction_degrees")? },
+        wind_direction_degrees: if compressed {
+            w.stepped_by("wind_direction_degrees", 4.0, false)?
+        } else {
+            w.stepped("wind_direction_degrees")?
+        },
         wind_speed_mph: w.float("wind_speed_mph")?,
         wind_gust_mph: w.float("wind_gust_mph")?,
         temperature_f: w.float("temperature_f")?,

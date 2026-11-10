@@ -15,6 +15,13 @@ The encoder writes exactly the bytes the vectors' Encoding rule gives, which the
 - Snowfall under an inch is written `.` and two digits (`.50`); 0.5 was `0.5`.
 - The vectors test runner compares the bytes written with each case's `canonical_info`, and knows the new `rounded` re-encoding.
 
+Builder gaps (the builder can say everything the neutral form does):
+
+**Breaking:** `course`, `WeatherBuilder::wind`, `humidity` and `luminosity` take `impl Into<f64>` instead of `u16`/`u8`, so a fractional value can be given. Integer and float literals, `u8`, `u16`, `i32` and `f32` values still compile; what breaks is coercing the method to a function pointer, or an argument whose type was inferred as `u16` (e.g. `course(s.parse()?)`). Whether a course is unknown (0) and whether it is in range (1-360) is decided in whole degrees; a known course is then rounded once, halves away from zero, to the step its field holds (whole degrees, or 4 degrees compressed), so 301.7 compressed is 300, not 304. A compressed 1.2 is north (360), 0.3 is unknown and refused, -0.7 and 360.6 are refused. Humidity and luminosity are rounded to whole numbers and range-checked after. Needs a minor version bump.
+
+- `WeatherBuilder::wind_direction` gives a wind direction alone. `TelemetryBuilder::channels` takes `&[Option<f64>]`, so any analog channel can be empty, not only the last ones.
+- `examples/diff_dump.rs` and the vectors runner read a fractional compressed course or wind direction by rounding once to the 4-degree step, instead of reporting it unsupported. The data types (`Positioned::course_degrees`, `Weather::wind_direction_degrees`, ...) still hold whole numbers: widening them to `f64` would change what every decoder user reads, so the rounding is done by the builder and the runner, which are the only places a fractional value arrives.
+
 Exact bytes batch 2 (rulings F1-F17, B1-B8, A1-A2); the vectors submodule moves to aprs-vectors exact-bytes `e27a79f`:
 
 - A value between the steps its field holds is rounded to the nearest step, halves away from zero, and refused only when the rounded value is outside the field: weather values (a gust of 5.4 mph is `g005`, a pressure of 986.95 mbar `b09870`), `/A=` feet (-0.6 is `-00001`), `RNG` miles (1.5 is `RNG0002`), speeds (a Mic-E speed of -0.3 is 0), DAO digits, latitude and longitude minutes, and the cs bytes. A value within 1e-6 of a step's half, measured in steps, is the half, so a latitude whose minutes compute as 58.584999999999996 is written `58.59`. Weather values between steps, `/A=` values and RNG values were refused, the last two with a message blaming the comment text. A refusal for a report with no comment now names the field that does not read back.
