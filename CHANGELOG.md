@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+The 1.0 API cleanup: one naming rule, fractional numbers where the encoder rounds, one way to say each thing. Nothing about what the encoder writes or the decoder reads changes: the vectors suite, and a differential run over 100,000 generated encode cases, 100,000 builder recipes and 1,831 captured packets, give the same bytes and results as 0.4.0.
+
+### Breaking changes
+
+Migrating from 0.4.0:
+
+**Numbers.**
+- `Positioned::course_degrees`, `Weather::wind_direction_degrees`, `Weather::humidity_percent`, `Weather::luminosity_w_m2` and `Footprint::radius_miles` are `f64`. They are whole when decoded and rounded once, by the encoder, when written (to 4 degrees for a compressed course or wind direction). `Some(88)` becomes `Some(88.0)`.
+- `Telemetry::analog` is `Vec<Option<f64>>`, with the text as sent in the new `analog_text` (one string per value, empty for an empty channel). `Telemetry::values()` is gone: read `analog`.
+- `TelemetryCoefficients::coefficients` is `Vec<f64>`, with the text as sent in the new `coefficients_text`.
+- `Footprint::latitude` and `longitude` are `f64`, with the text as sent in the new `latitude_text` and `longitude_text`. `Footprint::latitude_degrees()` and `longitude_degrees()` are gone. `Footprint::new` takes the radius as `f64`. `Footprint` and `TelemetryCoefficients` are no longer `Eq`.
+- The text fields are optional when encoding, and `==` ignores them. The encoder writes a text that is a number of the form the spec allows and still says the value, and otherwise the number: three digits for a whole telemetry value from 0 to 999, else the shortest decimal that reads back the same, with no exponent.
+
+**Names.** A builder setter has the name of the field it fills, and a converting setter changes only the unit.
+- `PositionBuilder` (and the object, item and Mic-E builders): `course` is `course_degrees`, `speed` is `speed_knots`, `altitude` is `altitude_feet`, `altitude_metres` is `altitude_m`, `range` is `range_miles`, `kill()` is `killed()`. `telemetry(sequence, &[u16])` and `telemetry_with_bits` are one `telemetry(CommentTelemetry)`.
+- `WeatherBuilder`: `wind(direction, speed)` is removed, use `wind_direction_degrees` and the new `wind_speed_mph`. `gust` is `wind_gust_mph`, `temperature` is `temperature_f`, `temperature_celsius` is `temperature_c`, `humidity` is `humidity_percent`, `pressure` is `pressure_mbar`, `rain_last_hour` is `rain_1h_in`, `rain_last_24_hours` is `rain_24h_in`, `rain_since_midnight` is `rain_midnight_in`, and the `_mm` ones are `rain_1h_mm`, `rain_24h_mm`, `rain_midnight_mm`. `luminosity` is `luminosity_w_m2`, `snowfall` is `snow_24h_in`.
+- `MessageBuilder::id` is `message_id`. `MicEBuilder::message` is `mic_e_message`, and so is the field `MicEReport::message`.
+- `TelemetryBuilder`: `analog(&[f64])` is removed and `channels(&[Option<f64>])` is now `analog(&[Option<f64>])`. `digital(u8)` is `bits(&str)`, eight `0` or `1` characters, B1 first.
+- `Station::telemetry_bits(bits: u8, project)` takes the bits as `&str`.
+- `GpsFix` and `NmeaSource` are `CompressionFix` and `CompressionSource`.
+- `TelemetryLabels` is two types, `TelemetryNames` (field `names`) and `TelemetryUnits` (field `units`), as `Data::TelemetryNames` and `Data::TelemetryUnits` carry.
+- `pdn_aprs::tocall(callsign)` is `Device::from_tocall(callsign)`, and `pdn_aprs::database_version()` is `Device::DATABASE_VERSION`.
+
+**Voice frequency.** `tone(hz: f64)` is `tone(kind: Tone, value: u16)`: the kind (`Tone::Tone`, `Tone::Ctcss`, `Tone::Dcs`) and the value as sent, so CTCSS and DCS no longer need the whole `voice_frequency(VoiceFrequency { .. })`. 118.8 Hz is `tone(Tone::Tone, 118)`, as it was cut to before.
+
+**Mic-E.** `Packet::create_mic_e` is gone: `Packet::create` works out the destination of a `Data::MicE` (the destination you pass is not used). `Data::encode` on Mic-E data now refuses it, since it used to return the information field and silently drop the computed destination, half the position. `MicEReport` has a new field, `altitude_in_comment`: the decoder sets it when the altitude came from a `/A=`, and the encoder honours it, so encoding a copy of a report writes the bytes it was built from (the builder sets it when the altitude is given in feet). Code that builds a `MicEReport` with a struct literal needs the field or `..Default::default()`.
+
+**Refusals.** `EncodeError` is `#[non_exhaustive]` and its `message` field is private: read `message()` or `Display`. The wording of a reason is not part of the stable API, so that a machine-readable reason can be added without a major version.
+
+**What can be built by hand.** `Data`, `Packet`, `Diagnostic`, `Device`, `HeaderError` and `Unrecognized` are `#[non_exhaustive]`: a `match` on `Data` or `Unrecognized` needs a `_` arm, and a `Packet` is made with `Packet::create` or `Packet::decode`, not a struct literal. The data structs a program fills in (`Positioned`, `Weather`, the reports and the rest) stay exhaustive with `Default`. `InvalidAddress`'s field is private: read `text()`. `Timestamp::to_bytes` is removed, use `Display` (`timestamp.to_string()`).
+
+**Other.** `Code::ALL` is `&'static [Code]` (not `[Code; 64]`), and `ParseOptions` holds its tolerated codes in a `u128`, so a 65th code fits without another break.
+
+### Added
+
+- `TelemetryMetadataBuilder`: `telemetry_names`, `telemetry_units`, `telemetry_coefficients` and `telemetry_bits` return it, with `addressee(&str)` for metadata about another station (the sending station itself by default), `to_data()` and `build()`.
+- `WeatherBuilder::wind_speed_mph`.
+- `Symbol::description()`: what the symbol stands for ("Car"), ignoring any overlay.
+- `Phg::power_watts()`, `height_feet()`, `gain_db()` and `directivity_degrees()` (`None` for omni).
+- `impl Display` for `Severity` and `Timestamp`.
+- `EncodeError::message()` and `InvalidAddress::text()`.
+- `examples/diff_dump.rs` writes the `symbol` and `phg` keys of the API view, and maps every recipe key it did before; telemetry metadata for another station and the CTCSS and DCS tones are now buildable, so the recipe keys for them are no longer reported unsupported.
+
+### Fixed
+
+- The `course_degrees` doc: 0 is the spec's unknown course, 360 is north, 1-360 is a known course (it said 1-360).
+
 ## 0.4.0
 
 The encoder writes exactly the bytes the vectors' Encoding rule gives, which the vectors now check byte for byte (packet-net/aprs-vectors, exact bytes batch 1, rulings E1-E12).
