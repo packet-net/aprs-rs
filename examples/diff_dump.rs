@@ -325,7 +325,7 @@ macro_rules! positioned {
         if let Some(s) = symbol(args.text("symbol")?)? {
             b = b.symbol(s);
         }
-        if let Some(c) = args.whole::<u16>("course_degrees", "whole degrees")? {
+        if let Some(c) = args.float("course_degrees")? {
             b = b.course(c);
         }
         if args.has("speed_knots") && args.has("speed_kmh") {
@@ -509,14 +509,14 @@ fn build(input: &Value) -> Built<Packet> {
             let mut b = station.telemetry(args.whole::<u16>("sequence", "a number 0-65535")?.unwrap_or(0));
             if let Some(a) = args.get("analog") {
                 let Some(a) = a.as_array() else { return unsupported("analog: not a list") };
-                // The channels not given are sent empty, so only trailing ones can be left out.
+                // A channel may be empty on its own, and the ones not given are sent empty.
                 let given = a.iter().rposition(|v| !v.is_null()).map_or(0, |i| i + 1);
                 let values = a[..given]
                     .iter()
-                    .map(Value::as_f64)
-                    .collect::<Option<Vec<f64>>>()
-                    .ok_or_else(|| NotBuilt::Unsupported("analog: the builder sends only the last channels empty".into()))?;
-                b = b.analog(&values);
+                    .map(|v| if v.is_null() { Ok(None) } else { v.as_f64().map(Some).ok_or(()) })
+                    .collect::<Result<Vec<Option<f64>>, ()>>()
+                    .map_err(|()| NotBuilt::Unsupported("analog: not a number".into()))?;
+                b = b.channels(&values);
             }
             if let Some(bits) = args.text("bits")? {
                 b = b.digital(bit_byte(bits).ok_or_else(|| NotBuilt::Unsupported("bits: the builder takes eight 0 or 1".into()))?);
@@ -751,11 +751,12 @@ fn weather(station: &Station, args: &Args) -> Built<Packet> {
     if let Some(t) = timestamp(args)? {
         b = b.timestamp(t);
     }
-    match (args.whole::<u16>("wind_direction_degrees", "whole degrees")?, args.float("wind_speed_mph")?) {
+    match (args.float("wind_direction_degrees")?, args.float("wind_speed_mph")?) {
         (Some(d), Some(s)) => b = b.wind(d, s),
+        (Some(d), None) => b = b.wind_direction(d),
+        // The speed alone goes in with observations(), before everything else.
+        (None, Some(s)) => b = b.observations(Weather { wind_speed_mph: Some(s), ..Weather::default() }),
         (None, None) => {}
-        // wind() takes both; one alone goes in with observations(), before everything else.
-        (d, s) => b = b.observations(Weather { wind_direction_degrees: d, wind_speed_mph: s, ..Weather::default() }),
     }
     if let Some(g) = args.float("wind_gust_mph")? {
         b = b.gust(g);
@@ -786,13 +787,13 @@ fn weather(station: &Station, args: &Args) -> Built<Packet> {
             b = set_mm(b, v);
         }
     }
-    if let Some(h) = args.whole::<u8>("humidity_percent", "whole percent")? {
+    if let Some(h) = args.float("humidity_percent")? {
         b = b.humidity(h);
     }
     if let Some(p) = args.float("pressure_mbar")? {
         b = b.pressure(p);
     }
-    if let Some(l) = args.whole::<u16>("luminosity_w_m2", "whole W/m2")? {
+    if let Some(l) = args.float("luminosity_w_m2")? {
         b = b.luminosity(l);
     }
     if let Some(s) = args.float("snow_24h_in")? {

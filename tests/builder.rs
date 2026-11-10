@@ -352,3 +352,46 @@ fn named_symbols_and_overlays() {
     assert_eq!(Symbol::CAR.with_overlay('I'), None);
     assert_eq!(Symbol::GATEWAY.with_overlay('a'), None);
 }
+
+#[test]
+fn a_fractional_course_is_rounded_once_to_its_step() {
+    // Whole degrees uncompressed: 88.5 is 89 (halves away from zero), 301.7 is 302.
+    assert!(sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course(88.5).speed(36.0).build().unwrap()).contains("089/036"));
+    // Compressed, 4-degree steps: 301.7 is the step nearest 301.7, 300, not the nearest to 302 (304).
+    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course(301.7).speed(36.0).build().unwrap());
+    let Data::Position(report) = heard(&line) else { panic!("{line}") };
+    assert_eq!(report.fields.course_degrees, Some(300));
+    // 359 is the step at north, 360; 1.2 is also the step at north, not the unknown course.
+    for course in [359.0, 1.2] {
+        let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course(course).speed(36.0).build().unwrap());
+        let Data::Position(report) = heard(&line) else { panic!("{line}") };
+        assert_eq!(report.fields.course_degrees, Some(360));
+    }
+    // A course that rounds to 0 whole degrees is unknown: refused compressed, 000 otherwise.
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course(0.3).speed(36.0).build().is_err());
+    // Outside the field once rounded.
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course(360.5).speed(36.0).build().is_err());
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course(f64::NAN).speed(36.0).build().is_err());
+}
+
+#[test]
+fn fractional_weather_values_are_rounded_once() {
+    let wx = me().weather().timestamp(Timestamp::mdhm(10, 9, 23, 59));
+    let line = sent(wx.clone().wind(89.5, 5.0).humidity(99.7).luminosity(412.4).temperature(72.0).build().unwrap());
+    assert!(line.contains("c090") && line.contains("h00") && line.contains("L412"), "{line}");
+    let line = sent(me().weather().at(51.4543, -0.9781).compressed().wind(301.7, 5.0).build().unwrap());
+    let Data::Position(report) = heard(&line) else { panic!("{line}") };
+    assert_eq!(report.fields.weather.unwrap().wind_direction_degrees, Some(300));
+    // A humidity that rounds to 0 is refused, since h00 is 100 percent.
+    assert!(wx.clone().humidity(0.4).build().is_err());
+    assert!(wx.humidity(100.6).build().is_err());
+}
+
+#[test]
+fn a_telemetry_channel_can_be_empty_on_its_own() {
+    let wx = me();
+    assert_eq!(
+        sent(wx.telemetry(7).channels(&[None, Some(1.5), None, Some(3.0), None]).build().unwrap()),
+        "M0LTE>APZ001:T#007,,1.5,,003,,00000000"
+    );
+}

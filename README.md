@@ -76,6 +76,8 @@ assert!(Packet::decode_tnc2(line, options)?.has_errors());
 
 Start from your station and say what the packet is. `build()` gives the encoded [`Packet`], and `to_data()` the [`Data`] alone.
 
+A course, wind direction, humidity or luminosity may be fractional; it is rounded once to the step the report holds (4 degrees for a compressed course), and a telemetry channel may be empty on its own (`channels`).
+
 ```rust
 use pdn_aprs::{Station, Symbol, Timestamp};
 
