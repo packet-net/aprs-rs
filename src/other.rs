@@ -278,33 +278,38 @@ pub(crate) fn query(ctx: &mut Context, info: &[u8]) -> Option<Data> {
     Some(Data::Query(Query { query_type: String::from_utf8_lossy(query_type).into_owned(), footprint }))
 }
 
+/// The latitude and longitude as sent, and the radius.
 fn footprint(rest: &[u8]) -> Option<Footprint> {
     let text = core::str::from_utf8(rest).ok()?;
     let parts: Vec<&str> = text.split(',').collect();
     if parts.len() != 3 {
         return None;
     }
-    // Degrees as a decimal number, with a minus sign or, only for a positive value, a leading
-    // space ("Note the leading space in the latitude, as its value is positive", APRS12c ch. 15).
-    let signed = |t: &str, limit: f64| -> Option<f64> {
-        let (t, digits) = match t.strip_prefix(' ') {
-            Some(positive) => (positive, positive),
-            None => (t, t.strip_prefix('-').unwrap_or(t)),
-        };
-        let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
-        if (whole.is_empty() && fraction.is_empty())
-            || !whole.bytes().all(|b| b.is_ascii_digit())
-            || !fraction.bytes().all(|b| b.is_ascii_digit())
-        {
-            return None;
-        }
-        t.parse::<f64>().ok().filter(|v| v.abs() <= limit)
-    };
+    footprint_degrees(parts[0], 90.0)?;
+    footprint_degrees(parts[1], 180.0)?;
     let radius = parts[2];
     if radius.len() != 4 || !radius.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    Some(Footprint { latitude: signed(parts[0], 90.0)?, longitude: signed(parts[1], 180.0)?, radius_miles: radius.parse().ok()? })
+    Some(Footprint { latitude: parts[0].to_string(), longitude: parts[1].to_string(), radius_miles: radius.parse().ok()? })
+}
+
+/// A footprint's degrees: a decimal number, with a minus sign or, only for a positive value, a
+/// leading space ("Note the leading space in the latitude, as its value is positive", APRS12c ch.
+/// 15), within `limit` either way.
+pub(crate) fn footprint_degrees(t: &str, limit: f64) -> Option<f64> {
+    let (t, digits) = match t.strip_prefix(' ') {
+        Some(positive) => (positive, positive),
+        None => (t, t.strip_prefix('-').unwrap_or(t)),
+    };
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    if (whole.is_empty() && fraction.is_empty())
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    t.parse::<f64>().ok().filter(|v| v.abs() <= limit)
 }
 
 /// `TOKEN,TOKEN=VALUE,...`.
@@ -447,13 +452,15 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             out.push(b'?');
             out.extend_from_slice(q.query_type.as_bytes());
             out.push(b'?');
-            if let Some(f) = q.footprint {
-                if !(-90.0..=90.0).contains(&f.latitude) || !(-180.0..=180.0).contains(&f.longitude) || f.radius_miles > 9999 {
-                    return Err(EncodeError::new("a query footprint is within -90..90, -180..180 and a radius of up to 9999 miles"));
+            if let Some(f) = &q.footprint {
+                // The numbers are written as they are held, as telemetry values are (vectors
+                // README, "Numbers as sent").
+                if f.latitude_degrees().is_none() || f.longitude_degrees().is_none() || f.radius_miles > 9999 {
+                    return Err(EncodeError::new(
+                        "a query footprint is decimal degrees within -90..90 and -180..180 (a leading space only before a positive value) and a radius of up to 9999 miles",
+                    ));
                 }
-                // A space only before a positive value; a negative one (-0 included) has its sign.
-                let signed = |v: f64| if v.is_sign_negative() { format!("{v}") } else { format!(" {v}") };
-                out.extend_from_slice(format!("{},{},{:04}", signed(f.latitude), signed(f.longitude), f.radius_miles).as_bytes());
+                out.extend_from_slice(format!("{},{},{:04}", f.latitude, f.longitude, f.radius_miles).as_bytes());
             }
         }
         Data::Capabilities(c) => {

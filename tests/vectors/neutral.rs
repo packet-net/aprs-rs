@@ -214,8 +214,11 @@ pub fn data(d: &Data) -> Value {
         Data::Query(q) => {
             let mut o = Obj::new("query");
             o.put("query_type", json!(q.query_type));
-            if let Some(f) = q.footprint {
-                o.put("footprint", json!({"latitude": f.latitude, "longitude": f.longitude, "radius_miles": f.radius_miles}));
+            if let Some(f) = &q.footprint {
+                o.put(
+                    "footprint",
+                    json!({"latitude": f.latitude_degrees(), "longitude": f.longitude_degrees(), "radius_miles": f.radius_miles}),
+                );
             }
             o.done()
         }
@@ -502,10 +505,12 @@ pub fn read_data(v: &Value) -> Data {
         "maidenhead-beacon" => Data::MaidenheadBeacon(MaidenheadBeacon { locator: string("locator"), comment: string("comment") }),
         "query" => Data::Query(Query {
             query_type: string("query_type"),
-            footprint: o.get("footprint").map(|f| Footprint {
-                latitude: f["latitude"].as_f64().unwrap(),
-                longitude: f["longitude"].as_f64().unwrap(),
-                radius_miles: f["radius_miles"].as_u64().unwrap() as u32,
+            footprint: o.get("footprint").map(|f| {
+                Footprint::new(
+                    f["latitude"].as_f64().unwrap(),
+                    f["longitude"].as_f64().unwrap(),
+                    f["radius_miles"].as_u64().unwrap() as u32,
+                )
             }),
         }),
         "capabilities" => Data::Capabilities(Capabilities {
