@@ -77,6 +77,14 @@ fn ambiguity_blanks_digits() {
 }
 
 #[test]
+fn a_dao_on_a_compressed_position_follows_the_position_reported() {
+    // The digits a decoder ignores on a compressed position are those of the compressed position,
+    // not of the one given: `f9` here, where the position given would have `f8`.
+    let line = sent(me().position(57.45846, -17.883209).symbol(Symbol::CAR).compressed().dao().build().unwrap());
+    assert!(line.ends_with("!wf9!"), "{line}");
+}
+
+#[test]
 fn messages() {
     assert_eq!(sent(me().message("G3NRW", "Hi Ian").id("01").build().unwrap()), "M0LTE>APZ001::G3NRW    :Hi Ian{01");
     assert_eq!(sent(me().message("G3NRW", "Hi Ian").id("02").reply_ack("17").build().unwrap()), "M0LTE>APZ001::G3NRW    :Hi Ian{02}17");
@@ -108,6 +116,22 @@ fn an_object_announcing_a_repeater() {
         .tone(118.8)
         .offset_khz(-600);
     assert_eq!(sent(repeater.build().unwrap()), "M0LTE>APZ001:;MYRPTR   *251830z5127.00N/00058.80Wr145.725MHz T118 -060");
+}
+
+#[test]
+fn a_voice_frequency_comes_first_in_the_comment() {
+    // Radios read the frequency in the first bytes of the comment (APRS12c ch. 18). After a data
+    // extension it follows a `/`, which a PHGR already ends in; the altitude and the text come after.
+    let at = (49.0 + 3.50 / 60.0, -(72.0 + 1.75 / 60.0));
+    let phg = Phg { power: 5, height: 1, gain: 3, directivity: 2, beacons_per_hour: None };
+    let repeater = me().position(at.0, at.1).symbol(Symbol::REPEATER).frequency(146.52).tone(100.0).altitude(1234.0).comment("Net 8pm");
+    assert_eq!(sent(repeater.clone().build().unwrap()), "M0LTE>APZ001:!4903.50N/07201.75Wr146.520MHz T100/A=001234 Net 8pm");
+    assert_eq!(
+        sent(repeater.clone().phg(phg).build().unwrap()),
+        "M0LTE>APZ001:!4903.50N/07201.75WrPHG5132/146.520MHz T100/A=001234 Net 8pm"
+    );
+    let phgr = Phg { beacons_per_hour: Some(4), ..phg };
+    assert_eq!(sent(repeater.phg(phgr).build().unwrap()), "M0LTE>APZ001:!4903.50N/07201.75WrPHG51324/146.520MHz T100/A=001234 Net 8pm");
 }
 
 #[test]
