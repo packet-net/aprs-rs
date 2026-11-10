@@ -333,15 +333,26 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         Some(true) => (9100.0, 91),
     };
 
-    // Latitude digits into the destination, blanked for ambiguity.
-    let half_box = [0.0, 0.05, 0.5, 5.0, 30.0][p.ambiguity as usize];
-    let mut lat_units = libm::round((p.latitude.abs() * 60.0 - half_box).max(0.0) * per_minute) as u64;
+    // Latitude digits into the destination, blanked for ambiguity: rounding then blanking keeps the
+    // box the position is in, and a decoded position (the centre of its box) writes back the same
+    // digits.
+    let mut lat_units = libm::round(p.latitude.abs() * 60.0 * per_minute) as u64;
     let lat_extra = (lat_units % extra_base) as u8;
     lat_units /= extra_base;
+    // The box, in hundredths of a minute, that each level of ambiguity blanks.
+    let box_size = [1u64, 10, 100, 1000, 6000][p.ambiguity as usize];
+    if p.ambiguity > 0 && lat_units / box_size * box_size + box_size / 2 > 90 * 6000 {
+        return Err(EncodeError::new("an ambiguous latitude whose box is centred past 90 degrees cannot be sent"));
+    }
     let lat_text = format!("{:02}{:02}{:02}", lat_units / 6000, lat_units % 6000 / 100, lat_units % 100);
     let mut lon_units = libm::round(p.longitude.abs() * 60.0 * per_minute) as u64;
     let lon_extra = (lon_units % extra_base) as u8;
     lon_units /= extra_base;
+    // The longitude digits the ambiguity makes a decoder ignore hold the centre it reports (vectors
+    // README, Mic-E).
+    if p.ambiguity > 0 {
+        lon_units = lon_units / box_size * box_size + box_size / 2;
+    }
     let lon_deg = (lon_units / 6000) as u32;
     let lon_min = (lon_units % 6000 / 100) as u32;
     let lon_hun = (lon_units % 100) as u32;
@@ -392,8 +403,16 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     if course > 360 {
         return Err(EncodeError::new("course must be 0-360 degrees"));
     }
-    // The encodings the spec's own examples use: speed tens from 'l', course hundreds + 4.
-    out.push((if speed < 200 { 108 + speed / 10 } else { 28 + speed / 10 }) as u8);
+    // A course of 0 is how Mic-E sends no course, so it would read back as none.
+    if f.course_degrees == Some(0) {
+        return Err(EncodeError::new(
+            "a Mic-E course of 0 means an unknown course (APRS12c ch. 10), so it cannot be sent: due north is 360",
+        ));
+    }
+    // The printable forms APRS12c ch. 10 allows, as its own examples use them: speed tens + 80 from
+    // 'l' below 190 knots, then '/' for 190-199 (the other form is DEL, a control character), and
+    // course hundreds + 4.
+    out.push((if speed < 190 { 108 + speed / 10 } else { 28 + speed / 10 }) as u8);
     out.push((32 + (speed % 10) * 10 + course / 100) as u8);
     out.push((28 + course % 100) as u8);
     out.push(f.symbol.code as u8);
@@ -468,7 +487,7 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     } else if let Some(dfs) = f.dfs {
         encode::dfs_codes(&mut out, dfs)?;
     }
-    let extension = out.len() > before_extension;
+    let after_extension = (out.len() > before_extension).then_some(out.len());
     if let Some(feet) = altitude_in_text {
         let n = libm::round(feet);
         if !(-99_999.0..=999_999.0).contains(&n) {
@@ -482,7 +501,9 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     }
 
     if let Some(fr) = &f.frequency {
-        if extension {
+        // Straight after a data extension, a `/` (a PHGR already ends in one), as in a position's
+        // comment; after a /A= altitude, straight on.
+        if after_extension == Some(out.len()) && out.last() != Some(&b'/') {
             out.push(b'/');
         }
         encode::frequency(&mut out, fr)?;
@@ -510,7 +531,17 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
 
     let text_at = out.len();
     let needs_space = !text.is_empty() && f.frequency.is_some();
-    let separators: &[&[u8]] = if needs_space { &[b" ", b"", b" /"] } else { &[b"", b"/"] };
+    // Status text that would start with a type code character or 0x1D (Rev 0 telemetry) is written
+    // after a `/`, even when it would read back without one (vectors README, Encoding). Only the
+    // start of the status text counts: after a type code or telemetry, it is written straight on.
+    let status_starts_with_code = text_at == status_start && matches!(text.first(), Some(b'`' | b'\'' | b'>' | b']' | b' ' | 0x1D));
+    let separators: &[&[u8]] = if needs_space {
+        &[b" ", b"", b" /"]
+    } else if status_starts_with_code {
+        &[b"/"]
+    } else {
+        &[b"", b"/"]
+    };
     for separator in separators {
         out.truncate(text_at);
         out.extend_from_slice(separator);
@@ -550,6 +581,7 @@ fn reads_back(r: &MicEReport, status_bytes: &[u8]) -> bool {
         && a.telemetry == b.telemetry
         && a.dao.map(|d| d.datum) == b.dao.map(|d| d.datum)
         && freq(&a.frequency) == freq(&b.frequency)
-        && close(a.altitude_feet, b.altitude_feet)
+        // A /A= altitude is whole feet, rounded as a position's is.
+        && (close(a.altitude_feet, b.altitude_feet) || a.altitude_feet.map(libm::round) == b.altitude_feet.map(libm::round))
         && a.range_miles.map(libm::round) == b.range_miles.map(libm::round)
 }

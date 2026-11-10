@@ -77,6 +77,17 @@ fn ambiguity_blanks_digits() {
 }
 
 #[test]
+fn a_mic_e_longitude_holds_the_centre_where_ambiguity_ignores_it() {
+    // 83 degrees 34.494 minutes west; ambiguity 2 makes a decoder ignore the tenths and hundredths,
+    // so they hold the centre it reports, 34.50 (vectors README, Mic-E): hundredths 50 + 28, `N`.
+    let line = sent(me().mic_e(32.525, -83.5749).ambiguity(2).symbol(Symbol::CAR).build().unwrap());
+    let info = &line.as_bytes()[line.find(':').unwrap() + 1..];
+    assert_eq!(&info[1..4], b"o>N", "{line}");
+    let Data::MicE(report) = heard(&line) else { panic!("{line}") };
+    assert!((report.fields.position.longitude + (83.0 + 34.5 / 60.0)).abs() < 1e-9);
+}
+
+#[test]
 fn a_dao_on_a_compressed_position_follows_the_position_reported() {
     // The digits a decoder ignores on a compressed position are those of the compressed position,
     // not of the one given: `f9` here, where the position given would have `f8`.
@@ -264,6 +275,9 @@ fn what_the_spec_forbids_is_refused_when_built() {
     let phg = Phg { power: 5, height: 3, gain: 6, directivity: 0, beacons_per_hour: None };
     assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().phg(phg).build().is_err());
     assert!(me().telemetry(1).analog(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).build().is_err());
+    // Mic-E sends an unknown course as 0 (APRS12c ch. 10), so north is 360.
+    assert!(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).course(0).build().is_err());
+    assert!(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).course(360).build().is_ok());
 }
 
 #[test]
