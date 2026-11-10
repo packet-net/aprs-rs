@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 The encoder writes exactly the bytes the vectors' Encoding rule gives, which the vectors now check byte for byte (packet-net/aprs-vectors, exact bytes batch 1, rulings E1-E12).
 
