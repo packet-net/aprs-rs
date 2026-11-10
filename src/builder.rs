@@ -269,10 +269,11 @@ impl Common {
             });
         }
         if let Some(course) = self.course {
-            let mut rounded = degrees(course, if fields.compressed { 4.0 } else { 1.0 }, "course")?;
-            // A compressed course of 1 or 2 degrees is the step at north, 360 (the cs bytes' c of 0), not
-            // the unknown course, which only a value that rounds to 0 whole degrees is.
-            if rounded == 0 && fields.compressed && degrees(course, 1.0, "course")? != 0 {
+            // Whether a course is unknown (0) or in range (1-360) is decided in whole degrees; a known
+            // course is then rounded once to the field's step. A compressed 1.2 is the step at north, 360.
+            let whole = degrees(course, 1.0, "course")?;
+            let mut rounded = if fields.compressed { degrees(course, 4.0, "course")? } else { whole };
+            if rounded == 0 && whole != 0 {
                 rounded = 360;
             }
             fields.course_degrees = Some(rounded);

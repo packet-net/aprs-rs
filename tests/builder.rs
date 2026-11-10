@@ -395,3 +395,36 @@ fn a_telemetry_channel_can_be_empty_on_its_own() {
         "M0LTE>APZ001:T#007,,1.5,,003,,00000000"
     );
 }
+
+#[test]
+fn the_compressed_course_band_is_decided_in_whole_degrees() {
+    let car = || me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().speed(36.0);
+    let course = |c: f64| {
+        let line = sent(car().course(c).build().unwrap());
+        let Data::Position(r) = heard(&line) else { panic!("{line}") };
+        r.fields.course_degrees
+    };
+    // Halves of the 4-degree step go away from zero.
+    assert_eq!(course(2.0), Some(4));
+    assert_eq!(course(302.0), Some(304));
+    assert_eq!(course(1.2), Some(360));
+    assert_eq!(course(360.4), Some(360));
+    for bad in [0.3, -0.7, 360.6, 361.0] {
+        assert!(car().course(bad).build().is_err(), "{bad}");
+    }
+}
+
+#[test]
+fn weather_halves_and_the_direction_alone() {
+    let wx = || me().weather().timestamp(Timestamp::mdhm(10, 9, 23, 59)).temperature(72.0);
+    assert!(sent(wx().humidity(0.5).build().unwrap()).contains("h01"));
+    assert!(sent(wx().wind_direction(120.0).build().unwrap()).contains("c120"));
+    // A compressed report carries the direction and speed together.
+    assert!(me().weather().at(51.4543, -0.9781).compressed().wind_direction(120.0).build().is_err());
+    // observations() replaces what was set before, the direction, humidity and luminosity included.
+    let line =
+        sent(wx().wind_direction(120.0).humidity(50.0).luminosity(300.0).observations(pdn_aprs::Weather::default()).build().unwrap());
+    assert!(!line.contains("c120") && !line.contains("h50") && !line.contains("L300"), "{line}");
+    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course(359.5).speed(1.0).build().unwrap());
+    assert!(line.contains("360/001"), "{line}");
+}
