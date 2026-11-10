@@ -197,6 +197,11 @@ fn lift_telemetry_and_dao(ctx: &mut Context, fields: &mut Positioned, c: &mut Ve
     true
 }
 
+/// Where the `!DAO!` [`tail`] would lift out of `c` is.
+pub(crate) fn dao_span(c: &[u8]) -> Option<core::ops::Range<usize>> {
+    find_dao(c, find_telemetry(c).map(|t| t.0), None).map(|d| d.0)
+}
+
 /// `c` with its base-91 telemetry and `!DAO!` taken out, as [`tail`] would lift them.
 pub(crate) fn without_telemetry_and_dao(c: &[u8]) -> Vec<u8> {
     let telemetry = find_telemetry(c).map(|t| t.0);

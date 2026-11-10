@@ -253,6 +253,15 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
                 report.fields.altitude_feet = altitude(&s[i..]);
                 s.drain(i..i + 4);
                 joined = Some(i);
+            } else if comment::dao_span(&s).is_some_and(|d| d.start < i + 4 && i < d.end) {
+                // Strictly the altitude is text, but a !DAO! that shares a byte with it is not
+                // one (vectors README, Mic-E), so that reading is not the packet's: rejected.
+                ctx.error(
+                    Code::MicEAltitudeNotFirst,
+                    "a Mic-E altitude after other status text shares a byte with a !DAO! (APRS12c ch. 10)",
+                    Some(offset + i),
+                );
+                return false;
             }
         }
     }

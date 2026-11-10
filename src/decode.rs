@@ -64,10 +64,11 @@ fn not_aprs(ctx: &mut Context, info: &[u8]) -> Data {
     let limit = info.len().min(BEACON_POSITION_LIMIT);
     if let Some(i) = info[..limit].iter().position(|&b| b == b'!') {
         if ctx.options.tolerates(Code::PositionNotAtStart) {
+            // In reading order: the position's own diagnostics come after the one that finds it.
             let mut trial = ctx.clone();
+            trial.warn(Code::PositionNotAtStart, "a ! position found after other text (obsolete TNC beacon rule)", Some(i));
             if let Some(data) = position_report(&mut trial, &info[i..], i) {
                 *ctx = trial;
-                ctx.warn(Code::PositionNotAtStart, "a ! position found after other text (obsolete TNC beacon rule)", Some(i));
                 return data;
             }
         }
