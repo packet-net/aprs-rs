@@ -793,7 +793,7 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
         }),
         "weather" => Data::Weather(WeatherReport {
             timestamp: read_timestamp(&o)?,
-            weather: read_weather(&o)?.unwrap_or_default(),
+            weather: read_weather(&o, false)?.unwrap_or_default(),
             comment: o.text("comment")?,
         }),
         "raw-weather" => Data::RawWeather(RawWeather {
@@ -1021,6 +1021,10 @@ const COLORS: [(&str, AreaColor); 16] = [
 ];
 
 fn read_positioned(o: &Keys) -> Read<Positioned> {
+    // A compressed course or wind direction is written in 4-degree steps, so rounding one here to
+    // whole degrees first would round it twice (41.6 would be 42, then 44, not 40): a fractional
+    // one is not something this crate's whole-degree types hold.
+    let compressed = o.flag("compressed")?;
     Ok(Positioned {
         position: Position {
             latitude: o.required_float("latitude")?,
@@ -1058,7 +1062,7 @@ fn read_positioned(o: &Keys) -> Read<Positioned> {
                 )?,
             }),
         },
-        course_degrees: o.stepped("course_degrees")?,
+        course_degrees: if compressed { o.int("course_degrees")? } else { o.stepped("course_degrees")? },
         speed_knots: o.float("speed_knots")?,
         altitude_feet: o.float("altitude_feet")?,
         phg: match o.object("phg", &["power", "height", "gain", "directivity", "beacons_per_hour"])? {
@@ -1181,13 +1185,13 @@ fn read_positioned(o: &Keys) -> Read<Positioned> {
                 ten_khz_resolution: f.flag("ten_khz_resolution")?,
             }),
         },
-        weather: read_weather(o)?,
+        weather: read_weather(o, compressed)?,
         signpost: o.string("signpost")?,
         comment: o.text("comment")?,
     })
 }
 
-fn read_weather(o: &Keys) -> Read<Option<Weather>> {
+fn read_weather(o: &Keys, compressed: bool) -> Read<Option<Weather>> {
     let Some(w) = o.object(
         "weather",
         &[
@@ -1222,7 +1226,7 @@ fn read_weather(o: &Keys) -> Read<Option<Weather>> {
             .collect::<Read<Vec<WeatherField>>>()?,
     };
     Ok(Some(Weather {
-        wind_direction_degrees: w.stepped("wind_direction_degrees")?,
+        wind_direction_degrees: if compressed { w.int("wind_direction_degrees")? } else { w.stepped("wind_direction_degrees")? },
         wind_speed_mph: w.float("wind_speed_mph")?,
         wind_gust_mph: w.float("wind_gust_mph")?,
         temperature_f: w.float("temperature_f")?,
