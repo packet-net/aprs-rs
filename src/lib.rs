@@ -32,10 +32,10 @@ mod weather;
 
 pub use builder::{
     AckBuilder, DEFAULT_DESTINATION, DataBuilder, ItemBuilder, MessageBuilder, MicEBuilder, ObjectBuilder, PositionBuilder, Station,
-    StatusBuilder, TelemetryBuilder, WeatherBuilder,
+    StatusBuilder, TelemetryBuilder, TelemetryMetadataBuilder, WeatherBuilder,
 };
 pub use data::*;
-pub use deviceid::{Device, database_version, tocall};
+pub use deviceid::Device;
 pub use diagnostics::{Code, Diagnostic, Severity};
 pub use options::ParseOptions;
 pub use packet::{Address, EncodeError, HeaderError, InvalidAddress, Packet, PathEntry, QConstruct};

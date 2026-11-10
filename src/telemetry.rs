@@ -4,7 +4,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::context::Context;
-use crate::message::is_decimal;
+use crate::message::{is_decimal, telemetry_value};
 use crate::{Code, Data, EncodeError, ParseOptions, Telemetry, text};
 
 pub(crate) fn report(ctx: &mut Context, info: &[u8]) -> Option<Data> {
@@ -38,8 +38,14 @@ pub(crate) fn report(ctx: &mut Context, info: &[u8]) -> Option<Data> {
     while t.analog.len() < 5 {
         let end = body[at..].iter().position(|&b| b == b',').map_or(body.len(), |i| at + i);
         match core::str::from_utf8(&body[at..end]) {
-            Ok("") => t.analog.push(None),
-            Ok(v) if is_decimal(v) => t.analog.push(Some(String::from(v))),
+            Ok("") => {
+                t.analog.push(None);
+                t.analog_text.push(String::new());
+            }
+            Ok(v) if is_decimal(v) => {
+                t.analog.push(Some(v.parse().unwrap_or(0.0)));
+                t.analog_text.push(String::from(v));
+            }
             _ => {
                 ctx.error(Code::InvalidTelemetry, "a telemetry value is not a number (APRS12c ch. 13)", Some(2 + at));
                 return None;
@@ -72,7 +78,7 @@ pub(crate) fn report(ctx: &mut Context, info: &[u8]) -> Option<Data> {
 pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
     let seq_ok = !t.sequence.is_empty() && t.sequence.bytes().all(|b| b.is_ascii_alphanumeric());
     let bits_ok = t.bits.as_ref().is_some_and(|b| b.len() == 8 && b.bytes().all(|x| x == b'0' || x == b'1'));
-    if !seq_ok || t.analog.len() != 5 || !bits_ok || !t.analog.iter().flatten().all(|v| is_decimal(v)) {
+    if !seq_ok || t.analog.len() != 5 || !bits_ok {
         return Err(EncodeError::new("a telemetry report carries 5 analog values and the 8 digital bits (APRS12c ch. 13)"));
     }
     // No form reads back with the first channel empty after MIC (vectors README, Encoding).
@@ -88,9 +94,10 @@ pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
     if t.sequence != "MIC" {
         out.push(b',');
     }
-    for v in &t.analog {
+    for (i, v) in t.analog.iter().enumerate() {
         if let Some(v) = v {
-            out.extend_from_slice(v.as_bytes());
+            let text = t.analog_text.get(i).map(String::as_str).filter(|t| !t.is_empty());
+            out.extend_from_slice(telemetry_value(*v, text)?.as_bytes());
         }
         out.push(b',');
     }
@@ -99,7 +106,19 @@ pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
     // A sequence that starts MIC but is not MIC would not read back, for one.
     let mut ctx = Context::new(ParseOptions::LENIENT);
     match report(&mut ctx, &out) {
-        Some(Data::Telemetry(back)) if back == *t => Ok(out),
+        Some(Data::Telemetry(back))
+            if back.sequence == t.sequence
+                && back.bits == t.bits
+                && back.comment == t.comment
+                && back.analog.len() == t.analog.len()
+                && back.analog.iter().zip(&t.analog).all(|(x, y)| match (x, y) {
+                    (None, None) => true,
+                    (Some(x), Some(y)) => crate::steps::same_number(*x, *y),
+                    _ => false,
+                }) =>
+        {
+            Ok(out)
+        }
         _ => Err(EncodeError::new("the telemetry report would not read back as given (a sequence starting MIC is MIC itself)")),
     }
 }

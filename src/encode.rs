@@ -11,21 +11,25 @@ use crate::context::Context;
 use crate::position::{self, type_to_bits};
 use crate::weather::{self, push_digits};
 use crate::{
-    CompressionOrigin, CompressionType, DaoPrecision, Data, EncodeError, GpsFix, ItemReport, NmeaSource, ObjectReport, ParseOptions,
-    PositionReport, Positioned, Timestamp, Tone,
+    CompressionFix, CompressionOrigin, CompressionSource, CompressionType, DaoPrecision, Data, EncodeError, ItemReport, ObjectReport,
+    ParseOptions, PositionReport, Positioned, Timestamp, Tone,
 };
 
 impl Data {
     /// The information field for this data. Fails, naming the field, when the data cannot be
-    /// written as APRS12c allows. Mic-E data needs its destination address too: use
-    /// [`crate::Packet::create_mic_e`].
+    /// written as APRS12c allows. Mic-E data is refused, since it carries half its position in
+    /// the destination address: use [`crate::Packet::create`], which works that address out.
     pub fn encode(&self) -> Result<Vec<u8>, EncodeError> {
         let mut out = Vec::new();
         match self {
             Data::Position(r) => position_report(&mut out, r)?,
             Data::Object(o) => object(&mut out, o)?,
             Data::Item(i) => item(&mut out, i)?,
-            Data::MicE(m) => return crate::mic_e::encode(m).map(|(_, info)| info),
+            Data::MicE(_) => {
+                return Err(EncodeError::new(
+                    "Mic-E data carries half its position in the destination address, which this information field leaves out: use Packet::create",
+                ));
+            }
             Data::Message(_)
             | Data::Ack(_)
             | Data::Reject(_)
@@ -302,10 +306,13 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
 fn compressed_cs(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError> {
     let wind = f.weather.as_ref().filter(|w| w.wind_direction_degrees.is_some() || w.wind_speed_mph.is_some());
     let course_speed = f.course_degrees.is_some() || f.speed_knots.is_some();
-    let t =
-        f.compression.unwrap_or(CompressionType { fix: GpsFix::Current, source: NmeaSource::Other, origin: CompressionOrigin::Software });
+    let t = f.compression.unwrap_or(CompressionType {
+        fix: CompressionFix::Current,
+        source: CompressionSource::Other,
+        origin: CompressionOrigin::Software,
+    });
     let log = |x: f64, base: f64| libm::log(x) / libm::log(base);
-    let (c, s, altitude) = if t.source == NmeaSource::Gga {
+    let (c, s, altitude) = if t.source == CompressionSource::Gga {
         // GGA cs bytes are read as an altitude, whatever else was meant.
         let Some(feet) = f.altitude_feet else {
             return Err(EncodeError::new("a GGA compression type carries an altitude in the cs bytes, and there is none"));
@@ -337,11 +344,8 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError>
         let (Some(dir), Some(mph)) = (w.wind_direction_degrees, w.wind_speed_mph) else {
             return Err(EncodeError::new("the cs bytes carry the wind as a direction and a speed together, so both are needed"));
         };
-        if dir > 360 {
-            return Err(EncodeError::new("wind direction must be 0-360 degrees"));
-        }
         let knots = mph / KNOTS_TO_MPH;
-        (direction_code(dir), speed_code(knots)?, false)
+        (direction_code(dir, "wind direction")?, speed_code(knots)?, false)
     } else if let Some(range) = f.range_miles {
         if course_speed {
             return Err(EncodeError::new("the cs bytes carry a course and speed or a range, not both (APRS12c ch. 9)"));
@@ -366,13 +370,13 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError>
         let (Some(course), Some(knots)) = (f.course_degrees, f.speed_knots) else {
             return Err(EncodeError::new("the cs bytes carry a course and a speed together, so a compressed report needs both"));
         };
-        if course == 0 {
+        // Unknown (0) and in range (1-360) are decided in whole degrees; a known course is then rounded
+        // once to the 4-degree step, where the step at north is 360.
+        let whole = whole_degrees(course, "course")?;
+        if whole == 0 {
             return Err(EncodeError::new("a compressed course of 0 would read back as 360, and the cs bytes have no unknown course"));
         }
-        if course > 360 {
-            return Err(EncodeError::new("course must be 0-360 degrees"));
-        }
-        (direction_code(course), speed_code(knots)?, false)
+        (direction_code(course, "course")?, speed_code(knots)?, false)
     } else {
         // No course/speed, range or altitude: the spec's own form for that, which has no type byte.
         if f.compression.is_some() {
@@ -389,10 +393,24 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError>
     Ok(altitude)
 }
 
-/// A course or wind direction in the compressed c byte's 4-degree steps: the nearest step (103
-/// degrees is written as 104), with 360 and 0 both north.
-fn direction_code(degrees: u16) -> u8 {
-    ((u32::from(degrees) + 2) / 4 % 90) as u8
+/// A course or wind direction rounded once to whole degrees, which must be 0-360.
+pub(crate) fn whole_degrees(degrees: f64, what: &str) -> Result<u32, EncodeError> {
+    let rounded = crate::steps::round(degrees);
+    if !(0.0..=360.0).contains(&rounded) {
+        return Err(EncodeError::new(format!("{what} must round to 0-360 degrees")));
+    }
+    Ok(rounded as u32)
+}
+
+/// A course or wind direction in the compressed c byte's 4-degree steps: the nearest step, rounded
+/// once from the value given (103 degrees is written as 104), with 360 and 0 both north. The step
+/// must be 0-360 degrees.
+fn direction_code(degrees: f64, what: &str) -> Result<u8, EncodeError> {
+    let steps = crate::steps::round(degrees / 4.0);
+    if !(0.0..=90.0).contains(&steps) {
+        return Err(EncodeError::new(format!("{what} must round to 0-360 degrees")));
+    }
+    Ok((steps as u32 % 90) as u8)
 }
 
 fn speed_code(knots: f64) -> Result<u8, EncodeError> {
@@ -423,13 +441,15 @@ fn three(out: &mut Vec<u8>, v: Option<u32>, max: u32, what: &str) -> Result<(), 
 /// Writes the 7-byte data extension of an uncompressed position; `true` if there is one.
 fn uncompressed_extension(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError> {
     if let Some(w) = f.weather.as_ref() {
-        three(out, w.wind_direction_degrees.map(u32::from), 360, "wind direction")?;
+        let direction = w.wind_direction_degrees.map(|d| whole_degrees(d, "wind direction")).transpose()?;
+        three(out, direction, 360, "wind direction")?;
         out.push(b'/');
         three(out, whole(w.wind_speed_mph, "wind speed")?, 999, "wind speed")?;
         return Ok(true);
     }
     if f.course_degrees.is_some() || f.speed_knots.is_some() || f.df_bearing.is_some() || f.storm.is_some() {
-        three(out, f.course_degrees.map(u32::from), 360, "course")?;
+        let course = f.course_degrees.map(|c| whole_degrees(c, "course")).transpose()?;
+        three(out, course, 360, "course")?;
         out.push(b'/');
         three(out, whole(f.speed_knots, "speed")?, 999, "speed")?;
         if let Some(b) = f.df_bearing {

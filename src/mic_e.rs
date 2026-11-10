@@ -139,7 +139,7 @@ pub(crate) fn decode(ctx: &mut Context, destination: &Address, info: &[u8]) -> O
     }
     let course = match course {
         0 => None,
-        1..=360 => Some(course as u16),
+        1..=360 => Some(f64::from(course)),
         _ => {
             if !ctx.tolerate(Code::OutOfRangeValue, "a Mic-E course over 360 degrees was dropped", Some(5)) {
                 return None;
@@ -150,7 +150,7 @@ pub(crate) fn decode(ctx: &mut Context, destination: &Address, info: &[u8]) -> O
 
     let symbol = position::symbol(ctx, info[8], info[7], 8, 7, false)?;
     let mut report = MicEReport {
-        message,
+        mic_e_message: message,
         old_data,
         destination_ssid: destination.ssid(),
         fields: Positioned {
@@ -266,7 +266,11 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
             }
         }
     }
-    comment::tail(ctx, &mut report.fields, &s, offset, joined)
+    let altitude_before = report.fields.altitude_feet;
+    let ok = comment::tail(ctx, &mut report.fields, &s, offset, joined);
+    // A `/A=` in the text wins over the Mic-E bytes, so an altitude that changed (or came) there is one.
+    report.altitude_in_comment = report.fields.altitude_feet.is_some() && report.fields.altitude_feet != altitude_before;
+    ok
 }
 
 /// Whether the text left once base-91 telemetry and the `!DAO!` are lifted out of `s` holds a
@@ -285,12 +289,6 @@ fn joins_into_altitude(s: &[u8]) -> bool {
         joins.push(r.start - before);
     }
     joins.iter().any(|&join| (join.saturating_sub(3)..join).any(|j| altitude(&rest[j..]).is_some()))
-}
-
-/// Whether two numbers are the same value, as the vectors compare them: within 1e-9, relative
-/// for values of 1 or more.
-fn same_number(x: f64, y: f64) -> bool {
-    (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0)
 }
 
 /// A Mic-E altitude, `xxx}`, at the start of `s`, in feet.
@@ -321,14 +319,10 @@ fn locator_len(s: &[u8]) -> Option<usize> {
 
 // ------------------------------------------------------------------ encoding
 
-/// The destination address and information field for a Mic-E report.
+/// The destination address and information field for a Mic-E report. An altitude goes in the
+/// Mic-E altitude bytes (whole metres) unless the report says it is in the comment, as `/A=` feet
+/// (vectors README, Builder rules).
 pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> {
-    encode_with(r, false)
-}
-
-/// As [`encode`]; with `feet_in_text`, an altitude goes in a `/A=` even when it is whole metres
-/// (a builder's altitude given in feet, vectors README, Builder rules).
-pub(crate) fn encode_with(r: &MicEReport, feet_in_text: bool) -> Result<(Address, Vec<u8>), EncodeError> {
     let f = &r.fields;
     position::check_symbol(f.symbol)?;
     let p = f.position;
@@ -347,7 +341,7 @@ pub(crate) fn encode_with(r: &MicEReport, feet_in_text: bool) -> Result<(Address
     if r.destination_ssid > 15 {
         return Err(EncodeError::new("the destination SSID is 0-15"));
     }
-    let (bits, custom) = match r.message {
+    let (bits, custom) = match r.mic_e_message {
         MicEMessage::Unknown => {
             return Err(EncodeError::new("an unknown Mic-E message code (mixed standard and custom bits) cannot be sent"));
         }
@@ -436,16 +430,19 @@ pub(crate) fn encode_with(r: &MicEReport, feet_in_text: bool) -> Result<(Address
         Some(s) if (0.0..=799.0).contains(&crate::steps::round(s)) => crate::steps::round(s) as u32,
         Some(_) => return Err(EncodeError::new("Mic-E speed is 0-799 knots")),
     };
-    let course = u32::from(f.course_degrees.unwrap_or(0));
-    if course > 360 {
-        return Err(EncodeError::new("course must be 0-360 degrees"));
-    }
-    // A course of 0 is how Mic-E sends no course, so it would read back as none.
-    if f.course_degrees == Some(0) {
-        return Err(EncodeError::new(
-            "a Mic-E course of 0 means an unknown course (APRS12c ch. 10), so it cannot be sent: due north is 360",
-        ));
-    }
+    let course = match f.course_degrees {
+        None => 0,
+        Some(c) => {
+            let whole = encode::whole_degrees(c, "course")?;
+            // A course of 0 is how Mic-E sends no course, so it would read back as none.
+            if whole == 0 {
+                return Err(EncodeError::new(
+                    "a Mic-E course of 0 means an unknown course (APRS12c ch. 10), so it cannot be sent: due north is 360",
+                ));
+            }
+            whole
+        }
+    };
     // The printable forms APRS12c ch. 10 allows, as its own examples use them: speed tens + 80 from
     // 'l' below 190 knots, then '/' for 190-199 (the other form is DEL, a control character), and
     // course hundreds + 4.
@@ -476,7 +473,7 @@ pub(crate) fn encode_with(r: &MicEReport, feet_in_text: bool) -> Result<(Address
     let mut altitude_in_text = None;
     if let Some(feet) = f.altitude_feet {
         let metres = crate::steps::round(feet / METRES_TO_FEET);
-        if feet_in_text || !same_number(metres * METRES_TO_FEET, feet) {
+        if r.altitude_in_comment || !crate::steps::same_number(metres * METRES_TO_FEET, feet) {
             altitude_in_text = Some(feet);
         } else {
             let datum = metres + 10_000.0;
@@ -610,7 +607,7 @@ fn reads_back(r: &MicEReport, status_bytes: &[u8]) -> bool {
     let (a, b) = (&back.fields, &r.fields);
     let close = |x: Option<f64>, y: Option<f64>| match (x, y) {
         (None, None) => true,
-        (Some(x), Some(y)) => same_number(x, y),
+        (Some(x), Some(y)) => crate::steps::same_number(x, y),
         _ => false,
     };
     let freq = |v: &Option<crate::VoiceFrequency>| v.as_ref().map(|x| (x.tone, x.tone_value, x.offset_khz, x.range, x.range_km, x.narrow));

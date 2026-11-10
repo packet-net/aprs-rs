@@ -26,7 +26,7 @@ assert_eq!(packet.q_construct().unwrap().construct, "qAR");
 let Data::Position(report) = &packet.data else { panic!("a position") };
 assert!(report.messaging);
 assert!((report.fields.position.latitude - 51.5).abs() < 1e-9);
-assert_eq!(report.fields.course_degrees, Some(88));
+assert_eq!(report.fields.course_degrees, Some(88.0));
 assert_eq!(report.fields.speed_knots, Some(36.0));
 assert_eq!(report.fields.comment, "Mobile");
 assert!(packet.diagnostics.is_empty());
@@ -76,17 +76,17 @@ assert!(Packet::decode_tnc2(line, options)?.has_errors());
 
 Start from your station and say what the packet is. `build()` gives the encoded [`Packet`], and `to_data()` the [`Data`] alone.
 
-A course, wind direction, humidity or luminosity may be fractional; it is rounded once to the step the report holds (4 degrees for a compressed course), and a telemetry channel may be empty on its own (`channels`).
+A setter has the name of the field it fills (`course_degrees`, `altitude_feet`), and the one that converts changes only the unit (`altitude_m`, `speed_kmh`, `temperature_c`, `rain_1h_mm`). A course, wind direction, humidity or luminosity may be fractional; the encoder rounds it once, to the step the report holds (4 degrees for a compressed course). A telemetry channel may be empty on its own (`analog(&[None, Some(1.5)])`).
 
 ```rust
-use pdn_aprs::{Station, Symbol, Timestamp};
+use pdn_aprs::{Station, Symbol, Timestamp, Tone};
 
 let me = Station::new("M0LTE-9")?.via(&["WIDE1-1", "WIDE2-1"])?;
 
-let beacon = me.position(51.4543, -0.9781).symbol(Symbol::CAR).course(88).speed(36.0).altitude(120.0).comment("Mobile").build()?;
+let beacon = me.position(51.4543, -0.9781).symbol(Symbol::CAR).course_degrees(88.0).speed_knots(36.0).altitude_feet(120.0).comment("Mobile").build()?;
 assert_eq!(beacon.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:!5127.26N/00058.69W>088/036/A=000120Mobile");
 
-let message = me.message("G3NRW", "Hi Ian").id("01").build()?;
+let message = me.message("G3NRW", "Hi Ian").message_id("01").build()?;
 assert_eq!(message.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1::G3NRW    :Hi Ian{01");
 
 let repeater = me
@@ -95,17 +95,17 @@ let repeater = me
     .symbol(Symbol::REPEATER)
     .timestamp(Timestamp::dhm(25, 18, 30))
     .frequency(145.725)
-    .tone(118.8)
+    .tone(Tone::Tone, 118)
     .offset_khz(-600)
     .build()?;
 assert_eq!(repeater.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:;MYRPTR   *251830z5127.00N/00058.80Wr145.725MHz T118 -060");
 
-let weather = me.weather().at(51.45, -0.98).wind(220, 4.0).gust(5.0).temperature(77.0).build()?;
+let weather = me.weather().at(51.45, -0.98).wind_direction_degrees(220.0).wind_speed_mph(4.0).wind_gust_mph(5.0).temperature_f(77.0).build()?;
 assert_eq!(weather.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:!5127.00N/00058.80W_220/004g005t077");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-[`Station`] also starts items, Mic-E reports, acks and rejects, bulletins, status reports, telemetry and its `PARM.`/`UNIT.`/`EQNS.`/`BITS.` metadata. A station is a value, so keep one and build every packet from it. The destination is [`DEFAULT_DESTINATION`], `APZ001` from the experimental range, until you set your own with [`Station::to`]. Values are in the units APRS sends (knots, feet, Fahrenheit, mph), with `speed_kmh`, `altitude_metres`, `temperature_celsius` and the `_mm` rain methods to convert; a value between the steps a field holds is rounded once to the nearest, halves away from zero. A course of 0 is the spec's unknown course, and north is 360. A Mic-E report says whether the station can message with its type code, `` ` `` after `messaging()` and `'` without, and carries an altitude from `altitude_metres` in its own altitude bytes, to the metre. The crate has no clock, so an object or a positionless weather report needs its timestamp given. Every defined symbol has a name ([`Symbol::CAR`], [`Symbol::GATEWAY`]`.with_overlay('I')`), the same names the other implementations use.
+[`Station`] also starts items, Mic-E reports, acks and rejects, bulletins, status reports, telemetry and its `PARM.`/`UNIT.`/`EQNS.`/`BITS.` metadata. A station is a value, so keep one and build every packet from it. The destination is [`DEFAULT_DESTINATION`], `APZ001` from the experimental range, until you set your own with [`Station::to`]. Values are in the units APRS sends (knots, feet, Fahrenheit, mph), with `speed_kmh`, `altitude_m`, `temperature_c` and the `_mm` rain methods to convert; a value between the steps a field holds is rounded once to the nearest, halves away from zero. A course of 0 is the spec's unknown course, and north is 360. A voice frequency takes a tone as a kind and the value as sent (`.tone(Tone::Ctcss, 100)`). A Mic-E report says whether the station can message with its type code, `` ` `` after `messaging()` and `'` without, and carries an altitude from `altitude_m` in its own altitude bytes, to the metre. Telemetry metadata (`telemetry_names` and the three after it) describes the sending station unless you give an `addressee(...)`, as a gateway does for a sensor station. The crate has no clock, so an object or a positionless weather report needs its timestamp given. Every defined symbol has a name ([`Symbol::CAR`], [`Symbol::GATEWAY`]`.with_overlay('I')`), the same names the other implementations use.
 
 ## Encoding
 
@@ -119,7 +119,7 @@ let report = PositionReport {
     fields: Positioned {
         position: Position { latitude: 51.5, longitude: -0.116667, ambiguity: 0 },
         symbol: Symbol::CAR,
-        course_degrees: Some(88),
+        course_degrees: Some(88.0),
         speed_knots: Some(36.0),
         altitude_feet: Some(120.0),
         comment: "Mobile".into(),
@@ -152,20 +152,20 @@ assert_eq!(message.encode()?, b":G3NRW    :Hi Ian{01}");
 
 // What the spec forbids is refused, with the reason.
 let too_long = Data::Message(Message { addressee: "N0CALL".into(), text: "x".repeat(68), ..Message::default() });
-assert!(too_long.encode().unwrap_err().message.contains("67 characters"));
+assert!(too_long.encode().unwrap_err().message().contains("67 characters"));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
 ## Mic-E and device identification
 
-Mic-E carries half its position in the destination address, so it has its own constructor, [`Packet::create_mic_e`], which works out that address. [`Packet::device`] names the sending device or program from the [APRS device identification database](https://github.com/aprsorg/aprs-deviceid): from the Mic-E type code and suffix, or from the destination address for everything else.
+Mic-E carries half its position in the destination address, so [`Packet::create`] works that address out (the destination you pass is not used), and [`Data::encode`] refuses a Mic-E report rather than drop it. [`Packet::device`] names the sending device or program from the [APRS device identification database](https://github.com/aprsorg/aprs-deviceid): from the Mic-E type code and suffix, or from the destination address for everything else.
 
 ```rust
 use pdn_aprs::{Data, Packet, ParseOptions};
 
 let packet = Packet::decode_tnc2(b"N1JCM-9>TRQP7T,WA1PLE-4*:`c'wl|+>/`\"4-}_%", ParseOptions::default())?;
 let Data::MicE(report) = &packet.data else { panic!("Mic-E") };
-assert_eq!(report.fields.course_degrees, Some(215));
+assert_eq!(report.fields.course_degrees, Some(215.0));
 assert_eq!(report.fields.speed_knots, Some(9.0));
 assert_eq!(report.device_suffix, "_%");
 
@@ -173,7 +173,7 @@ let device = packet.device().unwrap();
 assert_eq!((device.vendor, device.model), (Some("Yaesu"), Some("FTM-400DR")));
 
 // And back: the same information field and destination.
-let again = Packet::create_mic_e(packet.source.clone(), report.clone(), packet.path.clone())?;
+let again = Packet::create(packet.source.clone(), packet.destination.clone(), packet.path.clone(), Data::MicE(report.clone()))?;
 assert_eq!(again.destination, packet.destination);
 assert_eq!(again.information, packet.information);
 # Ok::<(), Box<dyn std::error::Error>>(())
@@ -197,7 +197,7 @@ Values are in the units APRS sends (knots, feet, mph, degrees Fahrenheit), with 
 
 ## Conformance
 
-`cargo test` runs the whole [packet-net/aprs-vectors](https://github.com/packet-net/aprs-vectors) suite (a git submodule at `vectors/`): every example in APRS12c and *Understanding APRS Packets*, every tolerable defect, the encoder's rules, 1,395 real APRS-IS packets, 40 more that settled a disagreement between this crate and the C# implementation, and 159 that settle what differential fuzzing of all five implementations found. Each case is checked lenient, strict, with only its own tolerance switched off, re-encoded (byte for byte, against the case's canonical bytes), and read back: 8,020 checks, all passing. A deliberate difference from a recorded expectation would be listed, with its reason, in [`tests/known-differences.txt`](https://github.com/packet-net/aprs-rs/blob/main/tests/known-differences.txt); there are none.
+`cargo test` runs the whole [packet-net/aprs-vectors](https://github.com/packet-net/aprs-vectors) suite (a git submodule at `vectors/`): every example in APRS12c and *Understanding APRS Packets*, every tolerable defect, the encoder's rules, 1,395 real APRS-IS packets, 40 more that settled a disagreement between this crate and the C# implementation, and 159 that settle what differential fuzzing of all five implementations found. Each case is checked lenient, strict, with only its own tolerance switched off, re-encoded (byte for byte, against the case's canonical bytes), and read back: 8,024 checks, all passing. A deliberate difference from a recorded expectation would be listed, with its reason, in [`tests/known-differences.txt`](https://github.com/packet-net/aprs-rs/blob/main/tests/known-differences.txt); there are none.
 
 This crate was written from the spec, the vectors and their [interpretations](https://github.com/packet-net/aprs-vectors/blob/main/interpretations.md), not by porting the C# implementation. Doing so found three places where the vectors had recorded a C# quirk rather than a rule; the C# was fixed and the cases refreshed.
 

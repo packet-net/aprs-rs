@@ -9,8 +9,8 @@ use crate::context::Context;
 use crate::position::Cs;
 use crate::weather;
 use crate::{
-    AreaColor, AreaObject, AreaShape, Code, CommentTelemetry, Dao, DaoPrecision, DfBearing, DfSignalStrength, NmeaSource, ParseOptions,
-    Phg, Positioned, Storm, StormKind, Tone, VoiceFrequency, Weather, base91, text,
+    AreaColor, AreaObject, AreaShape, Code, CommentTelemetry, CompressionSource, Dao, DaoPrecision, DfBearing, DfSignalStrength,
+    ParseOptions, Phg, Positioned, Storm, StormKind, Tone, VoiceFrequency, Weather, base91, text,
 };
 
 pub(crate) const KNOTS_TO_MPH: f64 = 1.150_779_448_023_543;
@@ -48,17 +48,17 @@ pub(crate) fn decode(ctx: &mut Context, fields: &mut Positioned, cs: Option<Cs>,
     if let Some(cs) = cs {
         fields.compression = Some(cs.t);
         let (c, s) = (i32::from(cs.c - 33), i32::from(cs.s - 33));
-        if cs.t.source == NmeaSource::Gga {
+        if cs.t.source == CompressionSource::Gga {
             fields.altitude_feet = Some(libm::pow(1.002, f64::from(c * 91 + s)));
         } else if cs.c == b'{' {
             fields.range_miles = Some(2.0 * libm::pow(1.08, f64::from(s)));
         } else if weather_symbol {
-            weather.wind_direction_degrees = Some((c * 4) as u16);
+            weather.wind_direction_degrees = Some(f64::from(c * 4));
             weather.wind_speed_mph = Some((libm::pow(1.08, f64::from(s)) - 1.0) * KNOTS_TO_MPH);
             cs_is_wind = true;
         } else {
             // The compressed course has no "unknown": 0 is north, reported as 360 (interpretations.md).
-            fields.course_degrees = Some(if c == 0 { 360 } else { (c * 4) as u16 });
+            fields.course_degrees = Some(if c == 0 { 360.0 } else { f64::from(c * 4) });
             fields.speed_knots = Some(libm::pow(1.08, f64::from(s)) - 1.0);
         }
     }
@@ -85,7 +85,7 @@ pub(crate) fn decode(ctx: &mut Context, fields: &mut Positioned, cs: Option<Cs>,
                     }
                     None
                 }
-                d => d.map(|d| d as u16),
+                d => d.map(f64::from),
             };
             weather.wind_speed_mph = speed.map(f64::from);
             at = 7;
@@ -137,8 +137,8 @@ pub(crate) fn decode(ctx: &mut Context, fields: &mut Positioned, cs: Option<Cs>,
             && (weather.wind_direction_degrees.is_some() || weather.wind_speed_mph.is_some())
         {
             fields.compression = Some(crate::CompressionType {
-                fix: crate::GpsFix::Current,
-                source: NmeaSource::Other,
+                fix: crate::CompressionFix::Current,
+                source: CompressionSource::Other,
                 origin: crate::CompressionOrigin::Software,
             });
         }
@@ -352,7 +352,7 @@ fn extension_at_start(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], 
                     return None;
                 }
             }
-            Some(c) => fields.course_degrees = Some(c as u16),
+            Some(c) => fields.course_degrees = Some(f64::from(c)),
             None => {}
         }
         fields.speed_knots = speed.map(f64::from);
