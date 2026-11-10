@@ -253,12 +253,13 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
                 report.fields.altitude_feet = altitude(&s[i..]);
                 s.drain(i..i + 4);
                 joined = Some(i);
-            } else if comment::dao_span(&s).is_some_and(|d| d.start < i + 4 && i < d.end) {
-                // Strictly the altitude is text, but a !DAO! that shares a byte with it is not
-                // one (vectors README, Mic-E), so that reading is not the packet's: rejected.
+            } else if comment::dao_span(&s).is_some_and(|d| joins_into_altitude(&s, d)) {
+                // Strictly the altitude is text and the !DAO! is lifted as usual, unless lifting
+                // it would join the bytes either side into an altitude, which the packet does not
+                // hold there: that reading is rejected (vectors README, Mic-E).
                 ctx.error(
                     Code::MicEAltitudeNotFirst,
-                    "a Mic-E altitude after other status text shares a byte with a !DAO! (APRS12c ch. 10)",
+                    "lifting the !DAO! would join the status text either side of it into a Mic-E altitude (APRS12c ch. 10)",
                     Some(offset + i),
                 );
                 return false;
@@ -266,6 +267,15 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
         }
     }
     comment::tail(ctx, &mut report.fields, &s, offset, joined)
+}
+
+/// Whether taking `dao` out of `s` brings the bytes either side of it together into a Mic-E
+/// altitude, `xxx}` across the join.
+fn joins_into_altitude(s: &[u8], dao: core::ops::Range<usize>) -> bool {
+    let mut rest = s.to_vec();
+    rest.drain(dao.clone());
+    let join = dao.start;
+    (join.saturating_sub(3)..join).any(|j| altitude(&rest[j..]).is_some())
 }
 
 /// Whether two numbers are the same value, as the vectors compare them: within 1e-9, relative
