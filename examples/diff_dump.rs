@@ -31,8 +31,8 @@ use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use pdn_aprs::{
-    Address, BeamHeading, Data, EncodeError, MicEMessage, Packet, ParseOptions, Phg, Station, Symbol, Timestamp, Tone, VoiceFrequency,
-    Weather, WeatherBuilder,
+    Address, BeamHeading, CommentTelemetry, Data, EncodeError, MicEMessage, Packet, ParseOptions, Phg, Station, Symbol, Timestamp, Tone,
+    WeatherBuilder,
 };
 use serde_json::{Map, Value, json};
 
@@ -128,9 +128,8 @@ fn reencode(packet: Option<&Packet>) -> (&'static str, Written) {
         return ("none", None);
     }
     let written = match &packet.data {
-        Data::MicE(m) => {
-            Packet::create_mic_e(packet.source.clone(), m.clone(), packet.path.clone()).map(|p| (p.information, p.destination))
-        }
+        Data::MicE(m) => Packet::create(packet.source.clone(), packet.destination.clone(), packet.path.clone(), Data::MicE(m.clone()))
+            .map(|p| (p.information, p.destination)),
         data => data.encode().map(|info| (info, packet.destination.clone())),
     };
     let Ok((info, destination)) = written else { return ("refused", None) };
@@ -149,8 +148,7 @@ fn reencode(packet: Option<&Packet>) -> (&'static str, Written) {
     (how, wrote)
 }
 
-/// The API view: what the packet's own public accessors say, as a program would read them. This
-/// crate has no symbol descriptions and no PHG arithmetic, so `symbol` and `phg` are left out.
+/// The API view: what the packet's own public accessors say, as a program would read them.
 fn api(p: &Packet) -> Value {
     let mut o = Map::new();
     o.insert("source".into(), json!(p.source.as_str()));
@@ -181,6 +179,28 @@ fn api(p: &Packet) -> Value {
         Value::Object(named)
     });
     o.insert("device".into(), device.unwrap_or(Value::Null));
+    let (positioned, status_symbol) = match &p.data {
+        Data::Position(r) => (Some(&r.fields), None),
+        Data::MicE(r) => (Some(&r.fields), None),
+        Data::Object(r) => (Some(&r.fields), None),
+        Data::Item(r) => (Some(&r.fields), None),
+        Data::Status(r) => (None, r.symbol),
+        _ => (None, None),
+    };
+    if let Some(description) = positioned.map(|f| f.symbol).or(status_symbol).and_then(|s| s.description()) {
+        o.insert("symbol".into(), json!({"description": description}));
+    }
+    if let Some(phg) = positioned.and_then(|f| f.phg) {
+        o.insert(
+            "phg".into(),
+            json!({
+                "watts": phg.power_watts(),
+                "height_feet": phg.height_feet(),
+                "gain_db": phg.gain_db(),
+                "directivity_degrees": phg.directivity_degrees(),
+            }),
+        );
+    }
     if let Data::ThirdParty(inner) = &p.data {
         o.insert("inner".into(), api(inner));
     }
@@ -197,11 +217,13 @@ fn encode_record(input: &Value) -> Value {
         Err(neutral::Unreadable::Refused(why)) => return json!({"n": n, "result": "refused", "reason": why}),
     };
     let written = match data {
-        Data::MicE(m) => Packet::create_mic_e(address("N0CALL"), m, Vec::new()).map(|p| (p.information, p.destination)),
+        Data::MicE(m) => {
+            Packet::create(address("N0CALL"), address("APZ001"), Vec::new(), Data::MicE(m)).map(|p| (p.information, p.destination))
+        }
         data => data.encode().map(|info| (info, address("APZ001"))),
     };
     match written {
-        Err(e) => json!({"n": n, "result": "refused", "reason": e.message}),
+        Err(e) => json!({"n": n, "result": "refused", "reason": e.message()}),
         Ok((info, destination)) => {
             // The bytes decoded leniently under N0CALL> and the destination.
             let p = Packet::decode(address("N0CALL"), destination.clone(), Vec::new(), &info, ParseOptions::LENIENT);
@@ -222,7 +244,7 @@ enum NotBuilt {
 
 impl From<EncodeError> for NotBuilt {
     fn from(e: EncodeError) -> NotBuilt {
-        NotBuilt::Refused(e.message)
+        NotBuilt::Refused(e.message().to_string())
     }
 }
 
@@ -326,13 +348,13 @@ macro_rules! positioned {
             b = b.symbol(s);
         }
         if let Some(c) = args.float("course_degrees")? {
-            b = b.course(c);
+            b = b.course_degrees(c);
         }
         if args.has("speed_knots") && args.has("speed_kmh") {
             return unsupported("speed_kmh: the builder takes one speed");
         }
         if let Some(s) = args.float("speed_knots")? {
-            b = b.speed(s);
+            b = b.speed_knots(s);
         }
         if let Some(s) = args.float("speed_kmh")? {
             b = b.speed_kmh(s);
@@ -341,10 +363,10 @@ macro_rules! positioned {
             return unsupported("altitude_m: the builder takes one altitude");
         }
         if let Some(a) = args.float("altitude_feet")? {
-            b = b.altitude(a);
+            b = b.altitude_feet(a);
         }
         if let Some(a) = args.float("altitude_m")? {
-            b = b.altitude_metres(a);
+            b = b.altitude_m(a);
         }
         if let Some(c) = args.text("comment")? {
             b = b.comment(c);
@@ -353,26 +375,20 @@ macro_rules! positioned {
             b = b.phg(phg(p)?);
         }
         if let Some(r) = args.float("range_miles")? {
-            b = b.range(r);
+            b = b.range_miles(r);
         }
         if let Some(f) = args.get("frequency") {
             let Frequency { mhz, tone, value, offset } = frequency(f)?;
-            b = match tone {
-                // The tone the builder's tone() sends, in whole Hz.
-                None | Some(Tone::Tone) => {
-                    let b = b.frequency(mhz);
-                    match value {
-                        Some(hz) => b.tone(hz),
-                        None => b,
-                    }
-                }
-                Some(tone) => {
-                    let value = value
-                        .filter(|v| v.fract() == 0.0 && (0.0..65536.0).contains(v))
-                        .ok_or_else(|| NotBuilt::Unsupported("frequency.tone_value: the builder takes a whole number".into()))?;
-                    b.voice_frequency(VoiceFrequency { mhz, tone: Some(tone), tone_value: Some(value as u16), ..VoiceFrequency::default() })
-                }
-            };
+            b = b.frequency(mhz);
+            // A tone value with no kind is the plain tone, as it always was.
+            if let Some(value) = value {
+                let value = Some(value)
+                    .filter(|v| v.fract() == 0.0 && (0.0..65536.0).contains(v))
+                    .ok_or_else(|| NotBuilt::Unsupported("frequency.tone_value: the builder takes a whole number".into()))?;
+                b = b.tone(tone.unwrap_or(Tone::Tone), value as u16);
+            } else if tone.is_some() {
+                return unsupported("frequency.tone: the builder takes a tone with its value");
+            }
             if let Some(khz) = offset {
                 b = b.offset_khz(khz);
             }
@@ -387,11 +403,7 @@ macro_rules! positioned {
             b = b.dao();
         }
         if let Some(t) = args.get("telemetry") {
-            let (sequence, analog, digital) = comment_telemetry(t)?;
-            b = match digital {
-                None => b.telemetry(sequence, &analog),
-                Some(d) => b.telemetry_with_bits(sequence, &analog, d),
-            };
+            b = b.telemetry(comment_telemetry(t)?);
         }
         b
     }};
@@ -422,7 +434,7 @@ fn build(input: &Value) -> Built<Packet> {
                 b = b.timestamp(t);
             }
             if args.flag("killed")? {
-                b = b.kill();
+                b = b.killed();
             }
             args.all_taken()?;
             b.build()?
@@ -432,7 +444,7 @@ fn build(input: &Value) -> Built<Packet> {
             b = b.at(args.required_float("latitude")?, args.required_float("longitude")?);
             b = positioned!(b, &args);
             if args.flag("killed")? {
-                b = b.kill();
+                b = b.killed();
             }
             args.all_taken()?;
             b.build()?
@@ -441,7 +453,7 @@ fn build(input: &Value) -> Built<Packet> {
             let mut b = station.mic_e(args.required_float("latitude")?, args.required_float("longitude")?);
             b = positioned!(b, &args);
             if let Some(m) = args.text("mic_e_message")? {
-                b = b.message(mic_e_message(m)?);
+                b = b.mic_e_message(mic_e_message(m)?);
             }
             if args.flag("messaging")? {
                 b = b.messaging();
@@ -453,7 +465,7 @@ fn build(input: &Value) -> Built<Packet> {
         "message" => {
             let mut b = station.message(args.text("addressee")?.unwrap_or_default(), args.text("text")?.unwrap_or_default());
             if let Some(id) = args.text("message_id")? {
-                b = b.id(id);
+                b = b.message_id(id);
             }
             if let Some(r) = args.text("reply_ack")? {
                 b = b.reply_ack(r);
@@ -488,10 +500,10 @@ fn build(input: &Value) -> Built<Packet> {
                 b = b.timestamp(t);
             }
             if let Some(locator) = args.text("locator")? {
-                let Some(symbol) = symbol(args.text("symbol")?)? else {
-                    return unsupported("locator: the builder takes a locator with a symbol");
-                };
-                b = b.locator(locator, symbol);
+                b = b.locator(locator);
+            }
+            if let Some(symbol) = symbol(args.text("symbol")?)? {
+                b = b.symbol(symbol);
             }
             if let Some(beam) = args.get("beam") {
                 let code = |k: &str| {
@@ -516,10 +528,10 @@ fn build(input: &Value) -> Built<Packet> {
                     .map(|v| if v.is_null() { Ok(None) } else { v.as_f64().map(Some).ok_or(()) })
                     .collect::<Result<Vec<Option<f64>>, ()>>()
                     .map_err(|()| NotBuilt::Unsupported("analog: not a number".into()))?;
-                b = b.channels(&values);
+                b = b.analog(&values);
             }
             if let Some(bits) = args.text("bits")? {
-                b = b.digital(bit_byte(bits).ok_or_else(|| NotBuilt::Unsupported("bits: the builder takes eight 0 or 1".into()))?);
+                b = b.bits(bits);
             }
             if let Some(c) = args.text("comment")? {
                 b = b.comment(c);
@@ -528,15 +540,18 @@ fn build(input: &Value) -> Built<Packet> {
             b.build()?
         }
         "telemetry-names" | "telemetry-units" => {
-            own_addressee(&station, &args)?;
+            let addressee = args.text("addressee")?;
             let labels = strings(&args, if report == "telemetry-names" { "names" } else { "units" })?;
             let labels: Vec<&str> = labels.iter().map(String::as_str).collect();
-            let b = if report == "telemetry-names" { station.telemetry_names(&labels) } else { station.telemetry_units(&labels) };
+            let mut b = if report == "telemetry-names" { station.telemetry_names(&labels) } else { station.telemetry_units(&labels) };
+            if let Some(a) = addressee {
+                b = b.addressee(a);
+            }
             args.all_taken()?;
             b.build()?
         }
         "telemetry-coefficients" => {
-            own_addressee(&station, &args)?;
+            let addressee = args.text("addressee")?;
             let coefficients = match args.get("coefficients") {
                 None => Vec::new(),
                 Some(a) => a
@@ -544,15 +559,19 @@ fn build(input: &Value) -> Built<Packet> {
                     .and_then(|a| a.iter().map(Value::as_f64).collect::<Option<Vec<f64>>>())
                     .ok_or_else(|| NotBuilt::Unsupported("coefficients: the builder takes numbers".into()))?,
             };
-            let b = station.telemetry_coefficients(&coefficients);
+            let mut b = station.telemetry_coefficients(&coefficients);
+            if let Some(a) = addressee {
+                b = b.addressee(a);
+            }
             args.all_taken()?;
             b.build()?
         }
         "telemetry-bits" => {
-            own_addressee(&station, &args)?;
-            let bits = args.text("bits")?.unwrap_or_default();
-            let bits = bit_byte(bits).ok_or_else(|| NotBuilt::Unsupported("bits: the builder takes eight 0 or 1".into()))?;
-            let b = station.telemetry_bits(bits, args.text("project")?.unwrap_or_default());
+            let addressee = args.text("addressee")?;
+            let mut b = station.telemetry_bits(args.text("bits")?.unwrap_or_default(), args.text("project")?.unwrap_or_default());
+            if let Some(a) = addressee {
+                b = b.addressee(a);
+            }
             args.all_taken()?;
             b.build()?
         }
@@ -575,14 +594,6 @@ fn station(v: &Value) -> Built<Station> {
     Ok(station)
 }
 
-/// Telemetry metadata goes to the sending station itself; the builder has no other addressee.
-fn own_addressee(station: &Station, args: &Args) -> Built<()> {
-    match args.text("addressee")? {
-        Some(a) if a != station.source().as_str() => unsupported("addressee: the builder addresses metadata to the station itself"),
-        _ => Ok(()),
-    }
-}
-
 fn strings(args: &Args, k: &str) -> Built<Vec<String>> {
     match args.get(k) {
         None => Ok(Vec::new()),
@@ -599,18 +610,6 @@ fn one_char(t: &str) -> Option<char> {
         (Some(c), None) => Some(c),
         _ => None,
     }
-}
-
-/// Eight `0`/`1` characters, B1 first, as the byte the builder takes (bit 0 is B1).
-fn bit_byte(bits: &str) -> Option<u8> {
-    if bits.len() != 8 {
-        return None;
-    }
-    bits.bytes().enumerate().try_fold(0u8, |acc, (i, b)| match b {
-        b'0' => Some(acc),
-        b'1' => Some(acc | 1 << i),
-        _ => None,
-    })
 }
 
 fn symbol(text: Option<&str>) -> Built<Option<Symbol>> {
@@ -681,7 +680,7 @@ fn frequency(f: &Value) -> Built<Frequency> {
 }
 
 /// Base-91 comment telemetry: the sequence, the analog values and any digital bits.
-fn comment_telemetry(t: &Value) -> Built<(u16, Vec<u16>, Option<u8>)> {
+fn comment_telemetry(t: &Value) -> Built<CommentTelemetry> {
     let value = |v: &Value| whole(v).and_then(|v| u16::try_from(v).ok());
     let sequence =
         t.get("sequence").and_then(value).ok_or_else(|| NotBuilt::Unsupported("telemetry.sequence: the builder takes 0-65535".into()))?;
@@ -698,7 +697,7 @@ fn comment_telemetry(t: &Value) -> Built<(u16, Vec<u16>, Option<u8>)> {
                 .ok_or_else(|| NotBuilt::Unsupported("telemetry.digital: the builder takes 0-255".into()))?,
         ),
     };
-    Ok((sequence, analog, digital))
+    Ok(CommentTelemetry { sequence, analog, digital })
 }
 
 fn mic_e_message(t: &str) -> Built<MicEMessage> {
@@ -751,30 +750,29 @@ fn weather(station: &Station, args: &Args) -> Built<Packet> {
     if let Some(t) = timestamp(args)? {
         b = b.timestamp(t);
     }
-    match (args.float("wind_direction_degrees")?, args.float("wind_speed_mph")?) {
-        (Some(d), Some(s)) => b = b.wind(d, s),
-        (Some(d), None) => b = b.wind_direction(d),
-        // The speed alone goes in with observations(), before everything else.
-        (None, Some(s)) => b = b.observations(Weather { wind_speed_mph: Some(s), ..Weather::default() }),
-        (None, None) => {}
+    if let Some(d) = args.float("wind_direction_degrees")? {
+        b = b.wind_direction_degrees(d);
+    }
+    if let Some(s) = args.float("wind_speed_mph")? {
+        b = b.wind_speed_mph(s);
     }
     if let Some(g) = args.float("wind_gust_mph")? {
-        b = b.gust(g);
+        b = b.wind_gust_mph(g);
     }
     if args.has("temperature_f") && args.has("temperature_c") {
         return unsupported("temperature_c: the builder takes one temperature");
     }
     if let Some(t) = args.float("temperature_f")? {
-        b = b.temperature(t);
+        b = b.temperature_f(t);
     }
     if let Some(t) = args.float("temperature_c")? {
-        b = b.temperature_celsius(t);
+        b = b.temperature_c(t);
     }
     type Rain = fn(WeatherBuilder, f64) -> WeatherBuilder;
     let rain: [(&str, &str, Rain, Rain); 3] = [
-        ("rain_1h_in", "rain_1h_mm", WeatherBuilder::rain_last_hour, WeatherBuilder::rain_last_hour_mm),
-        ("rain_24h_in", "rain_24h_mm", WeatherBuilder::rain_last_24_hours, WeatherBuilder::rain_last_24_hours_mm),
-        ("rain_midnight_in", "rain_midnight_mm", WeatherBuilder::rain_since_midnight, WeatherBuilder::rain_since_midnight_mm),
+        ("rain_1h_in", "rain_1h_mm", WeatherBuilder::rain_1h_in, WeatherBuilder::rain_1h_mm),
+        ("rain_24h_in", "rain_24h_mm", WeatherBuilder::rain_24h_in, WeatherBuilder::rain_24h_mm),
+        ("rain_midnight_in", "rain_midnight_mm", WeatherBuilder::rain_midnight_in, WeatherBuilder::rain_midnight_mm),
     ];
     for (inches, mm, set_in, set_mm) in rain {
         if args.has(inches) && args.has(mm) {
@@ -788,16 +786,16 @@ fn weather(station: &Station, args: &Args) -> Built<Packet> {
         }
     }
     if let Some(h) = args.float("humidity_percent")? {
-        b = b.humidity(h);
+        b = b.humidity_percent(h);
     }
     if let Some(p) = args.float("pressure_mbar")? {
-        b = b.pressure(p);
+        b = b.pressure_mbar(p);
     }
     if let Some(l) = args.float("luminosity_w_m2")? {
-        b = b.luminosity(l);
+        b = b.luminosity_w_m2(l);
     }
     if let Some(s) = args.float("snow_24h_in")? {
-        b = b.snowfall(s);
+        b = b.snow_24h_in(s);
     }
     args.all_taken()?;
     Ok(b.build()?)

@@ -208,7 +208,7 @@ fn assign(ctx: &mut Context, w: &mut Weather, letter: u8, snow: bool, v: Option<
                 }
                 w.wind_direction_degrees = None;
             }
-            d => w.wind_direction_degrees = d.map(|d| d as u16),
+            d => w.wind_direction_degrees = d,
         },
         b's' if !snow => w.wind_speed_mph = v,
         b's' => w.snow_24h_in = v,
@@ -224,11 +224,11 @@ fn assign(ctx: &mut Context, w: &mut Weather, letter: u8, snow: bool, v: Option<
                 }
                 w.humidity_percent = None;
             }
-            h => w.humidity_percent = h.map(|h| if h == 0.0 { 100 } else { h as u8 }),
+            h => w.humidity_percent = h.map(|h| if h == 0.0 { 100.0 } else { h }),
         },
         b'b' => w.pressure_mbar = v.map(|v| v / 10.0),
-        b'L' => w.luminosity_w_m2 = v.map(|v| v as u16),
-        b'l' => w.luminosity_w_m2 = v.map(|v| v as u16 + 1000),
+        b'L' => w.luminosity_w_m2 = v,
+        b'l' => w.luminosity_w_m2 = v.map(|v| v + 1000.0),
         b'#' => w.rain_raw = v.map(|v| v as u32),
         _ => {}
     }
@@ -276,24 +276,27 @@ pub(crate) fn encode_fields(out: &mut Vec<u8>, w: &Weather) -> Result<(), Encode
     optional(out, b'p', w.rain_24h_in.map(|v| v * 100.0), 3)?;
     optional(out, b'P', w.rain_midnight_in.map(|v| v * 100.0), 3)?;
     if let Some(h) = w.humidity_percent {
-        if !(1..=100).contains(&h) {
-            return Err(EncodeError::new("humidity must be 1-100 percent"));
+        // Rounded once to a whole percent: 99.7 is `h00`, and 0.4, which rounds to 0, is refused
+        // since `h00` means 100.
+        let h = crate::steps::round(h);
+        if !(1.0..=100.0).contains(&h) {
+            return Err(EncodeError::new("humidity must round to 1-100 percent"));
         }
         out.push(b'h');
-        push_digits(out, u32::from(h % 100), 2);
+        push_digits(out, h as u32 % 100, 2);
     }
     optional(out, b'b', w.pressure_mbar.map(|v| v * 10.0), 5)?;
     if let Some(l) = w.luminosity_w_m2 {
-        match l {
-            0..=999 => {
-                out.push(b'L');
-                push_digits(out, u32::from(l), 3);
-            }
-            1000..=1999 => {
-                out.push(b'l');
-                push_digits(out, u32::from(l - 1000), 3);
-            }
-            _ => return Err(EncodeError::new("luminosity must be 0-1999 W/m2")),
+        // Rounded once to a whole number of W/m2.
+        let l = crate::steps::round(l);
+        if (0.0..=999.0).contains(&l) {
+            out.push(b'L');
+            push_digits(out, l as u32, 3);
+        } else if (1000.0..=1999.0).contains(&l) {
+            out.push(b'l');
+            push_digits(out, l as u32 - 1000, 3);
+        } else {
+            return Err(EncodeError::new("luminosity must round to 0-1999 W/m2"));
         }
     }
     if let Some(snow) = w.snow_24h_in {

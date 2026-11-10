@@ -94,7 +94,14 @@ impl core::str::FromStr for Address {
 
 /// Text that cannot be an address.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InvalidAddress(pub String);
+pub struct InvalidAddress(String);
+
+impl InvalidAddress {
+    /// The text that was refused.
+    pub fn text(&self) -> &str {
+        &self.0
+    }
+}
 
 impl fmt::Display for InvalidAddress {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -131,6 +138,7 @@ pub struct QConstruct<'a> {
 
 /// A header that cannot be decoded, so the packet cannot be either.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct HeaderError {
     /// What is wrong: at least one [`Severity::Error`], plus any warnings found before it.
     pub diagnostics: Vec<Diagnostic>,
@@ -148,15 +156,23 @@ impl fmt::Display for HeaderError {
 impl core::error::Error for HeaderError {}
 
 /// A packet that cannot be written as asked, with the reason.
+///
+/// The reason is text for people, naming the field at fault; its wording is not part of the stable
+/// API. A machine-readable reason can be added later without a major version.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EncodeError {
-    /// Why, naming the field at fault.
-    pub message: String,
+    message: String,
 }
 
 impl EncodeError {
     pub(crate) fn new(message: impl Into<String>) -> EncodeError {
         EncodeError { message: message.into() }
+    }
+
+    /// Why the data was refused, in a sentence.
+    pub fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -171,6 +187,7 @@ impl core::error::Error for EncodeError {}
 /// An APRS packet: the header, the information field as received, what it decodes to, and
 /// everything the decoder noticed on the way.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub struct Packet {
     /// Who sent it.
     pub source: Address,
@@ -323,42 +340,16 @@ impl Packet {
         Packet { source, destination, path, information: information.to_vec(), data, diagnostics: ctx.diagnostics, third_party: false }
     }
 
-    /// Builds a packet from data, encoding its information field. For Mic-E data use
-    /// [`Packet::create_mic_e`], which works out the destination address too.
+    /// Builds a packet from data, encoding its information field. For Mic-E data the destination
+    /// address is worked out from the report (it carries the latitude, message code and digipeat
+    /// path, APRS12c ch. 10), and `destination` is not used.
     pub fn create(source: Address, destination: Address, path: Vec<PathEntry>, data: Data) -> Result<Packet, EncodeError> {
-        if matches!(data, Data::MicE(_)) {
-            return Err(EncodeError::new("Mic-E data carries half its position in the destination: use Packet::create_mic_e"));
-        }
-        let information = data.encode()?;
+        let (destination, information) = match &data {
+            Data::MicE(report) => crate::mic_e::encode(report)?,
+            data => (destination, data.encode()?),
+        };
         let decoded = Packet::decode(source.clone(), destination.clone(), path.clone(), &information, ParseOptions::STRICT);
         Ok(Packet { source, destination, path, information, data, diagnostics: decoded.diagnostics, third_party: false })
-    }
-
-    /// Builds a Mic-E packet: the information field and the destination address that carries the
-    /// latitude, message code and digipeat path (APRS12c ch. 10).
-    pub fn create_mic_e(source: Address, report: crate::MicEReport, path: Vec<PathEntry>) -> Result<Packet, EncodeError> {
-        Packet::create_mic_e_with(source, report, path, false)
-    }
-
-    /// As [`Packet::create_mic_e`]; with `feet_in_text`, an altitude goes in a `/A=` even when it is
-    /// whole metres.
-    pub(crate) fn create_mic_e_with(
-        source: Address,
-        report: crate::MicEReport,
-        path: Vec<PathEntry>,
-        feet_in_text: bool,
-    ) -> Result<Packet, EncodeError> {
-        let (destination, information) = crate::mic_e::encode_with(&report, feet_in_text)?;
-        let decoded = Packet::decode(source.clone(), destination.clone(), path.clone(), &information, ParseOptions::STRICT);
-        Ok(Packet {
-            source,
-            destination,
-            path,
-            information,
-            data: Data::MicE(report),
-            diagnostics: decoded.diagnostics,
-            third_party: false,
-        })
     }
 
     /// Whether any diagnostic is a warning.

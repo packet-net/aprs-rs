@@ -285,13 +285,19 @@ fn footprint(rest: &[u8]) -> Option<Footprint> {
     if parts.len() != 3 {
         return None;
     }
-    footprint_degrees(parts[0], 90.0)?;
-    footprint_degrees(parts[1], 180.0)?;
+    let latitude = footprint_degrees(parts[0], 90.0)?;
+    let longitude = footprint_degrees(parts[1], 180.0)?;
     let radius = parts[2];
     if radius.len() != 4 || !radius.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    Some(Footprint { latitude: parts[0].to_string(), longitude: parts[1].to_string(), radius_miles: radius.parse().ok()? })
+    Some(Footprint {
+        latitude,
+        longitude,
+        radius_miles: radius.parse::<u32>().ok()?.into(),
+        latitude_text: parts[0].to_string(),
+        longitude_text: parts[1].to_string(),
+    })
 }
 
 /// A footprint's degrees: a decimal number, with a minus sign or, only for a positive value, a
@@ -310,6 +316,24 @@ pub(crate) fn footprint_degrees(t: &str, limit: f64) -> Option<f64> {
         return None;
     }
     t.parse::<f64>().ok().filter(|v| v.abs() <= limit)
+}
+
+/// A footprint's latitude or longitude as it is written: the text it was sent as, when that is a
+/// number as APRS12c ch. 15 writes one and still says `value`, and otherwise the number as the
+/// shortest decimal that reads back the same, after a space unless it is negative (0 included).
+fn footprint_text(value: f64, text: &str, limit: f64, what: &str) -> Result<String, EncodeError> {
+    if let Some(sent) = footprint_degrees(text, limit) {
+        if sent == value {
+            return Ok(text.to_string());
+        }
+    }
+    if value.is_nan() || value.abs() > limit {
+        return Err(EncodeError::new(format!(
+            "a query footprint's {what} is decimal degrees within {limit} (a leading space only before a positive value)"
+        )));
+    }
+    let digits = crate::steps::number_text(value);
+    Ok(if value < 0.0 { digits } else { format!(" {digits}") })
 }
 
 /// `TOKEN,TOKEN=VALUE,...`.
@@ -404,12 +428,11 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             if !w.comment.is_empty() {
                 return Err(EncodeError::new("a weather report has no comment field (APRS12c ch. 12)"));
             }
-            if w.weather.wind_direction_degrees.is_some_and(|d| d > 360) {
-                return Err(EncodeError::new("wind direction must be 0-360 degrees"));
-            }
+            let direction =
+                w.weather.wind_direction_degrees.map(|d| crate::encode::whole_degrees(d, "wind direction")).transpose()?.map(f64::from);
             out.push(b'_');
             out.extend_from_slice(&t.to_bytes());
-            weather::field(&mut out, b'c', w.weather.wind_direction_degrees.map(f64::from), 3, false)?;
+            weather::field(&mut out, b'c', direction, 3, false)?;
             weather::field(&mut out, b's', w.weather.wind_speed_mph, 3, false)?;
             weather::encode_fields(&mut out, &w.weather)?;
             // The software type and unit, and the extra fields, must not read back as fields.
@@ -453,14 +476,15 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             out.extend_from_slice(q.query_type.as_bytes());
             out.push(b'?');
             if let Some(f) = &q.footprint {
-                // The numbers are written as they are held, as telemetry values are (vectors
-                // README, "Numbers as sent").
-                if f.latitude_degrees().is_none() || f.longitude_degrees().is_none() || f.radius_miles > 9999 {
-                    return Err(EncodeError::new(
-                        "a query footprint is decimal degrees within -90..90 and -180..180 (a leading space only before a positive value) and a radius of up to 9999 miles",
-                    ));
+                // The numbers are written as they were sent when they still say the value, as
+                // telemetry values are (vectors README, "Numbers as sent").
+                let radius = crate::steps::round(f.radius_miles);
+                if !(0.0..=9999.0).contains(&radius) {
+                    return Err(EncodeError::new("a query footprint's radius is 0-9999 miles once rounded"));
                 }
-                out.extend_from_slice(format!("{},{},{:04}", f.latitude, f.longitude, f.radius_miles).as_bytes());
+                let latitude = footprint_text(f.latitude, &f.latitude_text, 90.0, "latitude")?;
+                let longitude = footprint_text(f.longitude, &f.longitude_text, 180.0, "longitude")?;
+                out.extend_from_slice(format!("{latitude},{longitude},{:04}", radius as u32).as_bytes());
             }
         }
         Data::Capabilities(c) => {

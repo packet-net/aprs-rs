@@ -7,6 +7,7 @@ use crate::{Data, Packet};
 
 /// A device or program, as the database names it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Device {
     /// Who makes it.
     pub vendor: Option<&'static str>,
@@ -48,9 +49,22 @@ pub(crate) struct Legacy {
     pub(crate) features: &'static [&'static str],
 }
 
-/// The database version this crate carries: the aprs-deviceid commit and its date.
-pub fn database_version() -> &'static str {
-    COMMIT
+impl Device {
+    /// The database version this crate carries: the aprs-deviceid commit and its date.
+    pub const DATABASE_VERSION: &'static str = COMMIT;
+
+    /// The best match for a destination callsign: exact characters beat `?` (any character) and `n`
+    /// (a digit), which beat a trailing `*` (anything).
+    pub fn from_tocall(callsign: &str) -> Option<Device> {
+        let call = callsign.as_bytes();
+        TOCALLS.iter().filter_map(|e| score(e.pattern.as_bytes(), call).map(|s| (s, e))).max_by_key(|(s, _)| *s).map(|(_, e)| Device {
+            vendor: e.vendor,
+            model: e.model,
+            class: e.class,
+            os: e.os,
+            features: e.features,
+        })
+    }
 }
 
 impl Packet {
@@ -75,22 +89,9 @@ impl Packet {
                     _ => None,
                 }
             }
-            _ => tocall(self.destination.callsign()),
+            _ => Device::from_tocall(self.destination.callsign()),
         }
     }
-}
-
-/// The best match for a destination callsign: exact characters beat `?` (any character) and `n`
-/// (a digit), which beat a trailing `*` (anything).
-pub fn tocall(callsign: &str) -> Option<Device> {
-    let call = callsign.as_bytes();
-    TOCALLS.iter().filter_map(|e| score(e.pattern.as_bytes(), call).map(|s| (s, e))).max_by_key(|(s, _)| *s).map(|(_, e)| Device {
-        vendor: e.vendor,
-        model: e.model,
-        class: e.class,
-        os: e.os,
-        features: e.features,
-    })
 }
 
 fn score(pattern: &[u8], call: &[u8]) -> Option<(usize, usize)> {

@@ -168,7 +168,7 @@ pub enum Code {
 
 impl Code {
     /// Every code, in catalogue order.
-    pub const ALL: [Code; 64] = [
+    pub const ALL: &'static [Code] = &[
         Code::InvalidHeader,
         Code::InvalidAddress,
         Code::EmptyDestination,
@@ -349,8 +349,14 @@ impl Code {
         Code::ALL.iter().copied().find(|c| c.id() == id)
     }
 
-    pub(crate) const fn bit(self) -> u64 {
-        1u64 << (self as u8)
+    pub(crate) const fn bit(self) -> u128 {
+        1u128 << (self as u8)
+    }
+}
+
+impl fmt::Display for Severity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
     }
 }
 
@@ -362,6 +368,7 @@ impl fmt::Display for Code {
 
 /// Something a decoder noticed about a packet.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Diagnostic {
     /// How serious it is.
     pub severity: Severity,
@@ -375,7 +382,7 @@ pub struct Diagnostic {
 
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}: {}", self.severity.name(), self.code, self.message)?;
+        write!(f, "{} {}: {}", self.severity, self.code, self.message)?;
         if let Some(offset) = self.offset {
             write!(f, " (at {offset})")?;
         }

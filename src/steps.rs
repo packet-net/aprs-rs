@@ -20,6 +20,18 @@ pub(crate) fn round(steps: f64) -> f64 {
     if steps < 0.0 && rounded != 0.0 { -rounded } else { rounded }
 }
 
+/// Whether two numbers are the same value, as the vectors compare them: within 1e-9, relative for
+/// values of 1 or more.
+pub(crate) fn same_number(x: f64, y: f64) -> bool {
+    x == y || (x - y).abs() <= 1e-9 * x.abs().max(y.abs()).max(1.0)
+}
+
+/// A number as the shortest decimal text that reads back as it, with no exponent, no `+`, a `0`
+/// before a leading point and no trailing `.0`: `5.2`, `-32`, `0.53`, and 1e61 as a 1 and 61 zeros.
+pub(crate) fn number_text(v: f64) -> alloc::string::String {
+    if v == 0.0 { alloc::string::String::from("0") } else { alloc::format!("{v}") }
+}
+
 #[cfg(test)]
 mod tests {
     use super::round;

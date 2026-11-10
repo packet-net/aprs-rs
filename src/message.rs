@@ -1,13 +1,14 @@
 //! Messages, acks and rejects, bulletins, telemetry metadata and directed queries: everything
 //! sent as `:ADDRESSEE:text` (APRS12c ch. 13-15).
 
+use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
 use crate::context::Context;
 use crate::{
     Ack, Address, Bulletin, Code, Data, DirectedQuery, EncodeError, Message, ParseOptions, Reject, TelemetryBits, TelemetryCoefficients,
-    TelemetryLabels, text,
+    TelemetryNames, TelemetryUnits, text,
 };
 
 /// Message text senders may write (APRS12c ch. 14); receivers accept more.
@@ -209,13 +210,17 @@ fn telemetry_metadata(ctx: &mut Context, addressee: &str, body: &[u8], offset: u
                 ctx.info(Code::InvalidTelemetryMetadata, "telemetry metadata names at most 13 channels (APRS12c ch. 13)", Some(offset));
                 return None;
             }
-            let t = TelemetryLabels { addressee, labels, message_id };
-            if kind == b"PARM." { Data::TelemetryNames(t) } else { Data::TelemetryUnits(t) }
+            if kind == b"PARM." {
+                Data::TelemetryNames(TelemetryNames { addressee, names: labels, message_id })
+            } else {
+                Data::TelemetryUnits(TelemetryUnits { addressee, units: labels, message_id })
+            }
         }
         b"EQNS." => {
             // "The list may stop at any field" (APRS12c ch. 13): trailing commas and spaces are the
             // list stopping. Spaces (U+0020 only) around a coefficient are padding.
             let mut coefficients = Vec::new();
+            let mut coefficients_text = Vec::new();
             for part in s.trim_end_matches([' ', ',']).split(',') {
                 let part = part.trim_matches(' ');
                 if !is_coefficient(part) {
@@ -226,7 +231,8 @@ fn telemetry_metadata(ctx: &mut Context, addressee: &str, body: &[u8], offset: u
                     );
                     return None;
                 }
-                coefficients.push(part.to_string());
+                coefficients.push(part.parse::<f64>().unwrap_or(0.0));
+                coefficients_text.push(part.to_string());
             }
             if coefficients.len() > 15 {
                 ctx.info(
@@ -236,7 +242,7 @@ fn telemetry_metadata(ctx: &mut Context, addressee: &str, body: &[u8], offset: u
                 );
                 return None;
             }
-            Data::TelemetryCoefficients(TelemetryCoefficients { addressee, coefficients, message_id })
+            Data::TelemetryCoefficients(TelemetryCoefficients { addressee, coefficients, coefficients_text, message_id })
         }
         _ => {
             let (bits, project) = s.split_once(',').unwrap_or((&s, ""));
@@ -277,6 +283,37 @@ pub(crate) fn is_coefficient(t: &str) -> bool {
     // A mantissa of zero is zero whatever the exponent; otherwise the value must be finite.
     let zero = mantissa.bytes().all(|b| matches!(b, b'0' | b'.' | b'-'));
     zero || t.parse::<f64>().is_ok_and(f64::is_finite)
+}
+
+/// Whether `text` is a number of the form `form` allows that still says `value`.
+fn says(text: &str, value: f64, form: fn(&str) -> bool) -> bool {
+    form(text) && text.parse::<f64>().is_ok_and(|n| n == value)
+}
+
+/// A number as it is written: the text it was sent as, when that is a number of the form the spec
+/// allows (`form`) and still says `value`, and otherwise the number as the shortest decimal that reads
+/// back the same, with no exponent. A number with no such form (infinite, not a number) is refused.
+pub(crate) fn number_as_sent(value: f64, text: Option<&str>, form: fn(&str) -> bool, what: &str) -> Result<String, EncodeError> {
+    if let Some(t) = text.filter(|t| says(t, value, form)) {
+        return Ok(t.to_string());
+    }
+    if !value.is_finite() {
+        return Err(EncodeError::new(format!("{what} is a finite number")));
+    }
+    Ok(crate::steps::number_text(value))
+}
+
+/// A telemetry value as it is written: the text it was sent as when that still says the number, else a
+/// whole number from 0 to 999 as three digits, as APRS12c ch. 13 writes `aaa` (`005`, 190.0 as `190`),
+/// else the shortest decimal that reads back the same, with no exponent.
+pub(crate) fn telemetry_value(value: f64, text: Option<&str>) -> Result<String, EncodeError> {
+    if let Some(t) = text.filter(|t| says(t, value, is_decimal)) {
+        return Ok(t.to_string());
+    }
+    if (0.0..=999.0).contains(&value) && libm::floor(value) == value {
+        return Ok(alloc::format!("{:03}", value as u32));
+    }
+    number_as_sent(value, None, is_decimal, "a telemetry value")
 }
 
 /// A telemetry value: an optional `-`, then digits with an optional decimal point, with at least
@@ -381,24 +418,27 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             message_text(&mut out, &b.text, !nws)?;
             id_and_reply(&mut out, &b.message_id, &None)?;
         }
-        Data::TelemetryNames(t) | Data::TelemetryUnits(t) => {
-            if t.labels.len() > 13
-                || t.labels.iter().any(|l| l.contains(',') || l.contains('{') || crate::text::has_line_break(l.as_bytes()))
-            {
+        Data::TelemetryNames(TelemetryNames { addressee: to, names: labels, message_id })
+        | Data::TelemetryUnits(TelemetryUnits { addressee: to, units: labels, message_id }) => {
+            if labels.len() > 13 || labels.iter().any(|l| l.contains(',') || l.contains('{') || crate::text::has_line_break(l.as_bytes())) {
                 return Err(EncodeError::new("telemetry metadata names at most 13 channels, without commas or braces (APRS12c ch. 13)"));
             }
-            addressee(&mut out, &t.addressee)?;
+            addressee(&mut out, to)?;
             out.extend_from_slice(if matches!(data, Data::TelemetryNames(_)) { b"PARM." } else { b"UNIT." });
-            out.extend_from_slice(t.labels.join(",").as_bytes());
-            id_and_reply(&mut out, &t.message_id, &None)?;
+            out.extend_from_slice(labels.join(",").as_bytes());
+            id_and_reply(&mut out, message_id, &None)?;
         }
         Data::TelemetryCoefficients(t) => {
-            if t.coefficients.len() > 15 || !t.coefficients.iter().all(|c| is_coefficient(c)) {
+            if t.coefficients.len() > 15 {
                 return Err(EncodeError::new("telemetry equations are up to 15 numbers (APRS12c ch. 13)"));
+            }
+            let mut texts = Vec::with_capacity(t.coefficients.len());
+            for (i, &c) in t.coefficients.iter().enumerate() {
+                texts.push(number_as_sent(c, t.coefficients_text.get(i).map(String::as_str), is_coefficient, "a telemetry coefficient")?);
             }
             addressee(&mut out, &t.addressee)?;
             out.extend_from_slice(b"EQNS.");
-            out.extend_from_slice(t.coefficients.join(",").as_bytes());
+            out.extend_from_slice(texts.join(",").as_bytes());
             id_and_reply(&mut out, &t.message_id, &None)?;
         }
         Data::TelemetryBits(t) => {

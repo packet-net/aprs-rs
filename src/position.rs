@@ -4,7 +4,7 @@ use alloc::format;
 use alloc::vec::Vec;
 
 use crate::context::Context;
-use crate::{Code, CompressionOrigin, CompressionType, EncodeError, GpsFix, NmeaSource, Position, Symbol, base91};
+use crate::{Code, CompressionFix, CompressionOrigin, CompressionSource, CompressionType, EncodeError, Position, Symbol, base91};
 
 /// The compressed course/speed, range or altitude bytes, kept raw: what they mean depends on the
 /// symbol (a weather station sends wind in them) and on the type byte.
@@ -212,12 +212,12 @@ fn compressed(ctx: &mut Context, bytes: &[u8], offset: usize) -> Option<Decoded>
 
 fn type_from_bits(bits: u8) -> CompressionType {
     CompressionType {
-        fix: if bits & 0x20 != 0 { GpsFix::Current } else { GpsFix::Old },
+        fix: if bits & 0x20 != 0 { CompressionFix::Current } else { CompressionFix::Old },
         source: match (bits >> 3) & 3 {
-            0 => NmeaSource::Other,
-            1 => NmeaSource::Gll,
-            2 => NmeaSource::Gga,
-            _ => NmeaSource::Rmc,
+            0 => CompressionSource::Other,
+            1 => CompressionSource::Gll,
+            2 => CompressionSource::Gga,
+            _ => CompressionSource::Rmc,
         },
         origin: match bits & 7 {
             0 => CompressionOrigin::Compressed,
@@ -234,14 +234,14 @@ fn type_from_bits(bits: u8) -> CompressionType {
 
 pub(crate) fn type_to_bits(t: CompressionType) -> u8 {
     let fix = match t.fix {
-        GpsFix::Old => 0,
-        GpsFix::Current => 0x20,
+        CompressionFix::Old => 0,
+        CompressionFix::Current => 0x20,
     };
     let source = match t.source {
-        NmeaSource::Other => 0,
-        NmeaSource::Gll => 1,
-        NmeaSource::Gga => 2,
-        NmeaSource::Rmc => 3,
+        CompressionSource::Other => 0,
+        CompressionSource::Gll => 1,
+        CompressionSource::Gga => 2,
+        CompressionSource::Rmc => 3,
     } << 3;
     let origin = match t.origin {
         CompressionOrigin::Compressed => 0,

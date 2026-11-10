@@ -11,7 +11,7 @@ use crate::Code;
 /// [`ParseOptions::STRICT`] tolerates nothing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ParseOptions {
-    tolerated: u64,
+    tolerated: u128,
 }
 
 impl ParseOptions {
@@ -20,7 +20,7 @@ impl ParseOptions {
 
     /// Tolerates every tolerable defect, each with a warning.
     pub const LENIENT: ParseOptions = {
-        let mut tolerated = 0u64;
+        let mut tolerated = 0u128;
         let mut i = 0;
         while i < Code::ALL.len() {
             if Code::ALL[i].is_tolerable() {

@@ -258,9 +258,8 @@ fn reencode(case: &Value) -> Result<(), String> {
         decode(&case["input"], ParseOptions::LENIENT).map_err(|e| format!("header error {:?}", neutral::diagnostics(&e.diagnostics)))?;
     let expected = case["reencode"].as_str().unwrap();
     let written = match &packet.data {
-        Data::MicE(m) => {
-            Packet::create_mic_e(packet.source.clone(), m.clone(), packet.path.clone()).map(|p| (p.information, p.destination))
-        }
+        Data::MicE(m) => Packet::create(packet.source.clone(), packet.destination.clone(), packet.path.clone(), Data::MicE(m.clone()))
+            .map(|p| (p.information, p.destination)),
         data => data.encode().map(|info| (info, packet.destination.clone())),
     };
     let (info, destination) = match written {
@@ -316,9 +315,8 @@ fn encode(case: &Value) -> Result<(), String> {
     let expect = &case["expect"];
     let written = match neutral::try_read_data(&input["encode"]) {
         Err(neutral::Unreadable::Unsupported(why)) => return Err(format!("encode: this crate's data cannot hold it: {why}")),
-        Err(neutral::Unreadable::Refused(why)) => Err(pdn_aprs::EncodeError { message: why }),
-        Ok(Data::MicE(m)) => Packet::create_mic_e(source(input), m, Vec::new()),
-        Ok(data) => Packet::create(source(input), destination(input), Vec::new(), data),
+        Err(neutral::Unreadable::Refused(why)) => Err(why),
+        Ok(data) => Packet::create(source(input), destination(input), Vec::new(), data).map_err(|e| e.to_string()),
     };
     let packet = match written {
         Err(e) => {

@@ -8,6 +8,7 @@ use crate::Packet;
 
 /// The decoded content of an information field.
 #[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
 pub enum Data {
     /// A position report: `!`, `=`, `/` or `@` (APRS12c ch. 8 and 9).
     Position(PositionReport),
@@ -28,9 +29,9 @@ pub enum Data {
     /// A National Weather Service bulletin, addressed `NWS-` or `NWS_`.
     NwsBulletin(Bulletin),
     /// Telemetry channel names, `PARM.` (APRS12c ch. 13).
-    TelemetryNames(TelemetryLabels),
+    TelemetryNames(TelemetryNames),
     /// Telemetry channel units, `UNIT.`.
-    TelemetryUnits(TelemetryLabels),
+    TelemetryUnits(TelemetryUnits),
     /// Telemetry equation coefficients, `EQNS.`.
     TelemetryCoefficients(TelemetryCoefficients),
     /// Telemetry bit sense and project name, `BITS.`.
@@ -67,6 +68,7 @@ pub enum Data {
 
 /// Why nothing was decoded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Unrecognized {
     /// The information field is empty.
     Empty,
@@ -161,16 +163,16 @@ pub enum Timestamp {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompressionType {
     /// Whether the GPS fix is current.
-    pub fix: GpsFix,
+    pub fix: CompressionFix,
     /// The NMEA sentence the position came from.
-    pub source: NmeaSource,
+    pub source: CompressionSource,
     /// What compressed the position.
     pub origin: CompressionOrigin,
 }
 
 /// GPS fix in a compression type byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GpsFix {
+pub enum CompressionFix {
     /// Old (last known) fix.
     Old,
     /// Current fix.
@@ -179,7 +181,7 @@ pub enum GpsFix {
 
 /// NMEA source in a compression type byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NmeaSource {
+pub enum CompressionSource {
     /// Other.
     Other,
     /// GLL.
@@ -224,6 +226,28 @@ pub struct Phg {
     pub directivity: u8,
     /// PHGR: beacons per hour.
     pub beacons_per_hour: Option<u8>,
+}
+
+impl Phg {
+    /// The power in watts the code stands for: the code squared.
+    pub fn power_watts(&self) -> u32 {
+        u32::from(self.power) * u32::from(self.power)
+    }
+
+    /// The antenna height in feet the code stands for: 10 x 2^code (exact as a float for every code).
+    pub fn height_feet(&self) -> f64 {
+        libm::ldexp(10.0, i32::from(self.height))
+    }
+
+    /// The antenna gain in dB the code stands for (dBi, as the spec gives it).
+    pub fn gain_db(&self) -> u8 {
+        self.gain
+    }
+
+    /// The direction of maximum gain in degrees (45 x code), or `None` for an omnidirectional antenna.
+    pub fn directivity_degrees(&self) -> Option<u16> {
+        (self.directivity != 0).then(|| u16::from(self.directivity) * 45)
+    }
 }
 
 /// Omni DF signal strength, `DFSshgd` (APRS12c ch. 7).
@@ -429,8 +453,9 @@ pub enum Tone {
 /// Weather data (APRS12c ch. 12), in the units APRS sends.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Weather {
-    /// Wind direction, degrees.
-    pub wind_direction_degrees: Option<u16>,
+    /// Wind direction, degrees. Whole when decoded; rounded once when encoded (to 4 degrees in a
+    /// compressed report).
+    pub wind_direction_degrees: Option<f64>,
     /// Sustained wind speed, mph.
     pub wind_speed_mph: Option<f64>,
     /// Peak gust in the last 5 minutes, mph.
@@ -445,12 +470,12 @@ pub struct Weather {
     pub rain_midnight_in: Option<f64>,
     /// Raw rain counter (`#`).
     pub rain_raw: Option<u32>,
-    /// Relative humidity, percent.
-    pub humidity_percent: Option<u8>,
+    /// Relative humidity, percent (1-100 once rounded). Whole when decoded; rounded once when encoded.
+    pub humidity_percent: Option<f64>,
     /// Barometric pressure, millibars (tenths as sent).
     pub pressure_mbar: Option<f64>,
-    /// Luminosity, W/m².
-    pub luminosity_w_m2: Option<u16>,
+    /// Luminosity, W/m² (0-1999 once rounded). Whole when decoded; rounded once when encoded.
+    pub luminosity_w_m2: Option<f64>,
     /// Snowfall in the last 24 hours, inches.
     pub snow_24h_in: Option<f64>,
     /// Software type character, e.g. `e` or `W`.
@@ -481,8 +506,10 @@ pub struct Positioned {
     pub compressed: bool,
     /// The compressed type byte, when it says anything (course/speed, range or altitude present).
     pub compression: Option<CompressionType>,
-    /// Course, degrees (1-360; 360 is north).
-    pub course_degrees: Option<u16>,
+    /// Course, degrees. 0 is the spec's unknown course (a decoder reports it for `000`) and 360 is
+    /// north; 1-360 is a known course. Whole when decoded; rounded once when encoded (to 4 degrees
+    /// in a compressed report).
+    pub course_degrees: Option<f64>,
     /// Speed, knots.
     pub speed_knots: Option<f64>,
     /// Altitude, feet.
@@ -528,7 +555,7 @@ pub struct PositionReport {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct MicEReport {
     /// The Mic-E message (status) code.
-    pub message: MicEMessage,
+    pub mic_e_message: MicEMessage,
     /// Sent with `'` (old or non-current data) rather than `` ` ``.
     pub old_data: bool,
     /// The device type code after the symbol: `` ` ``, `'`, `>`, `]` or a space.
@@ -541,6 +568,11 @@ pub struct MicEReport {
     pub legacy_telemetry: Vec<u8>,
     /// The destination address's SSID, which selects a digipeat path.
     pub destination_ssid: u8,
+    /// The altitude is written in the status text as `/A=` (feet) rather than in the Mic-E altitude
+    /// bytes (whole metres). Set by the decoder when the altitude came from a `/A=`, and honoured by
+    /// the encoder, so that encoding a copy of a report writes the bytes the report was built from.
+    /// An altitude the Mic-E bytes cannot hold exactly is written as `/A=` whatever this says.
+    pub altitude_in_comment: bool,
     /// The shared positioned fields.
     pub fields: Positioned,
 }
@@ -645,26 +677,49 @@ pub struct Bulletin {
     pub message_id: Option<String>,
 }
 
-/// Telemetry channel names or units.
+/// Telemetry channel names, `PARM.`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TelemetryLabels {
+pub struct TelemetryNames {
     /// The station the metadata describes.
     pub addressee: String,
-    /// Up to 13 labels, in channel order (A1-A5, then B1-B8); empty for a channel not named.
-    pub labels: Vec<String>,
+    /// Up to 13 names, in channel order (A1-A5, then B1-B8); empty for a channel not named.
+    pub names: Vec<String>,
     /// The message ID, when the metadata was sent as a numbered message.
     pub message_id: Option<String>,
 }
 
-/// Telemetry equation coefficients.
+/// Telemetry channel units, `UNIT.`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TelemetryUnits {
+    /// The station the metadata describes.
+    pub addressee: String,
+    /// Up to 13 units, in channel order (A1-A5, then B1-B8); empty for a channel without one.
+    pub units: Vec<String>,
+    /// The message ID, when the metadata was sent as a numbered message.
+    pub message_id: Option<String>,
+}
+
+/// Telemetry equation coefficients, `EQNS.`. [`coefficients_text`](Self::coefficients_text) keeps
+/// the numbers as sent (`.53`), so that a received packet writes back byte for byte; it is
+/// optional when encoding, and is not compared by `==`.
+#[derive(Clone, Debug, Default)]
 pub struct TelemetryCoefficients {
     /// The station the metadata describes.
     pub addressee: String,
-    /// Up to 15 values, a, b, c for each analog channel in turn, as sent.
-    pub coefficients: Vec<String>,
+    /// Up to 15 values, a, b, c for each analog channel in turn.
+    pub coefficients: Vec<f64>,
+    /// The values as sent, one for each of `coefficients` (or empty). The encoder writes a text that
+    /// is a coefficient as the spec allows and still says its number, and otherwise writes the number
+    /// as the shortest decimal that reads back the same, with no exponent.
+    pub coefficients_text: Vec<String>,
     /// The message ID, when the metadata was sent as a numbered message.
     pub message_id: Option<String>,
+}
+
+impl PartialEq for TelemetryCoefficients {
+    fn eq(&self, other: &Self) -> bool {
+        self.addressee == other.addressee && self.coefficients == other.coefficients && self.message_id == other.message_id
+    }
 }
 
 /// Telemetry bit sense and project name.
@@ -715,24 +770,29 @@ pub struct BeamHeading {
     pub power_code: char,
 }
 
-/// A telemetry report.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// A telemetry report. [`analog_text`](Self::analog_text) keeps the values as sent (`073`,
+/// `190.0`), so that a received packet writes back byte for byte; it is optional when encoding,
+/// and is not compared by `==`.
+#[derive(Clone, Debug, Default)]
 pub struct Telemetry {
     /// The sequence as sent: usually three digits, or `MIC`.
     pub sequence: String,
-    /// Five analog values as sent (so `073` and `190.0` write back unchanged); `None` for a
-    /// channel sent empty. [`Telemetry::values`] reads them as numbers.
-    pub analog: Vec<Option<String>>,
+    /// Five analog values; `None` for a channel sent empty.
+    pub analog: Vec<Option<f64>>,
+    /// The analog values as sent, one for each of `analog` (or empty); an empty string for a channel
+    /// sent empty. The encoder writes a text that is a telemetry value and still says its number, and
+    /// otherwise writes the number: three digits for a whole number from 0 to 999, else the shortest
+    /// decimal that reads back the same, with no exponent.
+    pub analog_text: Vec<String>,
     /// The eight digital bits as on air, B1 first.
     pub bits: Option<String>,
     /// Text after the bits.
     pub comment: String,
 }
 
-impl Telemetry {
-    /// The analog values as numbers.
-    pub fn values(&self) -> Vec<Option<f64>> {
-        self.analog.iter().map(|v| v.as_deref().and_then(|t| t.parse().ok())).collect()
+impl PartialEq for Telemetry {
+    fn eq(&self, other: &Self) -> bool {
+        self.sequence == other.sequence && self.analog == other.analog && self.bits == other.bits && self.comment == other.comment
     }
 }
 
@@ -817,40 +877,39 @@ pub struct Query {
     pub footprint: Option<Footprint>,
 }
 
-/// A query's target area. The latitude and longitude are kept as sent, a leading space included, so
-/// that ` 34.0` and `-.1715` write back unchanged; [`Footprint::latitude_degrees`] and
-/// [`Footprint::longitude_degrees`] read them as numbers, and [`Footprint::new`] writes them from
-/// numbers.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// A query's target area. [`latitude_text`](Self::latitude_text) and
+/// [`longitude_text`](Self::longitude_text) keep the numbers as sent, a leading space included, so
+/// that ` 34.0` and `-.1715` write back unchanged; they are optional when encoding, and are not
+/// compared by `==`.
+#[derive(Clone, Debug, Default)]
 pub struct Footprint {
-    /// Latitude in decimal degrees as sent: an optional `-`, or for a positive value an optional
-    /// leading space ("Note the leading space in the latitude, as its value is positive", APRS12c
-    /// ch. 15), then digits with an optional decimal point.
-    pub latitude: String,
-    /// Longitude in decimal degrees as sent, written as the latitude is.
-    pub longitude: String,
-    /// Radius, miles.
-    pub radius_miles: u32,
+    /// Latitude in decimal degrees, north positive, within 90 degrees.
+    pub latitude: f64,
+    /// Longitude in decimal degrees, east positive, within 180 degrees.
+    pub longitude: f64,
+    /// Radius in miles: whole when decoded; rounded once when encoded, to 0-9999.
+    pub radius_miles: f64,
+    /// The latitude as sent: an optional `-`, or for a positive value an optional leading space ("Note
+    /// the leading space in the latitude, as its value is positive", APRS12c ch. 15), then digits with
+    /// an optional decimal point; empty if there is none. The encoder writes a text of that form that
+    /// still says the latitude, and otherwise the number as the shortest decimal that reads back the
+    /// same, after a space unless negative.
+    pub latitude_text: String,
+    /// The longitude as sent, written as `latitude_text` is.
+    pub longitude_text: String,
+}
+
+impl PartialEq for Footprint {
+    fn eq(&self, other: &Self) -> bool {
+        self.latitude == other.latitude && self.longitude == other.longitude && self.radius_miles == other.radius_miles
+    }
 }
 
 impl Footprint {
-    /// A footprint from degrees, north and east positive, written as APRS12c ch. 15 writes them: a
-    /// positive value after a space, a negative one with its sign.
-    pub fn new(latitude: f64, longitude: f64, radius_miles: u32) -> Footprint {
-        let text = |v: f64| if v.is_sign_negative() { alloc::format!("{v}") } else { alloc::format!(" {v}") };
-        Footprint { latitude: text(latitude), longitude: text(longitude), radius_miles }
-    }
-
-    /// The latitude in degrees, north positive; `None` when the text is not a number as APRS12c
-    /// writes one, or is beyond 90 degrees.
-    pub fn latitude_degrees(&self) -> Option<f64> {
-        crate::other::footprint_degrees(&self.latitude, 90.0)
-    }
-
-    /// The longitude in degrees, east positive; `None` when the text is not a number as APRS12c
-    /// writes one, or is beyond 180 degrees.
-    pub fn longitude_degrees(&self) -> Option<f64> {
-        crate::other::footprint_degrees(&self.longitude, 180.0)
+    /// A footprint from degrees (north and east positive) and a radius in miles, with no text as sent:
+    /// the encoder writes the numbers as APRS12c ch. 15 writes them, a positive value after a space.
+    pub fn new(latitude: f64, longitude: f64, radius_miles: f64) -> Footprint {
+        Footprint { latitude, longitude, radius_miles, ..Footprint::default() }
     }
 }
 

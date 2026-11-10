@@ -34,7 +34,7 @@ fn a_mic_e_comment_after_a_space_where_only_that_reads_back() {
         ..Default::default()
     };
     let source = pdn_aprs::Address::new("N0CALL").unwrap();
-    let packet = Packet::create_mic_e(source, report, Vec::new()).unwrap();
+    let packet = Packet::create(source, pdn_aprs::Address::new("APZ001").unwrap(), Vec::new(), Data::MicE(report)).unwrap();
     assert!(packet.information.ends_with(b"/A=000101 {5}"), "{}", String::from_utf8_lossy(&packet.information));
     let back = Packet::decode(packet.source, packet.destination, Vec::new(), &packet.information, ParseOptions::STRICT);
     let Data::MicE(m) = back.data else { panic!("a Mic-E report") };
@@ -51,13 +51,14 @@ fn mic_e_telemetry_ending_in_a_cr_is_refused() {
         fields: pdn_aprs::Positioned {
             position: pdn_aprs::Position { latitude: 83.34616666666666, longitude: 40.285833333333336, ambiguity: 0 },
             symbol: pdn_aprs::Symbol::CAR,
-            course_degrees: Some(265),
+            course_degrees: Some(265.0),
             speed_knots: Some(1.0),
             ..Default::default()
         },
         ..Default::default()
     };
     let source = pdn_aprs::Address::new("N0CALL").unwrap();
-    assert!(Packet::create_mic_e(source.clone(), report(13), Vec::new()).is_err());
-    assert!(Packet::create_mic_e(source, report(14), Vec::new()).is_ok());
+    let create = |report| Packet::create(source.clone(), pdn_aprs::Address::new("APZ001").unwrap(), Vec::new(), Data::MicE(report));
+    assert!(create(report(13)).is_err());
+    assert!(create(report(14)).is_ok());
 }

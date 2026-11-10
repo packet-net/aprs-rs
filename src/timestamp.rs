@@ -66,13 +66,13 @@ impl Timestamp {
     }
 
     /// The timestamp as sent on air: `092345z`, `092345/`, `234517h` or `10090556`.
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub(crate) fn to_bytes(self) -> Vec<u8> {
         let mut out = Vec::with_capacity(8);
         let mut two = |n: u8| {
             out.push(b'0' + n / 10 % 10);
             out.push(b'0' + n % 10);
         };
-        match *self {
+        match self {
             Timestamp::DayHourMinute { day, hour, minute, .. } => {
                 two(day);
                 two(hour);
@@ -90,7 +90,7 @@ impl Timestamp {
                 two(minute);
             }
         }
-        match *self {
+        match self {
             Timestamp::DayHourMinute { utc: true, .. } => out.push(b'z'),
             Timestamp::DayHourMinute { utc: false, .. } => out.push(b'/'),
             Timestamp::HourMinuteSecond { .. } => out.push(b'h'),
@@ -102,4 +102,11 @@ impl Timestamp {
 
 fn pair(b: &[u8]) -> u8 {
     (b[0] - b'0') * 10 + (b[1] - b'0')
+}
+
+impl core::fmt::Display for Timestamp {
+    /// The timestamp as sent on air: `092345z`, `092345/`, `234517h` or `10090556`.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        self.to_bytes().iter().try_for_each(|&b| core::fmt::Write::write_char(f, char::from(b)))
+    }
 }

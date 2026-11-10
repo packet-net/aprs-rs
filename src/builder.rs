@@ -7,8 +7,8 @@ use alloc::vec::Vec;
 use crate::packet::{Address, EncodeError, InvalidAddress, Packet, PathEntry};
 use crate::{
     Ack, BeamHeading, Bulletin, CommentTelemetry, Dao, DaoPrecision, Data, ItemReport, Message, MicEMessage, MicEReport, ObjectReport, Phg,
-    Position, PositionReport, Positioned, Reject, Status, Symbol, Telemetry, TelemetryBits, TelemetryCoefficients, TelemetryLabels,
-    Timestamp, Tone, VoiceFrequency, Weather, WeatherReport,
+    Position, PositionReport, Positioned, Reject, Status, Symbol, Telemetry, TelemetryBits, TelemetryCoefficients, TelemetryNames,
+    TelemetryUnits, Timestamp, Tone, VoiceFrequency, Weather, WeatherReport,
 };
 
 /// The destination address a [`Station`] uses until [`Station::to`] sets one: `APZ001`, in the range the
@@ -23,7 +23,7 @@ pub const DEFAULT_DESTINATION: &str = "APZ001";
 /// use pdn_aprs::{Station, Symbol};
 ///
 /// let me = Station::new("M0LTE-9")?.via(&["WIDE1-1", "WIDE2-1"])?;
-/// let packet = me.position(51.4543, -0.9781).symbol(Symbol::CAR).course(88).speed(36.0).comment("Mobile").build()?;
+/// let packet = me.position(51.4543, -0.9781).symbol(Symbol::CAR).course_degrees(88.0).speed_knots(36.0).comment("Mobile").build()?;
 /// assert_eq!(packet.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:!5127.26N/00058.69W>088/036Mobile");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
@@ -32,6 +32,11 @@ pub const DEFAULT_DESTINATION: &str = "APZ001";
 /// reused. `build()` encodes the packet, so anything APRS12c does not allow is refused there with an
 /// [`EncodeError`], as [`Packet::create`] would. `to_data()` gives the [`Data`] alone, for anything the
 /// builder does not cover; [`Station::data`] sends it.
+///
+/// A setter has the name of the field it fills, so its unit is visible at the call site
+/// (`altitude_feet`, `speed_kmh`), and a setter that converts changes only the unit (`altitude_m`,
+/// `temperature_c`, `rain_1h_mm`). A value between the steps a report holds is not rounded by the
+/// builder: the encoder rounds it, once, when the packet is built.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Station {
     source: Address,
@@ -91,7 +96,12 @@ impl Station {
     /// A Mic-E position report, which carries part of its position in the destination address, so ignores
     /// this station's destination (APRS12c ch. 10).
     pub fn mic_e(&self, latitude: f64, longitude: f64) -> MicEBuilder {
-        MicEBuilder { station: self.clone(), common: Common::at(latitude, longitude), message: MicEMessage::OffDuty, messaging: false }
+        MicEBuilder {
+            station: self.clone(),
+            common: Common::at(latitude, longitude),
+            mic_e_message: MicEMessage::OffDuty,
+            messaging: false,
+        }
     }
 
     /// A weather report. With [`at`](WeatherBuilder::at) it is a position report with the weather station
@@ -106,9 +116,6 @@ impl Station {
             messaging: false,
             compressed: false,
             dao: None,
-            wind_direction: None,
-            humidity: None,
-            luminosity: None,
         }
     }
 
@@ -145,38 +152,49 @@ impl Station {
         StatusBuilder { station: self.clone(), status: Status { text: text.to_string(), ..Status::default() } }
     }
 
-    /// A telemetry report with this sequence number, sent as three digits when it is 0-999 (APRS12c ch. 13).
+    /// A telemetry report with this sequence number, sent as three digits; a sequence over 999 is
+    /// refused (APRS12c ch. 13).
     pub fn telemetry(&self, sequence: u16) -> TelemetryBuilder {
-        TelemetryBuilder { station: self.clone(), sequence, analog: Vec::new(), digital: 0, comment: String::new() }
+        TelemetryBuilder { station: self.clone(), sequence, analog: Vec::new(), bits: "00000000".to_string(), comment: String::new() }
     }
 
-    /// The names of this station's telemetry channels, A1-A5 then B1-B8 (`PARM.`, APRS12c ch. 13).
-    pub fn telemetry_names(&self, names: &[&str]) -> DataBuilder {
-        self.data(Data::TelemetryNames(self.labels(names)))
-    }
-
-    /// The units of this station's analog telemetry channels, then the labels of its digital ones
-    /// (`UNIT.`, APRS12c ch. 13).
-    pub fn telemetry_units(&self, units: &[&str]) -> DataBuilder {
-        self.data(Data::TelemetryUnits(self.labels(units)))
-    }
-
-    /// The scaling for this station's analog telemetry channels: a, b and c for each in turn, giving
-    /// a x v^2 + b x v + c (`EQNS.`, APRS12c ch. 13).
-    pub fn telemetry_coefficients(&self, coefficients: &[f64]) -> DataBuilder {
-        self.data(Data::TelemetryCoefficients(TelemetryCoefficients {
+    /// The names of telemetry channels, A1-A5 then B1-B8 (`PARM.`, APRS12c ch. 13), by default this
+    /// station's own.
+    pub fn telemetry_names(&self, names: &[&str]) -> TelemetryMetadataBuilder {
+        self.metadata(Data::TelemetryNames(TelemetryNames {
             addressee: self.source.as_str().to_string(),
-            coefficients: coefficients.iter().map(|c| format!("{c}")).collect(),
+            names: names.iter().map(|l| l.to_string()).collect(),
             message_id: None,
         }))
     }
 
-    /// Which state of each digital channel matches its label (bit 0 is B1), and the project title
-    /// (`BITS.`, APRS12c ch. 13).
-    pub fn telemetry_bits(&self, bits: u8, project: &str) -> DataBuilder {
-        self.data(Data::TelemetryBits(TelemetryBits {
+    /// The units of analog telemetry channels, then the labels of the digital ones (`UNIT.`, APRS12c
+    /// ch. 13), by default this station's own.
+    pub fn telemetry_units(&self, units: &[&str]) -> TelemetryMetadataBuilder {
+        self.metadata(Data::TelemetryUnits(TelemetryUnits {
             addressee: self.source.as_str().to_string(),
-            bits: bit_string(bits),
+            units: units.iter().map(|l| l.to_string()).collect(),
+            message_id: None,
+        }))
+    }
+
+    /// The scaling for analog telemetry channels: a, b and c for each in turn, giving a x v^2 + b x v + c
+    /// (`EQNS.`, APRS12c ch. 13), by default this station's own.
+    pub fn telemetry_coefficients(&self, coefficients: &[f64]) -> TelemetryMetadataBuilder {
+        self.metadata(Data::TelemetryCoefficients(TelemetryCoefficients {
+            addressee: self.source.as_str().to_string(),
+            coefficients: coefficients.to_vec(),
+            coefficients_text: Vec::new(),
+            message_id: None,
+        }))
+    }
+
+    /// Which state of each digital channel matches its label (eight `0` or `1` characters, B1 first),
+    /// and the project title (`BITS.`, APRS12c ch. 13), by default this station's own.
+    pub fn telemetry_bits(&self, bits: &str, project: &str) -> TelemetryMetadataBuilder {
+        self.metadata(Data::TelemetryBits(TelemetryBits {
+            addressee: self.source.as_str().to_string(),
+            bits: bits.to_string(),
             project: project.to_string(),
             message_id: None,
         }))
@@ -187,19 +205,12 @@ impl Station {
         DataBuilder { station: self.clone(), data }
     }
 
-    fn labels(&self, labels: &[&str]) -> TelemetryLabels {
-        TelemetryLabels {
-            addressee: self.source.as_str().to_string(),
-            labels: labels.iter().map(|l| l.to_string()).collect(),
-            message_id: None,
-        }
+    fn metadata(&self, data: Data) -> TelemetryMetadataBuilder {
+        TelemetryMetadataBuilder { station: self.clone(), data }
     }
 
     fn packet(&self, data: Data) -> Result<Packet, EncodeError> {
-        match data {
-            Data::MicE(report) => Packet::create_mic_e(self.source.clone(), report, self.path.clone()),
-            data => Packet::create(self.source.clone(), self.destination.clone(), self.path.clone(), data),
-        }
+        Packet::create(self.source.clone(), self.destination.clone(), self.path.clone(), data)
     }
 }
 
@@ -222,6 +233,40 @@ impl DataBuilder {
     }
 }
 
+/// Telemetry metadata (`PARM.`, `UNIT.`, `EQNS.` or `BITS.`), from [`Station::telemetry_names`] and the
+/// methods after it. It describes the sending station's own telemetry unless
+/// [`addressee`](Self::addressee) says another, as a gateway does for a sensor station.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TelemetryMetadataBuilder {
+    station: Station,
+    data: Data,
+}
+
+impl TelemetryMetadataBuilder {
+    /// The station the metadata describes, instead of the sending station itself.
+    pub fn addressee(mut self, addressee: &str) -> Self {
+        let to = addressee.to_string();
+        match &mut self.data {
+            Data::TelemetryNames(t) => t.addressee = to,
+            Data::TelemetryUnits(t) => t.addressee = to,
+            Data::TelemetryCoefficients(t) => t.addressee = to,
+            Data::TelemetryBits(t) => t.addressee = to,
+            _ => {}
+        }
+        self
+    }
+
+    /// The data, without a header.
+    pub fn to_data(&self) -> Result<Data, EncodeError> {
+        Ok(self.data.clone())
+    }
+
+    /// The packet: the station's header and this metadata, encoded.
+    pub fn build(&self) -> Result<Packet, EncodeError> {
+        self.station.packet(self.data.clone())
+    }
+}
+
 /// What every report that puts something on the map carries besides its own fields.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Common {
@@ -229,12 +274,10 @@ struct Common {
     ambiguity: u8,
     symbol: Option<Symbol>,
     fields: Positioned,
-    tone: Option<f64>,
+    tone: Option<(Tone, u16)>,
     offset_khz: Option<i32>,
     /// An altitude given in metres, which a Mic-E report carries in metres and any other in feet.
-    altitude_metres: Option<f64>,
-    /// The course as given, which is rounded once to its field's step (1 degree, or 4 when compressed).
-    course: Option<f64>,
+    altitude_m: Option<f64>,
 }
 
 impl Common {
@@ -260,7 +303,7 @@ impl Common {
             Position { ambiguity: self.ambiguity, ..position }
         };
         fields.symbol = symbol;
-        if let Some(metres) = self.altitude_metres {
+        if let Some(metres) = self.altitude_m {
             // Mic-E carries its altitude in whole metres (APRS12c ch. 10); a /A= is in feet.
             fields.altitude_feet = Some(if mic_e {
                 crate::steps::round(metres) * crate::comment::METRES_TO_FEET
@@ -268,18 +311,8 @@ impl Common {
                 metres * crate::comment::METRES_TO_FEET
             });
         }
-        if let Some(course) = self.course {
-            // Whether a course is unknown (0) or in range (1-360) is decided in whole degrees; a known
-            // course is then rounded once to the field's step. A compressed 1.2 is the step at north, 360.
-            let whole = degrees(course, 1.0, "course")?;
-            let mut rounded = if fields.compressed { degrees(course, 4.0, "course")? } else { whole };
-            if rounded == 0 && whole != 0 {
-                rounded = 360;
-            }
-            fields.course_degrees = Some(rounded);
-        }
-        // A course of 0 is the spec's unknown course, which Mic-E sends as 0 (APRS12c ch. 10).
-        if mic_e && fields.course_degrees == Some(0) {
+        // A course that rounds to 0 is the spec's unknown course, which Mic-E sends as 0 (APRS12c ch. 10).
+        if mic_e && fields.course_degrees.is_some_and(|c| crate::steps::round(c) == 0.0) {
             fields.course_degrees = None;
         }
         if self.tone.is_some() || self.offset_khz.is_some() {
@@ -287,9 +320,10 @@ impl Common {
                 .frequency
                 .as_mut()
                 .ok_or_else(|| EncodeError::new("a tone or offset needs a frequency: call frequency(mhz) first"))?;
-            if let Some(hz) = self.tone {
-                frequency.tone = Some(Tone::Tone);
-                frequency.tone_value = Some(hz as u16);
+            if let Some((tone, value)) = self.tone {
+                frequency.tone = Some(tone);
+                // `Toff` and the 1750 Hz burst have no value of their own.
+                frequency.tone_value = matches!(tone, Tone::Tone | Tone::Ctcss | Tone::Dcs).then_some(value);
             }
             if let Some(khz) = self.offset_khz {
                 frequency.offset_khz = Some(khz);
@@ -297,25 +331,6 @@ impl Common {
         }
         Ok(fields)
     }
-}
-
-/// `value` in whole degrees, rounded once to the nearest multiple of `step` (halves away from zero),
-/// then checked against the 0-360 the field holds.
-fn degrees(value: f64, step: f64, what: &str) -> Result<u16, EncodeError> {
-    let rounded = if value.is_finite() { crate::steps::round(value / step) * step } else { f64::NAN };
-    if !(0.0..=360.0).contains(&rounded) {
-        return Err(EncodeError::new(format!("{what} must round to 0-360 degrees")));
-    }
-    Ok(rounded as u16)
-}
-
-/// `value` rounded once to the nearest whole number (halves away from zero), which must lie in `low..=high`.
-fn whole_in(value: f64, low: f64, high: f64, what: &str) -> Result<f64, EncodeError> {
-    let rounded = if value.is_finite() { crate::steps::round(value) } else { f64::NAN };
-    if !(low..=high).contains(&rounded) {
-        return Err(EncodeError::new(format!("{what} is outside what a report holds once rounded")));
-    }
-    Ok(rounded)
 }
 
 /// The centre of the box that holds `degrees` once `ambiguity` (1-4) digits are blanked: the
@@ -349,35 +364,35 @@ macro_rules! positioned_methods {
         /// Course over ground in degrees clockwise from north, 1-360: 360 is north, and 0 is the
         /// spec's unknown course (APRS12c ch. 7 and 10), which a compressed report cannot send. A
         /// course between the steps the report holds (whole degrees, or 4 degrees compressed) is
-        /// rounded to the nearest, once, from the value given.
-        pub fn course(mut self, degrees: impl Into<f64>) -> Self {
-            self.common.course = Some(degrees.into());
+        /// rounded to the nearest, once, when the packet is built.
+        pub fn course_degrees(mut self, degrees: f64) -> Self {
+            self.common.fields.course_degrees = Some(degrees);
             self
         }
 
         /// Speed over ground in knots.
-        pub fn speed(mut self, knots: f64) -> Self {
+        pub fn speed_knots(mut self, knots: f64) -> Self {
             self.common.fields.speed_knots = Some(knots);
             self
         }
 
         /// Speed over ground in kilometres per hour, sent in knots.
         pub fn speed_kmh(self, kilometres_per_hour: f64) -> Self {
-            self.speed(kilometres_per_hour / 1.852)
+            self.speed_knots(kilometres_per_hour / 1.852)
         }
 
         /// Altitude above mean sea level in feet (`/A=`), sent to the nearest foot.
-        pub fn altitude(mut self, feet: f64) -> Self {
+        pub fn altitude_feet(mut self, feet: f64) -> Self {
             self.common.fields.altitude_feet = Some(feet);
-            self.common.altitude_metres = None;
+            self.common.altitude_m = None;
             self
         }
 
         /// Altitude above mean sea level in metres: in a Mic-E report, in its altitude bytes to the
         /// nearest metre; otherwise converted to feet for a `/A=`, to the nearest foot.
-        pub fn altitude_metres(mut self, metres: f64) -> Self {
+        pub fn altitude_m(mut self, metres: f64) -> Self {
             self.common.fields.altitude_feet = None;
-            self.common.altitude_metres = Some(metres);
+            self.common.altitude_m = Some(metres);
             self
         }
 
@@ -394,22 +409,25 @@ macro_rules! positioned_methods {
         }
 
         /// Omnidirectional radio range in miles (`RNGrrrr`, APRS12c ch. 7).
-        pub fn range(mut self, miles: f64) -> Self {
+        pub fn range_miles(mut self, miles: f64) -> Self {
             self.common.fields.range_miles = Some(miles);
             self
         }
 
         /// A voice frequency at the start of the comment, as radios with a tune button read it
-        /// (`145.725MHz`, APRS12c ch. 18). Add [`tone`](Self::tone) and [`offset_khz`](Self::offset_khz) after it.
+        /// (`145.725MHz`, APRS12c ch. 18), rounded to the nearest kHz. Add [`tone`](Self::tone) and
+        /// [`offset_khz`](Self::offset_khz) after it.
         pub fn frequency(mut self, mhz: f64) -> Self {
             self.common.fields.frequency = Some(VoiceFrequency { mhz, ..VoiceFrequency::default() });
             self
         }
 
-        /// The CTCSS access tone for [`frequency`](Self::frequency), in Hz; its tenths are not sent
-        /// (`118.8` sends `T118`).
-        pub fn tone(mut self, hz: f64) -> Self {
-            self.common.tone = Some(hz);
+        /// The tone field for [`frequency`](Self::frequency): a kind, [`Tone::Tone`], [`Tone::Ctcss`] or
+        /// [`Tone::Dcs`], and its value as sent, a whole number of Hz or a DCS code (`Tone::Tone, 118`
+        /// sends `T118`; 118.8 Hz is sent as 118). [`Tone::Off`] and [`Tone::ToneBurst`] have no value,
+        /// which is ignored.
+        pub fn tone(mut self, tone: Tone, value: u16) -> Self {
+            self.common.tone = Some((tone, value));
             self
         }
 
@@ -446,17 +464,11 @@ macro_rules! positioned_methods {
             self
         }
 
-        /// Base-91 telemetry in the comment (`|ss1122..|`, APRS12c ch. 13): a sequence number and 1-5 analog
-        /// values, each 0-8280.
-        pub fn telemetry(mut self, sequence: u16, analog: &[u16]) -> Self {
-            self.common.fields.telemetry = Some(CommentTelemetry { sequence, analog: analog.to_vec(), digital: None });
-            self
-        }
-
-        /// Base-91 telemetry in the comment with the 8 digital bits (bit 0 is B1), which can only follow all 5
-        /// analog values.
-        pub fn telemetry_with_bits(mut self, sequence: u16, analog: &[u16], digital: u8) -> Self {
-            self.common.fields.telemetry = Some(CommentTelemetry { sequence, analog: analog.to_vec(), digital: Some(digital) });
+        /// Base-91 telemetry in the comment (`|ss1122..|`, APRS12c ch. 13): a sequence number, 1-5 analog
+        /// values, each 0-8280, and optionally the 8 digital bits, which can only follow all 5 analog
+        /// values.
+        pub fn telemetry(mut self, telemetry: CommentTelemetry) -> Self {
+            self.common.fields.telemetry = Some(telemetry);
             self
         }
     };
@@ -528,7 +540,7 @@ impl ObjectBuilder {
     }
 
     /// Kills the object, removing it from maps (`_` rather than `*`).
-    pub fn kill(mut self) -> Self {
+    pub fn killed(mut self) -> Self {
         self.killed = true;
         self
     }
@@ -560,7 +572,7 @@ impl ItemBuilder {
     positioned_methods!();
 
     /// Kills the item, removing it from maps (`_` rather than `!`).
-    pub fn kill(mut self) -> Self {
+    pub fn killed(mut self) -> Self {
         self.killed = true;
         self
     }
@@ -582,7 +594,7 @@ impl ItemBuilder {
 pub struct MicEBuilder {
     station: Station,
     common: Common,
-    message: MicEMessage,
+    mic_e_message: MicEMessage,
     messaging: bool,
 }
 
@@ -590,8 +602,8 @@ impl MicEBuilder {
     positioned_methods!();
 
     /// The position comment, e.g. [`MicEMessage::EnRoute`].
-    pub fn message(mut self, message: MicEMessage) -> Self {
-        self.message = message;
+    pub fn mic_e_message(mut self, message: MicEMessage) -> Self {
+        self.mic_e_message = message;
         self
     }
 
@@ -605,9 +617,11 @@ impl MicEBuilder {
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
         Ok(Data::MicE(MicEReport {
-            message: self.message,
+            mic_e_message: self.mic_e_message,
             // The type code says whether the station can message (APRS 1.2 Mic-E type codes).
             type_code: Some(if self.messaging { '`' } else { '\'' }),
+            // An altitude given in feet goes in a `/A=`, one in metres in the Mic-E altitude bytes.
+            altitude_in_comment: self.common.altitude_m.is_none() && self.common.fields.altitude_feet.is_some(),
             fields: self.common.positioned("a Mic-E report", true)?,
             ..MicEReport::default()
         }))
@@ -616,19 +630,13 @@ impl MicEBuilder {
     /// The packet: the station's source and path, the destination this report computes, and the report.
     /// An altitude given in feet goes in a `/A=`, one in metres in the Mic-E altitude bytes.
     pub fn build(&self) -> Result<Packet, EncodeError> {
-        match self.to_data()? {
-            Data::MicE(report) => {
-                let feet_in_text = self.common.altitude_metres.is_none() && report.fields.altitude_feet.is_some();
-                Packet::create_mic_e_with(self.station.source.clone(), report, self.station.path.clone(), feet_in_text)
-            }
-            data => self.station.packet(data),
-        }
+        self.station.packet(self.to_data()?)
     }
 }
 
 /// A weather report, from [`Station::weather`] (APRS12c ch. 12). With a position it is a position report
 /// with the weather station symbol; without, a positionless weather report. Values are in the units APRS
-/// sends (mph, Fahrenheit, inches, millibars); the `_celsius` and `_mm` methods convert.
+/// sends (mph, Fahrenheit, inches, millibars); the `_c` and `_mm` methods convert.
 #[derive(Clone, Debug, PartialEq)]
 pub struct WeatherBuilder {
     station: Station,
@@ -639,10 +647,6 @@ pub struct WeatherBuilder {
     messaging: bool,
     compressed: bool,
     dao: Option<Dao>,
-    /// Wind direction, humidity and luminosity as given, rounded once to their steps when built.
-    wind_direction: Option<f64>,
-    humidity: Option<f64>,
-    luminosity: Option<f64>,
 }
 
 impl WeatherBuilder {
@@ -685,93 +689,92 @@ impl WeatherBuilder {
         self
     }
 
-    /// Wind direction in degrees clockwise from north, and sustained one-minute speed in mph. A
-    /// direction between the steps the report holds (whole degrees, or 4 degrees compressed) is rounded
-    /// to the nearest, once, from the value given.
-    pub fn wind(self, direction_degrees: impl Into<f64>, speed_mph: f64) -> Self {
-        let mut b = self.wind_direction(direction_degrees);
-        b.weather.wind_speed_mph = Some(speed_mph);
-        b
+    /// Wind direction in degrees clockwise from north. A direction between the steps the report holds
+    /// (whole degrees, or 4 degrees compressed) is rounded to the nearest, once, when the packet is
+    /// built. A compressed report needs the speed too.
+    pub fn wind_direction_degrees(mut self, degrees: f64) -> Self {
+        self.weather.wind_direction_degrees = Some(degrees);
+        self
     }
 
-    /// Wind direction alone, in degrees clockwise from north, rounded as in [`wind`](Self::wind). A
-    /// compressed report needs the speed too.
-    pub fn wind_direction(mut self, degrees: impl Into<f64>) -> Self {
-        self.wind_direction = Some(degrees.into());
+    /// The sustained one-minute wind speed in mph.
+    pub fn wind_speed_mph(mut self, mph: f64) -> Self {
+        self.weather.wind_speed_mph = Some(mph);
         self
     }
 
     /// The peak wind gust in the last five minutes, in mph.
-    pub fn gust(mut self, mph: f64) -> Self {
+    pub fn wind_gust_mph(mut self, mph: f64) -> Self {
         self.weather.wind_gust_mph = Some(mph);
         self
     }
 
     /// Temperature in degrees Fahrenheit, sent to the nearest degree.
-    pub fn temperature(mut self, fahrenheit: f64) -> Self {
+    pub fn temperature_f(mut self, fahrenheit: f64) -> Self {
         self.weather.temperature_f = Some(fahrenheit);
         self
     }
 
     /// Temperature in degrees Celsius, sent to the nearest degree Fahrenheit.
-    pub fn temperature_celsius(self, celsius: f64) -> Self {
-        self.temperature(celsius * 9.0 / 5.0 + 32.0)
+    pub fn temperature_c(self, celsius: f64) -> Self {
+        self.temperature_f(celsius * 9.0 / 5.0 + 32.0)
     }
 
-    /// Relative humidity, 1-100 percent, rounded to the nearest whole percent (99.7 is sent as 100%;
-    /// a value that rounds to 0 is refused, since the report's `h00` means 100).
-    pub fn humidity(mut self, percent: impl Into<f64>) -> Self {
-        self.humidity = Some(percent.into());
+    /// Relative humidity, 1-100 percent, rounded to the nearest whole percent when the packet is built
+    /// (99.7 is sent as 100%; a value that rounds to 0 is refused, since the report's `h00` means 100).
+    pub fn humidity_percent(mut self, percent: f64) -> Self {
+        self.weather.humidity_percent = Some(percent);
         self
     }
 
     /// Barometric pressure in millibars (hPa), sent to a tenth.
-    pub fn pressure(mut self, millibars: f64) -> Self {
+    pub fn pressure_mbar(mut self, millibars: f64) -> Self {
         self.weather.pressure_mbar = Some(millibars);
         self
     }
 
     /// Rainfall in the last hour, in inches.
-    pub fn rain_last_hour(mut self, inches: f64) -> Self {
+    pub fn rain_1h_in(mut self, inches: f64) -> Self {
         self.weather.rain_1h_in = Some(inches);
         self
     }
 
     /// Rainfall in the last 24 hours, in inches.
-    pub fn rain_last_24_hours(mut self, inches: f64) -> Self {
+    pub fn rain_24h_in(mut self, inches: f64) -> Self {
         self.weather.rain_24h_in = Some(inches);
         self
     }
 
     /// Rainfall since local midnight, in inches.
-    pub fn rain_since_midnight(mut self, inches: f64) -> Self {
+    pub fn rain_midnight_in(mut self, inches: f64) -> Self {
         self.weather.rain_midnight_in = Some(inches);
         self
     }
 
     /// Rainfall in the last hour, in millimetres, sent in inches.
-    pub fn rain_last_hour_mm(self, millimetres: f64) -> Self {
-        self.rain_last_hour(millimetres / 25.4)
+    pub fn rain_1h_mm(self, millimetres: f64) -> Self {
+        self.rain_1h_in(millimetres / 25.4)
     }
 
     /// Rainfall in the last 24 hours, in millimetres, sent in inches.
-    pub fn rain_last_24_hours_mm(self, millimetres: f64) -> Self {
-        self.rain_last_24_hours(millimetres / 25.4)
+    pub fn rain_24h_mm(self, millimetres: f64) -> Self {
+        self.rain_24h_in(millimetres / 25.4)
     }
 
     /// Rainfall since local midnight, in millimetres, sent in inches.
-    pub fn rain_since_midnight_mm(self, millimetres: f64) -> Self {
-        self.rain_since_midnight(millimetres / 25.4)
+    pub fn rain_midnight_mm(self, millimetres: f64) -> Self {
+        self.rain_midnight_in(millimetres / 25.4)
     }
 
-    /// Luminosity in watts per square metre, 0-1999, rounded to the nearest whole number.
-    pub fn luminosity(mut self, watts_per_square_metre: impl Into<f64>) -> Self {
-        self.luminosity = Some(watts_per_square_metre.into());
+    /// Luminosity in watts per square metre, 0-1999, rounded to the nearest whole number when the
+    /// packet is built.
+    pub fn luminosity_w_m2(mut self, watts_per_square_metre: f64) -> Self {
+        self.weather.luminosity_w_m2 = Some(watts_per_square_metre);
         self
     }
 
     /// Snowfall in the last 24 hours, in inches.
-    pub fn snowfall(mut self, inches: f64) -> Self {
+    pub fn snow_24h_in(mut self, inches: f64) -> Self {
         self.weather.snow_24h_in = Some(inches);
         self
     }
@@ -779,25 +782,12 @@ impl WeatherBuilder {
     /// Every observation at once, replacing any set before.
     pub fn observations(mut self, weather: Weather) -> Self {
         self.weather = weather;
-        self.wind_direction = None;
-        self.humidity = None;
-        self.luminosity = None;
         self
     }
 
     /// The data, without a header: a position report with a position, otherwise a positionless report.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
-        let mut weather = self.weather.clone();
-        if let Some(d) = self.wind_direction {
-            weather.wind_direction_degrees =
-                Some(degrees(d, if self.compressed && self.position.is_some() { 4.0 } else { 1.0 }, "wind direction")?);
-        }
-        if let Some(h) = self.humidity {
-            weather.humidity_percent = Some(whole_in(h, 0.0, 255.0, "humidity")? as u8);
-        }
-        if let Some(l) = self.luminosity {
-            weather.luminosity_w_m2 = Some(whole_in(l, 0.0, 65535.0, "luminosity")? as u16);
-        }
+        let weather = self.weather.clone();
         if let Some(position) = self.position {
             let fields = Positioned {
                 position,
@@ -833,12 +823,12 @@ pub struct MessageBuilder {
 
 impl MessageBuilder {
     /// A message ID (1-5 letters or digits), which asks the other station to acknowledge it.
-    pub fn id(mut self, id: &str) -> Self {
+    pub fn message_id(mut self, id: &str) -> Self {
         self.message.message_id = Some(id.to_string());
         self
     }
 
-    /// Uses the reply-ack format (APRS12c ch. 14), which needs [`id`](Self::id): acknowledges the other
+    /// Uses the reply-ack format (APRS12c ch. 14), which needs [`message_id`](Self::message_id): acknowledges the other
     /// station's message `their_id` in the same packet, or with `""` just says this station understands
     /// reply-acks.
     pub fn reply_ack(mut self, their_id: &str) -> Self {
@@ -905,9 +895,15 @@ impl StatusBuilder {
         self
     }
 
-    /// A 4- or 6-character Maidenhead locator and a symbol at the start, e.g. `IO91SX/-`.
-    pub fn locator(mut self, maidenhead_locator: &str, symbol: Symbol) -> Self {
+    /// A 4- or 6-character Maidenhead locator at the start, e.g. `IO91SX`. It goes with a
+    /// [`symbol`](Self::symbol): one without the other is refused when built.
+    pub fn locator(mut self, maidenhead_locator: &str) -> Self {
         self.status.locator = Some(maidenhead_locator.to_string());
+        self
+    }
+
+    /// The symbol after the locator, e.g. [`Symbol::HOUSE`]. Only with a [`locator`](Self::locator).
+    pub fn symbol(mut self, symbol: Symbol) -> Self {
         self.status.symbol = Some(symbol);
         self
     }
@@ -937,27 +933,21 @@ pub struct TelemetryBuilder {
     station: Station,
     sequence: u16,
     analog: Vec<Option<f64>>,
-    digital: u8,
+    bits: String,
     comment: String,
 }
 
 impl TelemetryBuilder {
-    /// Up to 5 analog values, A1 first; any not given are sent empty.
-    pub fn analog(mut self, values: &[f64]) -> Self {
-        self.analog = values.iter().map(|&v| Some(v)).collect();
-        self
-    }
-
     /// Up to 5 analog values, A1 first, each of which may be `None` to send that channel empty, before a
     /// filled one or after; any not given are sent empty.
-    pub fn channels(mut self, values: &[Option<f64>]) -> Self {
+    pub fn analog(mut self, values: &[Option<f64>]) -> Self {
         self.analog = values.to_vec();
         self
     }
 
-    /// The 8 digital channels; bit 0 is B1.
-    pub fn digital(mut self, bits: u8) -> Self {
-        self.digital = bits;
+    /// The 8 digital channels as eight `0` or `1` characters, B1 first; all `0` unless set.
+    pub fn bits(mut self, bits: &str) -> Self {
+        self.bits = bits.to_string();
         self
     }
 
@@ -975,12 +965,13 @@ impl TelemetryBuilder {
         if self.analog.len() > 5 {
             return Err(EncodeError::new("a telemetry report carries at most 5 analog values (APRS12c ch. 13)"));
         }
-        let mut analog: Vec<Option<String>> = self.analog.iter().map(|&v| v.map(telemetry_value)).collect();
+        let mut analog = self.analog.clone();
         analog.resize(5, None);
         Ok(Data::Telemetry(Telemetry {
             sequence: format!("{:03}", self.sequence),
             analog,
-            bits: Some(bit_string(self.digital)),
+            analog_text: Vec::new(),
+            bits: Some(self.bits.clone()),
             comment: self.comment.clone(),
         }))
     }
@@ -989,15 +980,4 @@ impl TelemetryBuilder {
     pub fn build(&self) -> Result<Packet, EncodeError> {
         self.station.packet(self.to_data()?)
     }
-}
-
-/// A telemetry value as sent: three digits for a whole number 0-999, as APRS12c writes them, otherwise
-/// the shortest decimal form.
-fn telemetry_value(v: f64) -> String {
-    if (0.0..=999.0).contains(&v) && libm::trunc(v) == v { format!("{:03}", v as u16) } else { format!("{v}") }
-}
-
-/// Eight `0`/`1` characters, B1 (bit 0) first.
-fn bit_string(bits: u8) -> String {
-    (0..8).map(|i| if bits & (1 << i) != 0 { '1' } else { '0' }).collect()
 }
