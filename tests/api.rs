@@ -160,6 +160,27 @@ fn numbers_kept_as_sent_are_written_back_while_they_still_say_the_number() {
 }
 
 #[test]
+fn text_as_sent_must_say_exactly_the_number() {
+    let coefficients = |text: &str| TelemetryCoefficients {
+        addressee: "M0LTE".into(),
+        coefficients: vec![0.1 + 0.2],
+        coefficients_text: vec![text.into()],
+        message_id: None,
+    };
+    // 0.1 + 0.2 is not 0.3, so the text does not say it: the number is written.
+    assert_eq!(info(Data::TelemetryCoefficients(coefficients("0.3"))), ":M0LTE    :EQNS.0.30000000000000004");
+    let telemetry = Telemetry {
+        sequence: "001".into(),
+        analog: vec![Some(1.0), None, None, None, None],
+        analog_text: vec!["1.0000000001".into()],
+        bits: Some("00000000".into()),
+        ..Telemetry::default()
+    };
+    assert_eq!(info(Data::Telemetry(telemetry)), "T#001,001,,,,,00000000");
+    assert_eq!(Phg { power: 1, height: 61, gain: 0, directivity: 0, beacons_per_hour: None }.height_feet(), 10.0 * 2f64.powi(61));
+}
+
+#[test]
 fn a_refusal_has_a_reason_to_read() {
     let refused =
         Data::Message(pdn_aprs::Message { addressee: "N0CALL".into(), text: "x".repeat(68), ..Default::default() }).encode().unwrap_err();
@@ -182,7 +203,7 @@ fn small_things_a_program_reads() {
     assert_eq!(Symbol::GATEWAY.with_overlay('I').unwrap().description(), Symbol::GATEWAY.description());
     assert_eq!(Symbol::new('/', ' ').description(), None);
     let phg = Phg { power: 5, height: 3, gain: 6, directivity: 2, beacons_per_hour: None };
-    assert_eq!((phg.power_watts(), phg.height_feet(), phg.gain_db(), phg.directivity_degrees()), (25, 80, 6, Some(90)));
+    assert_eq!((phg.power_watts(), phg.height_feet(), phg.gain_db(), phg.directivity_degrees()), (25, 80.0, 6, Some(90)));
     assert_eq!(Phg { directivity: 0, ..phg }.directivity_degrees(), None);
 }
 

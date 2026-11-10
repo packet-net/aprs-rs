@@ -234,9 +234,9 @@ impl Phg {
         u32::from(self.power) * u32::from(self.power)
     }
 
-    /// The antenna height in feet the code stands for: 10 x 2^code (saturating, for the largest codes).
-    pub fn height_feet(&self) -> u64 {
-        1u64.checked_shl(u32::from(self.height)).map_or(u64::MAX, |p| p.saturating_mul(10))
+    /// The antenna height in feet the code stands for: 10 x 2^code (exact as a float for every code).
+    pub fn height_feet(&self) -> f64 {
+        libm::ldexp(10.0, i32::from(self.height))
     }
 
     /// The antenna gain in dB the code stands for (dBi, as the spec gives it).

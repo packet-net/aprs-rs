@@ -287,7 +287,7 @@ pub(crate) fn is_coefficient(t: &str) -> bool {
 
 /// Whether `text` is a number of the form `form` allows that still says `value`.
 fn says(text: &str, value: f64, form: fn(&str) -> bool) -> bool {
-    form(text) && text.parse::<f64>().is_ok_and(|n| crate::steps::same_number(n, value))
+    form(text) && text.parse::<f64>().is_ok_and(|n| n == value)
 }
 
 /// A number as it is written: the text it was sent as, when that is a number of the form the spec

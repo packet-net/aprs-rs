@@ -113,7 +113,7 @@ pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
                 && back.analog.len() == t.analog.len()
                 && back.analog.iter().zip(&t.analog).all(|(x, y)| match (x, y) {
                     (None, None) => true,
-                    (Some(x), Some(y)) => crate::steps::same_number(*x, *y),
+                    (Some(x), Some(y)) => x == y,
                     _ => false,
                 }) =>
         {

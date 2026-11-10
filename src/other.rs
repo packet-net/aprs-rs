@@ -323,7 +323,7 @@ pub(crate) fn footprint_degrees(t: &str, limit: f64) -> Option<f64> {
 /// shortest decimal that reads back the same, after a space unless it is negative (0 included).
 fn footprint_text(value: f64, text: &str, limit: f64, what: &str) -> Result<String, EncodeError> {
     if let Some(sent) = footprint_degrees(text, limit) {
-        if crate::steps::same_number(sent, value) {
+        if sent == value {
             return Ok(text.to_string());
         }
     }
