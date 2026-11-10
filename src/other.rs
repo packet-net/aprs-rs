@@ -557,12 +557,21 @@ fn encode_nmea(n: &Nmea) -> Result<Vec<u8>, EncodeError> {
     fn agrees<T: PartialEq>(given: &Option<T>, read: &Option<T>) -> bool {
         given.is_none() || given == read
     }
-    if !(agrees(&n.latitude, &read.latitude)
-        && agrees(&n.longitude, &read.longitude)
+    // Degrees reached by other arithmetic differ in the last bits, so numbers agree within a
+    // part in 10^9 (absolute below 1), as the vectors compare them.
+    fn near(given: &Option<f64>, read: &Option<f64>) -> bool {
+        match (given, read) {
+            (None, _) => true,
+            (Some(g), Some(r)) => (g - r).abs() <= 1e-9 * g.abs().max(r.abs()).max(1.0),
+            (Some(_), None) => false,
+        }
+    }
+    if !(near(&n.latitude, &read.latitude)
+        && near(&n.longitude, &read.longitude)
         && agrees(&n.fix_valid, &read.fix_valid)
-        && agrees(&n.course_degrees, &read.course_degrees)
-        && agrees(&n.speed_knots, &read.speed_knots)
-        && agrees(&n.altitude_m, &read.altitude_m)
+        && near(&n.course_degrees, &read.course_degrees)
+        && near(&n.speed_knots, &read.speed_knots)
+        && near(&n.altitude_m, &read.altitude_m)
         && agrees(&n.time, &read.time)
         && agrees(&n.waypoint, &read.waypoint))
     {
