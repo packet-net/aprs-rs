@@ -253,13 +253,13 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
                 report.fields.altitude_feet = altitude(&s[i..]);
                 s.drain(i..i + 4);
                 joined = Some(i);
-            } else if comment::dao_span(&s).is_some_and(|d| joins_into_altitude(&s, d)) {
-                // Strictly the altitude is text and the !DAO! is lifted as usual, unless lifting
-                // it would join the bytes either side into an altitude, which the packet does not
-                // hold there: that reading is rejected (vectors README, Mic-E).
+            } else if joins_into_altitude(&s) {
+                // Strictly the altitude is text and telemetry and the !DAO! are lifted as usual,
+                // unless what is left holds an altitude across a place one was taken from, which
+                // a lenient reader would then take: that reading is rejected (vectors README, Mic-E).
                 ctx.error(
                     Code::MicEAltitudeNotFirst,
-                    "lifting the !DAO! would join the status text either side of it into a Mic-E altitude (APRS12c ch. 10)",
+                    "lifting telemetry and the !DAO! would join the status text into a Mic-E altitude (APRS12c ch. 10)",
                     Some(offset + i),
                 );
                 return false;
@@ -269,13 +269,22 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
     comment::tail(ctx, &mut report.fields, &s, offset, joined)
 }
 
-/// Whether taking `dao` out of `s` brings the bytes either side of it together into a Mic-E
-/// altitude, `xxx}` across the join.
-fn joins_into_altitude(s: &[u8], dao: core::ops::Range<usize>) -> bool {
+/// Whether the text left once base-91 telemetry and the `!DAO!` are lifted out of `s` holds a
+/// Mic-E altitude, `xxx}`, across a place one was taken from.
+fn joins_into_altitude(s: &[u8]) -> bool {
     let mut rest = s.to_vec();
-    rest.drain(dao.clone());
-    let join = dao.start;
-    (join.saturating_sub(3)..join).any(|j| altitude(&rest[j..]).is_some())
+    let mut joins = Vec::new();
+    // Spans come last first, so each join's place in what is left is its span's start less the
+    // lengths of the spans before it, taken out later.
+    let spans = comment::telemetry_and_dao_spans(s);
+    for r in &spans {
+        rest.drain(r.clone());
+    }
+    for r in &spans {
+        let before: usize = spans.iter().filter(|o| o.start < r.start).map(|o| o.len()).sum();
+        joins.push(r.start - before);
+    }
+    joins.iter().any(|&join| (join.saturating_sub(3)..join).any(|j| altitude(&rest[j..]).is_some()))
 }
 
 /// Whether two numbers are the same value, as the vectors compare them: within 1e-9, relative
@@ -577,6 +586,11 @@ pub(crate) fn encode_with(r: &MicEReport, feet_in_text: bool) -> Result<(Address
         out.extend_from_slice(text);
         out.extend_from_slice(&trailer);
         out.extend_from_slice(suffix);
+        // A CR or LF at the end (the last byte of Rev 0 telemetry, say) reads back as a
+        // trailing line break, a warning.
+        if matches!(out.last(), Some(b'\r' | b'\n')) {
+            return Err(EncodeError::new("the information field would end in a CR or LF, which reads back as a trailing line break"));
+        }
         if reads_back(r, &out[status_start..]) {
             let destination = Address::new(&dest).map_err(|_| EncodeError::new("the Mic-E destination is not an address"))?;
             return Ok((destination, out));

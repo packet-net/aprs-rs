@@ -197,19 +197,19 @@ fn lift_telemetry_and_dao(ctx: &mut Context, fields: &mut Positioned, c: &mut Ve
     true
 }
 
-/// Where the `!DAO!` [`tail`] would lift out of `c` is.
-pub(crate) fn dao_span(c: &[u8]) -> Option<core::ops::Range<usize>> {
-    find_dao(c, find_telemetry(c).map(|t| t.0), None).map(|d| d.0)
+/// Where the base-91 telemetry and `!DAO!` [`tail`] would lift out of `c` are, last first.
+pub(crate) fn telemetry_and_dao_spans(c: &[u8]) -> Vec<core::ops::Range<usize>> {
+    let telemetry = find_telemetry(c).map(|t| t.0);
+    let dao = find_dao(c, telemetry.clone(), None).map(|d| d.0);
+    let mut spans: Vec<core::ops::Range<usize>> = telemetry.into_iter().chain(dao).collect();
+    spans.sort_by_key(|r| core::cmp::Reverse(r.start));
+    spans
 }
 
 /// `c` with its base-91 telemetry and `!DAO!` taken out, as [`tail`] would lift them.
 pub(crate) fn without_telemetry_and_dao(c: &[u8]) -> Vec<u8> {
-    let telemetry = find_telemetry(c).map(|t| t.0);
-    let dao = find_dao(c, telemetry.clone(), None).map(|d| d.0);
-    let mut removals: Vec<core::ops::Range<usize>> = telemetry.into_iter().chain(dao).collect();
-    removals.sort_by_key(|r| core::cmp::Reverse(r.start));
     let mut rest = c.to_vec();
-    for r in removals {
+    for r in telemetry_and_dao_spans(c) {
         rest.drain(r);
     }
     rest

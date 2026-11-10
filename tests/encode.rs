@@ -41,3 +41,23 @@ fn a_mic_e_comment_after_a_space_where_only_that_reads_back() {
     assert_eq!(m.fields.comment, "{5}");
     assert_eq!(m.fields.altitude_feet, Some(101.0));
 }
+
+/// Rev 0 Mic-E telemetry whose last byte is a CR would end the information field in one, which
+/// reads back as a trailing line break: refused.
+#[test]
+fn mic_e_telemetry_ending_in_a_cr_is_refused() {
+    let report = |last: u8| pdn_aprs::MicEReport {
+        legacy_telemetry: vec![203, 184, 177, 127, last],
+        fields: pdn_aprs::Positioned {
+            position: pdn_aprs::Position { latitude: 83.34616666666666, longitude: 40.285833333333336, ambiguity: 0 },
+            symbol: pdn_aprs::Symbol::CAR,
+            course_degrees: Some(265),
+            speed_knots: Some(1.0),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let source = pdn_aprs::Address::new("N0CALL").unwrap();
+    assert!(Packet::create_mic_e(source.clone(), report(13), Vec::new()).is_err());
+    assert!(Packet::create_mic_e(source, report(14), Vec::new()).is_ok());
+}
