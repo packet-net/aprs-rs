@@ -2,7 +2,9 @@
 //! parsing, plus the defaults and the refusals. The expected lines are the ones Packet.Aprs's builder
 //! tests expect, so the two builders are held to the same output.
 
-use pdn_aprs::{Data, MicEMessage, Packet, ParseOptions, Phg, PositionReport, Severity, Station, Symbol, Timestamp};
+use pdn_aprs::{
+    CommentTelemetry, Data, MicEMessage, Packet, ParseOptions, Phg, PositionReport, Severity, Station, Symbol, Timestamp, Tone,
+};
 
 fn me() -> Station {
     Station::new("M0LTE").unwrap()
@@ -31,9 +33,9 @@ fn a_position_report() {
         .unwrap()
         .position(51.4543, -0.9781)
         .symbol(Symbol::CAR)
-        .course(88)
-        .speed(36.0)
-        .altitude(120.0)
+        .course_degrees(88.0)
+        .speed_knots(36.0)
+        .altitude_feet(120.0)
         .comment("Mobile")
         .build()
         .unwrap();
@@ -57,8 +59,7 @@ fn a_compressed_position_decodes_to_what_was_given() {
 
 #[test]
 fn other_units_are_converted_to_the_ones_aprs_sends() {
-    let Data::Position(report) =
-        me().position(51.4543, -0.9781).symbol(Symbol::CAR).speed_kmh(100.0).altitude_metres(100.0).to_data().unwrap()
+    let Data::Position(report) = me().position(51.4543, -0.9781).symbol(Symbol::CAR).speed_kmh(100.0).altitude_m(100.0).to_data().unwrap()
     else {
         panic!()
     };
@@ -97,9 +98,12 @@ fn a_dao_on_a_compressed_position_follows_the_position_reported() {
 
 #[test]
 fn messages() {
-    assert_eq!(sent(me().message("G3NRW", "Hi Ian").id("01").build().unwrap()), "M0LTE>APZ001::G3NRW    :Hi Ian{01");
-    assert_eq!(sent(me().message("G3NRW", "Hi Ian").id("02").reply_ack("17").build().unwrap()), "M0LTE>APZ001::G3NRW    :Hi Ian{02}17");
-    assert_eq!(sent(me().message("G3NRW", "Hi Ian").id("03").reply_ack("").build().unwrap()), "M0LTE>APZ001::G3NRW    :Hi Ian{03}");
+    assert_eq!(sent(me().message("G3NRW", "Hi Ian").message_id("01").build().unwrap()), "M0LTE>APZ001::G3NRW    :Hi Ian{01");
+    assert_eq!(
+        sent(me().message("G3NRW", "Hi Ian").message_id("02").reply_ack("17").build().unwrap()),
+        "M0LTE>APZ001::G3NRW    :Hi Ian{02}17"
+    );
+    assert_eq!(sent(me().message("G3NRW", "Hi Ian").message_id("03").reply_ack("").build().unwrap()), "M0LTE>APZ001::G3NRW    :Hi Ian{03}");
 }
 
 #[test]
@@ -124,7 +128,7 @@ fn an_object_announcing_a_repeater() {
         .symbol(Symbol::REPEATER)
         .timestamp(Timestamp::dhm(25, 18, 30))
         .frequency(145.725)
-        .tone(118.8)
+        .tone(Tone::Tone, 118)
         .offset_khz(-600);
     assert_eq!(sent(repeater.build().unwrap()), "M0LTE>APZ001:;MYRPTR   *251830z5127.00N/00058.80Wr145.725MHz T118 -060");
 }
@@ -135,7 +139,8 @@ fn a_voice_frequency_comes_first_in_the_comment() {
     // extension it follows a `/`, which a PHGR already ends in; the altitude and the text come after.
     let at = (49.0 + 3.50 / 60.0, -(72.0 + 1.75 / 60.0));
     let phg = Phg { power: 5, height: 1, gain: 3, directivity: 2, beacons_per_hour: None };
-    let repeater = me().position(at.0, at.1).symbol(Symbol::REPEATER).frequency(146.52).tone(100.0).altitude(1234.0).comment("Net 8pm");
+    let repeater =
+        me().position(at.0, at.1).symbol(Symbol::REPEATER).frequency(146.52).tone(Tone::Tone, 100).altitude_feet(1234.0).comment("Net 8pm");
     assert_eq!(sent(repeater.clone().build().unwrap()), "M0LTE>APZ001:!4903.50N/07201.75Wr146.520MHz T100/A=001234 Net 8pm");
     assert_eq!(
         sent(repeater.clone().phg(phg).build().unwrap()),
@@ -149,38 +154,48 @@ fn a_voice_frequency_comes_first_in_the_comment() {
 fn a_permanent_object_and_a_killed_one() {
     let obj = me().object("MYRPTR").at(51.45, -0.98).symbol(Symbol::REPEATER).permanent();
     assert_eq!(sent(obj.clone().build().unwrap()), "M0LTE>APZ001:;MYRPTR   *111111z5127.00N/00058.80Wr");
-    assert_eq!(sent(obj.kill().build().unwrap()), "M0LTE>APZ001:;MYRPTR   _111111z5127.00N/00058.80Wr");
+    assert_eq!(sent(obj.killed().build().unwrap()), "M0LTE>APZ001:;MYRPTR   _111111z5127.00N/00058.80Wr");
 }
 
 #[test]
 fn an_item_and_a_killed_one() {
     let item = me().item("AID #2").at(49.0 + 3.50 / 60.0, -(72.0 + 1.75 / 60.0)).symbol(Symbol::AID_STATION);
     assert_eq!(sent(item.clone().build().unwrap()), "M0LTE>APZ001:)AID #2!4903.50N/07201.75WA");
-    assert_eq!(sent(item.kill().build().unwrap()), "M0LTE>APZ001:)AID #2_4903.50N/07201.75WA");
+    assert_eq!(sent(item.killed().build().unwrap()), "M0LTE>APZ001:)AID #2_4903.50N/07201.75WA");
 }
 
 #[test]
 fn a_mic_e_report_computes_its_destination_and_is_not_an_emergency_by_default() {
     let station = Station::new("M0LTE-9").unwrap().via(&["WIDE1-1"]).unwrap();
-    let packet = station.mic_e(42.179, -71.1985).symbol(Symbol::CAR).course(215).speed(9.0).messaging().build().unwrap();
+    let packet = station.mic_e(42.179, -71.1985).symbol(Symbol::CAR).course_degrees(215.0).speed_knots(9.0).messaging().build().unwrap();
     assert_ne!(packet.destination.as_str(), pdn_aprs::DEFAULT_DESTINATION);
     let line = sent(packet);
     let Data::MicE(report) = heard(&line) else { panic!("{line}") };
-    assert_eq!(report.message, MicEMessage::OffDuty);
+    assert_eq!(report.mic_e_message, MicEMessage::OffDuty);
     assert_eq!(report.type_code, Some('`'));
     assert!((report.fields.position.latitude - 42.179).abs() < 0.01 / 60.0);
     assert!((report.fields.position.longitude + 71.1985).abs() < 0.01 / 60.0);
-    assert_eq!(report.fields.course_degrees, Some(215));
+    assert_eq!(report.fields.course_degrees, Some(215.0));
     assert_eq!(report.fields.speed_knots, Some(9.0));
 
-    let line = sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).message(MicEMessage::EnRoute).build().unwrap());
+    let line = sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).mic_e_message(MicEMessage::EnRoute).build().unwrap());
     let Data::MicE(en_route) = heard(&line) else { panic!("{line}") };
-    assert_eq!(en_route.message, MicEMessage::EnRoute);
+    assert_eq!(en_route.mic_e_message, MicEMessage::EnRoute);
 }
 
 #[test]
 fn a_weather_report_with_a_position() {
-    let packet = me().weather().at(51.45, -0.98).wind(220, 4.0).gust(5.0).temperature(77.0).humidity(54).pressure(1013.2).build().unwrap();
+    let packet = me()
+        .weather()
+        .at(51.45, -0.98)
+        .wind_direction_degrees(220.0)
+        .wind_speed_mph(4.0)
+        .wind_gust_mph(5.0)
+        .temperature_f(77.0)
+        .humidity_percent(54.0)
+        .pressure_mbar(1013.2)
+        .build()
+        .unwrap();
     assert_eq!(sent(packet), "M0LTE>APZ001:!5127.00N/00058.80W_220/004g005t077h54b10132");
 }
 
@@ -189,11 +204,12 @@ fn a_weather_report_without_a_position() {
     let packet = me()
         .weather()
         .timestamp(Timestamp::mdhm(9, 25, 18, 30))
-        .wind(220, 4.0)
-        .gust(5.0)
-        .temperature_celsius(25.0)
-        .rain_last_hour(0.1)
-        .rain_since_midnight(0.25)
+        .wind_direction_degrees(220.0)
+        .wind_speed_mph(4.0)
+        .wind_gust_mph(5.0)
+        .temperature_c(25.0)
+        .rain_1h_in(0.1)
+        .rain_midnight_in(0.25)
         .build()
         .unwrap();
     assert_eq!(sent(packet), "M0LTE>APZ001:_09251830c220s004g005t077r010P025");
@@ -201,9 +217,9 @@ fn a_weather_report_without_a_position() {
 
 #[test]
 fn a_weather_report_needs_a_position_for_a_symbol_or_compression() {
-    assert!(me().weather().timestamp(Timestamp::mdhm(9, 25, 18, 30)).temperature(77.0).compressed().build().is_err());
+    assert!(me().weather().timestamp(Timestamp::mdhm(9, 25, 18, 30)).temperature_f(77.0).compressed().build().is_err());
     assert!(me().weather().timestamp(Timestamp::mdhm(9, 25, 18, 30)).symbol(Symbol::WEATHER_STATION_WITH_DIGIPEATER).build().is_err());
-    assert!(me().weather().temperature(77.0).build().is_err(), "a positionless report needs a timestamp");
+    assert!(me().weather().temperature_f(77.0).build().is_err(), "a positionless report needs a timestamp");
 }
 
 #[test]
@@ -217,22 +233,32 @@ fn status_reports() {
 fn telemetry_and_what_it_means() {
     let wx = Station::new("M0LTE-11").unwrap();
     assert_eq!(
-        sent(wx.telemetry(123).analog(&[172.0, 123.0, 150.0, 50.0, 113.0]).digital(0b0000_0101).build().unwrap()),
+        sent(wx.telemetry(123).analog(&[Some(172.0), Some(123.0), Some(150.0), Some(50.0), Some(113.0)]).bits("10100000").build().unwrap()),
         "M0LTE-11>APZ001:T#123,172,123,150,050,113,10100000"
     );
-    assert_eq!(sent(wx.telemetry(7).analog(&[1.5]).build().unwrap()), "M0LTE-11>APZ001:T#007,1.5,,,,,00000000");
+    assert_eq!(sent(wx.telemetry(7).analog(&[Some(1.5)]).build().unwrap()), "M0LTE-11>APZ001:T#007,1.5,,,,,00000000");
     assert_eq!(sent(wx.telemetry_names(&["Battery", "Temp"]).build().unwrap()), "M0LTE-11>APZ001::M0LTE-11 :PARM.Battery,Temp");
     assert_eq!(sent(wx.telemetry_units(&["V", "degC"]).build().unwrap()), "M0LTE-11>APZ001::M0LTE-11 :UNIT.V,degC");
     assert_eq!(
         sent(wx.telemetry_coefficients(&[0.0, 0.075, 0.0, 0.0, 0.5, -40.0]).build().unwrap()),
         "M0LTE-11>APZ001::M0LTE-11 :EQNS.0,0.075,0,0,0.5,-40"
     );
-    assert_eq!(sent(wx.telemetry_bits(0xFF, "Garden station").build().unwrap()), "M0LTE-11>APZ001::M0LTE-11 :BITS.11111111,Garden station");
+    assert_eq!(
+        sent(wx.telemetry_bits("11111111", "Garden station").build().unwrap()),
+        "M0LTE-11>APZ001::M0LTE-11 :BITS.11111111,Garden station"
+    );
 }
 
 #[test]
 fn comment_telemetry_rides_in_a_position_report() {
-    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::HOUSE).comment("Home").telemetry(1, &[100, 200]).build().unwrap());
+    let line = sent(
+        me().position(51.4543, -0.9781)
+            .symbol(Symbol::HOUSE)
+            .comment("Home")
+            .telemetry(CommentTelemetry { sequence: 1, analog: vec![100, 200], digital: None })
+            .build()
+            .unwrap(),
+    );
     let Data::Position(report) = heard(&line) else { panic!("{line}") };
     let telemetry = report.fields.telemetry.unwrap();
     assert_eq!((telemetry.sequence, telemetry.analog, telemetry.digital), (1, vec![100, 200], None));
@@ -264,38 +290,38 @@ fn missing_pieces_are_named() {
     assert!(no_position.to_string().contains("position"), "{no_position}");
     let no_timestamp = me().object("MYRPTR").at(51.45, -0.98).symbol(Symbol::REPEATER).build().unwrap_err();
     assert!(no_timestamp.to_string().contains("timestamp"), "{no_timestamp}");
-    let tone_alone = me().position(51.45, -0.98).symbol(Symbol::CAR).tone(88.5).build().unwrap_err();
+    let tone_alone = me().position(51.45, -0.98).symbol(Symbol::CAR).tone(Tone::Tone, 88).build().unwrap_err();
     assert!(tone_alone.to_string().contains("frequency"), "{tone_alone}");
 }
 
 #[test]
 fn what_the_spec_forbids_is_refused_when_built() {
-    assert!(me().message("G3NRW", "Hi").id("TOOLONG").build().is_err());
+    assert!(me().message("G3NRW", "Hi").message_id("TOOLONG").build().is_err());
     assert!(me().object("NAMEISTOOLONG").at(51.45, -0.98).symbol(Symbol::REPEATER).timestamp(Timestamp::dhm(1, 2, 3)).build().is_err());
     let phg = Phg { power: 5, height: 3, gain: 6, directivity: 0, beacons_per_hour: None };
     assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().phg(phg).build().is_err());
-    assert!(me().telemetry(1).analog(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]).build().is_err());
-    assert!(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).course(360).build().is_ok());
+    assert!(me().telemetry(1).analog(&[Some(1.0), Some(2.0), Some(3.0), Some(4.0), Some(5.0), Some(6.0)]).build().is_err());
+    assert!(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).course_degrees(360.0).build().is_ok());
     // Out of range is refused, never wrapped.
-    assert!(me().telemetry(1000).analog(&[1.0]).build().is_err());
-    assert!(me().telemetry(999).analog(&[1.0]).build().is_ok());
+    assert!(me().telemetry(1000).analog(&[Some(1.0)]).build().is_err());
+    assert!(me().telemetry(999).analog(&[Some(1.0)]).build().is_ok());
 }
 
 /// A builder's course of 0 is the spec's unknown course: `000` uncompressed, 0 in Mic-E (no
 /// course), and refused compressed, whose cs bytes have no unknown course.
 #[test]
 fn a_course_of_0_is_unknown() {
-    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course(0).speed(10.0).build().unwrap());
+    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course_degrees(0.0).speed_knots(10.0).build().unwrap());
     assert_eq!(line, "M0LTE>APZ001:!5127.26N/00058.69W>000/010");
-    let mic_e = me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).course(0).speed(10.0).build().unwrap();
+    let mic_e = me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).course_degrees(0.0).speed_knots(10.0).build().unwrap();
     let Data::MicE(m) = heard(&sent(mic_e)) else { panic!("a Mic-E report") };
     assert_eq!(m.fields.course_degrees, None);
     assert_eq!(m.fields.speed_knots, Some(10.0));
-    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course(0).speed(10.0).build().is_err());
-    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course(360).speed(10.0).build().is_ok());
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course_degrees(0.0).speed_knots(10.0).build().is_err());
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course_degrees(360.0).speed_knots(10.0).build().is_ok());
     // The cs bytes hold a course and a speed together.
-    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().speed(10.0).build().is_err());
-    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course(90).build().is_err());
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().speed_knots(10.0).build().is_err());
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course_degrees(90.0).build().is_err());
 }
 
 /// The Mic-E type code says whether the station can message.
@@ -313,13 +339,13 @@ fn the_mic_e_type_code_says_whether_the_station_can_message() {
 /// `/A=`, rounded to the foot.
 #[test]
 fn a_mic_e_altitude_in_metres_stays_in_metres() {
-    let line = sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).altitude_metres(100.5).build().unwrap());
+    let line = sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).altitude_m(100.5).build().unwrap());
     let Data::MicE(m) = heard(&line) else { panic!("a Mic-E report") };
     assert!(!line.contains("/A="), "{line}");
     assert!((m.fields.altitude_feet.unwrap() - 101.0 / 0.3048).abs() < 1e-6, "{line}");
-    let line = sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).altitude(-12.5).build().unwrap());
+    let line = sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).altitude_feet(-12.5).build().unwrap());
     assert!(line.ends_with("/A=-00013"), "{line}");
-    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).altitude_metres(30.48).build().unwrap());
+    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).altitude_m(30.48).build().unwrap());
     assert!(line.ends_with("/A=000100"), "{line}");
 }
 
@@ -337,11 +363,20 @@ fn ambiguity_cuts_the_digits() {
 /// Values between the steps a field holds are rounded once, halves away from zero.
 #[test]
 fn values_between_steps_are_rounded() {
-    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course(90).speed(29.75).altitude(-0.6).build().unwrap());
+    let line = sent(
+        me().position(51.4543, -0.9781).symbol(Symbol::CAR).course_degrees(90.0).speed_knots(29.75).altitude_feet(-0.6).build().unwrap(),
+    );
     assert_eq!(line, "M0LTE>APZ001:!5127.26N/00058.69W>090/030/A=-00001");
-    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).range(1.5).build().unwrap());
+    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).range_miles(1.5).build().unwrap());
     assert_eq!(line, "M0LTE>APZ001:!5127.26N/00058.69W>RNG0002");
-    let weather = me().weather().at(51.4543, -0.9781).wind(220, 4.0).gust(5.4).temperature_celsius(25.0).rain_last_hour(0.005);
+    let weather = me()
+        .weather()
+        .at(51.4543, -0.9781)
+        .wind_direction_degrees(220.0)
+        .wind_speed_mph(4.0)
+        .wind_gust_mph(5.4)
+        .temperature_c(25.0)
+        .rain_1h_in(0.005);
     assert_eq!(sent(weather.build().unwrap()), "M0LTE>APZ001:!5127.26N/00058.69W_220/004g005t077r001");
 }
 
@@ -356,75 +391,96 @@ fn named_symbols_and_overlays() {
 #[test]
 fn a_fractional_course_is_rounded_once_to_its_step() {
     // Whole degrees uncompressed: 88.5 is 89 (halves away from zero), 301.7 is 302.
-    assert!(sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course(88.5).speed(36.0).build().unwrap()).contains("089/036"));
+    assert!(
+        sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course_degrees(88.5).speed_knots(36.0).build().unwrap())
+            .contains("089/036")
+    );
     // Compressed, 4-degree steps: 301.7 is the step nearest 301.7, 300, not the nearest to 302 (304).
-    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course(301.7).speed(36.0).build().unwrap());
+    let line =
+        sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course_degrees(301.7).speed_knots(36.0).build().unwrap());
     let Data::Position(report) = heard(&line) else { panic!("{line}") };
-    assert_eq!(report.fields.course_degrees, Some(300));
+    assert_eq!(report.fields.course_degrees, Some(300.0));
     // 359 is the step at north, 360; 1.2 is also the step at north, not the unknown course.
     for course in [359.0, 1.2] {
-        let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course(course).speed(36.0).build().unwrap());
+        let line = sent(
+            me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course_degrees(course).speed_knots(36.0).build().unwrap(),
+        );
         let Data::Position(report) = heard(&line) else { panic!("{line}") };
-        assert_eq!(report.fields.course_degrees, Some(360));
+        assert_eq!(report.fields.course_degrees, Some(360.0));
     }
     // A course that rounds to 0 whole degrees is unknown: refused compressed, 000 otherwise.
-    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course(0.3).speed(36.0).build().is_err());
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().course_degrees(0.3).speed_knots(36.0).build().is_err());
     // Outside the field once rounded.
-    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course(360.5).speed(36.0).build().is_err());
-    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course(f64::NAN).speed(36.0).build().is_err());
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course_degrees(360.5).speed_knots(36.0).build().is_err());
+    assert!(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course_degrees(f64::NAN).speed_knots(36.0).build().is_err());
 }
 
 #[test]
 fn fractional_weather_values_are_rounded_once() {
     let wx = me().weather().timestamp(Timestamp::mdhm(10, 9, 23, 59));
-    let line = sent(wx.clone().wind(89.5, 5.0).humidity(99.7).luminosity(412.4).temperature(72.0).build().unwrap());
+    let line = sent(
+        wx.clone()
+            .wind_direction_degrees(89.5)
+            .wind_speed_mph(5.0)
+            .humidity_percent(99.7)
+            .luminosity_w_m2(412.4)
+            .temperature_f(72.0)
+            .build()
+            .unwrap(),
+    );
     assert!(line.contains("c090") && line.contains("h00") && line.contains("L412"), "{line}");
-    let line = sent(me().weather().at(51.4543, -0.9781).compressed().wind(301.7, 5.0).build().unwrap());
+    let line = sent(me().weather().at(51.4543, -0.9781).compressed().wind_direction_degrees(301.7).wind_speed_mph(5.0).build().unwrap());
     let Data::Position(report) = heard(&line) else { panic!("{line}") };
-    assert_eq!(report.fields.weather.unwrap().wind_direction_degrees, Some(300));
+    assert_eq!(report.fields.weather.unwrap().wind_direction_degrees, Some(300.0));
     // A humidity that rounds to 0 is refused, since h00 is 100 percent.
-    assert!(wx.clone().humidity(0.4).build().is_err());
-    assert!(wx.humidity(100.6).build().is_err());
+    assert!(wx.clone().humidity_percent(0.4).build().is_err());
+    assert!(wx.humidity_percent(100.6).build().is_err());
 }
 
 #[test]
 fn a_telemetry_channel_can_be_empty_on_its_own() {
     let wx = me();
     assert_eq!(
-        sent(wx.telemetry(7).channels(&[None, Some(1.5), None, Some(3.0), None]).build().unwrap()),
+        sent(wx.telemetry(7).analog(&[None, Some(1.5), None, Some(3.0), None]).build().unwrap()),
         "M0LTE>APZ001:T#007,,1.5,,003,,00000000"
     );
 }
 
 #[test]
 fn the_compressed_course_band_is_decided_in_whole_degrees() {
-    let car = || me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().speed(36.0);
+    let car = || me().position(51.4543, -0.9781).symbol(Symbol::CAR).compressed().speed_knots(36.0);
     let course = |c: f64| {
-        let line = sent(car().course(c).build().unwrap());
+        let line = sent(car().course_degrees(c).build().unwrap());
         let Data::Position(r) = heard(&line) else { panic!("{line}") };
         r.fields.course_degrees
     };
     // Halves of the 4-degree step go away from zero.
-    assert_eq!(course(2.0), Some(4));
-    assert_eq!(course(302.0), Some(304));
-    assert_eq!(course(1.2), Some(360));
-    assert_eq!(course(360.4), Some(360));
+    assert_eq!(course(2.0), Some(4.0));
+    assert_eq!(course(302.0), Some(304.0));
+    assert_eq!(course(1.2), Some(360.0));
+    assert_eq!(course(360.4), Some(360.0));
     for bad in [0.3, -0.7, 360.6, 361.0] {
-        assert!(car().course(bad).build().is_err(), "{bad}");
+        assert!(car().course_degrees(bad).build().is_err(), "{bad}");
     }
 }
 
 #[test]
 fn weather_halves_and_the_direction_alone() {
-    let wx = || me().weather().timestamp(Timestamp::mdhm(10, 9, 23, 59)).temperature(72.0);
-    assert!(sent(wx().humidity(0.5).build().unwrap()).contains("h01"));
-    assert!(sent(wx().wind_direction(120.0).build().unwrap()).contains("c120"));
+    let wx = || me().weather().timestamp(Timestamp::mdhm(10, 9, 23, 59)).temperature_f(72.0);
+    assert!(sent(wx().humidity_percent(0.5).build().unwrap()).contains("h01"));
+    assert!(sent(wx().wind_direction_degrees(120.0).build().unwrap()).contains("c120"));
     // A compressed report carries the direction and speed together.
-    assert!(me().weather().at(51.4543, -0.9781).compressed().wind_direction(120.0).build().is_err());
+    assert!(me().weather().at(51.4543, -0.9781).compressed().wind_direction_degrees(120.0).build().is_err());
     // observations() replaces what was set before, the direction, humidity and luminosity included.
-    let line =
-        sent(wx().wind_direction(120.0).humidity(50.0).luminosity(300.0).observations(pdn_aprs::Weather::default()).build().unwrap());
+    let line = sent(
+        wx().wind_direction_degrees(120.0)
+            .humidity_percent(50.0)
+            .luminosity_w_m2(300.0)
+            .observations(pdn_aprs::Weather::default())
+            .build()
+            .unwrap(),
+    );
     assert!(!line.contains("c120") && !line.contains("h50") && !line.contains("L300"), "{line}");
-    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course(359.5).speed(1.0).build().unwrap());
+    let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course_degrees(359.5).speed_knots(1.0).build().unwrap());
     assert!(line.contains("360/001"), "{line}");
 }

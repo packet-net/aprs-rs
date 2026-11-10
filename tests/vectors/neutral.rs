@@ -86,7 +86,7 @@ fn enum_name<T: std::fmt::Debug>(v: T) -> String {
 }
 
 fn timestamp(t: &Option<Timestamp>) -> Value {
-    t.map_or(Value::Null, |t| json!(String::from_utf8(t.to_bytes()).unwrap()))
+    t.map_or(Value::Null, |t| json!(t.to_string()))
 }
 
 fn symbol(s: Symbol) -> String {
@@ -103,7 +103,7 @@ pub fn data(d: &Data) -> Value {
         }
         Data::MicE(m) => {
             let mut o = Obj::new("mic-e");
-            o.put("mic_e_message", json!(mic_e_message(m.message)))
+            o.put("mic_e_message", json!(mic_e_message(m.mic_e_message)))
                 .put("old_data", json!(m.old_data))
                 .put("type_code", m.type_code.map_or(Value::Null, |c| json!(c.to_string())))
                 .put("device_suffix", json!(m.device_suffix))
@@ -151,17 +151,17 @@ pub fn data(d: &Data) -> Value {
         }
         Data::TelemetryNames(t) => Obj::new("telemetry-names")
             .put("addressee", json!(t.addressee))
-            .put("names", json!(t.labels))
+            .put("names", json!(t.names))
             .put("message_id", json!(t.message_id))
             .done(),
         Data::TelemetryUnits(t) => Obj::new("telemetry-units")
             .put("addressee", json!(t.addressee))
-            .put("units", json!(t.labels))
+            .put("units", json!(t.units))
             .put("message_id", json!(t.message_id))
             .done(),
         Data::TelemetryCoefficients(t) => Obj::new("telemetry-coefficients")
             .put("addressee", json!(t.addressee))
-            .put("coefficients", Value::Array(t.coefficients.iter().map(|c| number_text(c)).collect()))
+            .put("coefficients", json!(t.coefficients))
             .put("message_id", json!(t.message_id))
             .done(),
         Data::TelemetryBits(t) => Obj::new("telemetry-bits")
@@ -187,7 +187,7 @@ pub fn data(d: &Data) -> Value {
         }
         Data::Telemetry(t) => Obj::new("telemetry")
             .put("sequence", json!(t.sequence))
-            .put("analog", Value::Array(t.analog.iter().map(|v| v.as_deref().map_or(Value::Null, number_text)).collect()))
+            .put("analog", json!(t.analog))
             .put("bits", json!(t.bits))
             .put("comment", json!(t.comment))
             .done(),
@@ -215,10 +215,7 @@ pub fn data(d: &Data) -> Value {
             let mut o = Obj::new("query");
             o.put("query_type", json!(q.query_type));
             if let Some(f) = &q.footprint {
-                o.put(
-                    "footprint",
-                    json!({"latitude": number_text(&f.latitude), "longitude": number_text(&f.longitude), "radius_miles": f.radius_miles}),
-                );
+                o.put("footprint", json!({"latitude": f.latitude, "longitude": f.longitude, "radius_miles": f.radius_miles}));
             }
             o.done()
         }
@@ -253,28 +250,8 @@ pub fn data(d: &Data) -> Value {
         Data::Test(t) => Obj::new("test").put("data", json!(t.data)).done(),
         Data::AgreloDf(a) => Obj::new("agrelo-df").put("bearing_degrees", json!(a.bearing_degrees)).put("quality", json!(a.quality)).done(),
         Data::Unrecognized(u) => Obj::new("unrecognized").put("reason", json!(enum_name(*u))).done(),
-    }
-}
-
-fn number_text(text: &str) -> Value {
-    serde_json::from_str::<Value>(&normalise_number(text))
-        .or_else(|_| text.trim().parse::<f64>().map(|v| json!(v)))
-        .unwrap_or_else(|_| json!(text))
-}
-
-/// Numbers as sent (`073`, `.53`, `-.5`, `+1`) as JSON numbers.
-fn normalise_number(text: &str) -> String {
-    let t = text.trim();
-    let (sign, digits) = match t.strip_prefix('-') {
-        Some(rest) => ("-", rest),
-        None => ("", t.strip_prefix('+').unwrap_or(t)),
-    };
-    let (whole, fraction) = digits.split_once('.').map_or((digits, None), |(w, f)| (w, Some(f)));
-    let whole = whole.trim_start_matches('0');
-    let whole = if whole.is_empty() { "0" } else { whole };
-    match fraction {
-        Some(f) if !f.is_empty() => format!("{sign}{whole}.{f}"),
-        _ => format!("{sign}{whole}"),
+        // Data and Unrecognized are non-exhaustive: a new kind needs its neutral form written here.
+        _ => panic!("a data type the neutral form here does not know"),
     }
 }
 
@@ -496,37 +473,6 @@ impl<'a> Keys<'a> {
             .map_err(|_| Unreadable::Refused(format!("{}: outside its field once rounded", self.name(k))))
     }
 
-    /// Like [`stepped`](Self::stepped) for a field held in steps of `step` units (a compressed
-    /// course or wind direction, 4 degrees): the nearest step, rounded once from the value given.
-    /// A whole number is kept, as the encoder rounds it to its step itself.
-    fn stepped_by<T: TryFrom<i128>>(&self, k: &str, step: f64, course: bool) -> Read<Option<T>> {
-        let Some(v) = self.get(k) else { return Ok(None) };
-        if let Some(n) = whole(v) {
-            return T::try_from(n).map(Some).map_err(|_| Unreadable::Refused(format!("{}: outside its field", self.name(k))));
-        }
-        let Some(x) = v.as_f64().filter(|x| x.is_finite()) else {
-            return unsupported(format!("{}: not a number", self.name(k)));
-        };
-        let mut n = (round_steps(x / step) * step) as i128;
-        if course {
-            // Unknown (0) and in range (1-360) are decided in whole degrees, then a known course is
-            // rounded once to its step; the step at north is 360.
-            let whole = round_steps(x) as i128;
-            if !(0..=360).contains(&whole) {
-                return Err(Unreadable::Refused(format!("{}: outside its field once rounded", self.name(k))));
-            }
-            if n == 0 && whole != 0 {
-                n = 360;
-            }
-        }
-        T::try_from(n).map(Some).map_err(|_| Unreadable::Refused(format!("{}: outside its field once rounded", self.name(k))))
-    }
-
-    fn required_stepped<T: TryFrom<i128>>(&self, k: &str) -> Read<T> {
-        self.stepped(k)?
-            .ok_or_else(|| Unreadable::Unsupported(format!("{}: missing, and this crate has no value for its absence", self.name(k))))
-    }
-
     fn required_int<T: TryFrom<i128>>(&self, k: &str) -> Read<T> {
         self.int(k)?
             .ok_or_else(|| Unreadable::Unsupported(format!("{}: missing, and this crate has no value for its absence", self.name(k))))
@@ -712,7 +658,7 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             Data::Position(PositionReport { timestamp: read_timestamp(&o)?, messaging: o.flag("messaging")?, fields: read_positioned(&o)? })
         }
         "mic-e" => Data::MicE(MicEReport {
-            message: o.required("mic_e_message", read_mic_e_message(&o)?)?,
+            mic_e_message: o.required("mic_e_message", read_mic_e_message(&o)?)?,
             old_data: o.flag("old_data")?,
             type_code: o.char("type_code")?,
             device_suffix: o.text("device_suffix")?,
@@ -727,6 +673,7 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             },
             destination_ssid: o.int("destination_ssid")?.unwrap_or(0),
             fields: read_positioned(&o)?,
+            ..MicEReport::default()
         }),
         "object" => Data::Object(ObjectReport {
             name: o.text("name")?,
@@ -757,23 +704,24 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             let b = Bulletin { addressee: o.text("addressee")?, text: o.text("text")?, message_id: o.string("message_id")? };
             if kind == "bulletin" { Data::Bulletin(b) } else { Data::NwsBulletin(b) }
         }
-        "telemetry-names" => Data::TelemetryNames(TelemetryLabels {
+        "telemetry-names" => Data::TelemetryNames(TelemetryNames {
             addressee: o.text("addressee")?,
-            labels: o.strings("names")?,
+            names: o.strings("names")?,
             message_id: o.string("message_id")?,
         }),
-        "telemetry-units" => Data::TelemetryUnits(TelemetryLabels {
+        "telemetry-units" => Data::TelemetryUnits(TelemetryUnits {
             addressee: o.text("addressee")?,
-            labels: o.strings("units")?,
+            units: o.strings("units")?,
             message_id: o.string("message_id")?,
         }),
         "telemetry-coefficients" => Data::TelemetryCoefficients(TelemetryCoefficients {
             addressee: o.text("addressee")?,
             coefficients: o
                 .array("coefficients")?
-                .map(|a| a.iter().map(number_as_text).collect::<Option<Vec<String>>>())
+                .map(|a| a.iter().map(Value::as_f64).collect::<Option<Vec<f64>>>())
                 .unwrap_or(Some(Vec::new()))
                 .ok_or_else(|| Unreadable::Unsupported("coefficients: each is a number".into()))?,
+            coefficients_text: Vec::new(),
             message_id: o.string("message_id")?,
         }),
         "telemetry-bits" => Data::TelemetryBits(TelemetryBits {
@@ -808,18 +756,17 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             analog: o
                 .array("analog")?
                 .map(|a| {
-                    a.iter()
-                        .map(|x| if x.is_null() { Some(None) } else { telemetry_number(x).map(Some) })
-                        .collect::<Option<Vec<Option<String>>>>()
+                    a.iter().map(|x| if x.is_null() { Some(None) } else { x.as_f64().map(Some) }).collect::<Option<Vec<Option<f64>>>>()
                 })
                 .unwrap_or(Some(Vec::new()))
                 .ok_or_else(|| Unreadable::Unsupported("analog: each is a number or null".into()))?,
+            analog_text: Vec::new(),
             bits: o.string("bits")?,
             comment: o.text("comment")?,
         }),
         "weather" => Data::Weather(WeatherReport {
             timestamp: read_timestamp(&o)?,
-            weather: read_weather(&o, false)?.unwrap_or_default(),
+            weather: read_weather(&o)?.unwrap_or_default(),
             comment: o.text("comment")?,
         }),
         "raw-weather" => Data::RawWeather(RawWeather {
@@ -853,21 +800,12 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
         "maidenhead-beacon" => Data::MaidenheadBeacon(MaidenheadBeacon { locator: o.text("locator")?, comment: o.text("comment")? }),
         "query" => Data::Query(Query {
             query_type: o.text("query_type")?,
-            // The neutral form has the numbers, not their text: each is written as the JSON gives
-            // it, after a space when it is positive (APRS12c ch. 15).
+            // The neutral form has the numbers, not their text: the encoder writes each after a space
+            // when it is positive (APRS12c ch. 15), and rounds the radius.
             footprint: match o.object("footprint", &["latitude", "longitude", "radius_miles"])? {
                 None => None,
                 Some(f) => {
-                    let text = |k: &str| -> Read<String> {
-                        let t = f.get(k).and_then(number_as_text);
-                        let t = f.required(k, t)?;
-                        Ok(if t.starts_with('-') { t } else { format!(" {t}") })
-                    };
-                    Some(Footprint {
-                        latitude: text("latitude")?,
-                        longitude: text("longitude")?,
-                        radius_miles: f.required_stepped("radius_miles")?,
-                    })
+                    Some(Footprint::new(f.required_float("latitude")?, f.required_float("longitude")?, f.required_float("radius_miles")?))
                 }
             },
         }),
@@ -903,7 +841,13 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
                 data => data.encode().map_err(|e| Unreadable::Refused(format!("the inner packet's data: {e}")))?,
             };
             let diagnostics = p.strings("diagnostics")?.iter().map(|d| read_diagnostic(d)).collect::<Read<Vec<Diagnostic>>>()?;
-            Data::ThirdParty(Box::new(Packet { source, destination, path, information, data, diagnostics, third_party: true }))
+            // Packet is non-exhaustive: start from decoding the information field, then say what the
+            // neutral form says.
+            let mut inner = Packet::decode(source, destination, path, &information, ParseOptions::LENIENT);
+            inner.data = data;
+            inner.diagnostics = diagnostics;
+            inner.third_party = true;
+            Data::ThirdParty(Box::new(inner))
         }
         "user-defined" => {
             let byte_text = |k: &str| -> Read<Vec<u8>> {
@@ -961,7 +905,14 @@ fn read_diagnostic(text: &str) -> Read<Diagnostic> {
     let Some(code) = Code::from_id(code) else {
         return unsupported("packet.diagnostics: not a code this crate has".into());
     };
-    Ok(Diagnostic { severity, code, message: String::new(), offset: None })
+    // Diagnostic is non-exhaustive: take one the decoder made and set its public fields.
+    let mut diagnostic =
+        Packet::decode_tnc2(b"N0CALL>:", ParseOptions::LENIENT).expect("an empty destination is tolerated").diagnostics.remove(0);
+    diagnostic.severity = severity;
+    diagnostic.code = code;
+    diagnostic.message = String::new();
+    diagnostic.offset = None;
+    Ok(diagnostic)
 }
 
 pub fn read_path_entry(text: &str) -> PathEntry {
@@ -1047,10 +998,6 @@ const COLORS: [(&str, AreaColor); 16] = [
 ];
 
 fn read_positioned(o: &Keys) -> Read<Positioned> {
-    // A compressed course or wind direction is written in 4-degree steps, so rounding one here to
-    // whole degrees first would round it twice (41.6 would be 42, then 44, not 40): a fractional
-    // one is not something this crate's whole-degree types hold.
-    let compressed = o.flag("compressed")?;
     Ok(Positioned {
         position: Position {
             latitude: o.required_float("latitude")?,
@@ -1062,12 +1009,17 @@ fn read_positioned(o: &Keys) -> Read<Positioned> {
         compression: match o.object("compression", &["fix", "source", "origin"])? {
             None => None,
             Some(c) => Some(CompressionType {
-                fix: c.required("fix", c.choice("fix", &[("old", GpsFix::Old), ("current", GpsFix::Current)])?)?,
+                fix: c.required("fix", c.choice("fix", &[("old", CompressionFix::Old), ("current", CompressionFix::Current)])?)?,
                 source: c.required(
                     "source",
                     c.choice(
                         "source",
-                        &[("other", NmeaSource::Other), ("gll", NmeaSource::Gll), ("gga", NmeaSource::Gga), ("rmc", NmeaSource::Rmc)],
+                        &[
+                            ("other", CompressionSource::Other),
+                            ("gll", CompressionSource::Gll),
+                            ("gga", CompressionSource::Gga),
+                            ("rmc", CompressionSource::Rmc),
+                        ],
                     )?,
                 )?,
                 origin: c.required(
@@ -1088,7 +1040,7 @@ fn read_positioned(o: &Keys) -> Read<Positioned> {
                 )?,
             }),
         },
-        course_degrees: if compressed { o.stepped_by("course_degrees", 4.0, true)? } else { o.stepped("course_degrees")? },
+        course_degrees: o.float("course_degrees")?,
         speed_knots: o.float("speed_knots")?,
         altitude_feet: o.float("altitude_feet")?,
         phg: match o.object("phg", &["power", "height", "gain", "directivity", "beacons_per_hour"])? {
@@ -1211,13 +1163,13 @@ fn read_positioned(o: &Keys) -> Read<Positioned> {
                 ten_khz_resolution: f.flag("ten_khz_resolution")?,
             }),
         },
-        weather: read_weather(o, compressed)?,
+        weather: read_weather(o)?,
         signpost: o.string("signpost")?,
         comment: o.text("comment")?,
     })
 }
 
-fn read_weather(o: &Keys, compressed: bool) -> Read<Option<Weather>> {
+fn read_weather(o: &Keys) -> Read<Option<Weather>> {
     let Some(w) = o.object(
         "weather",
         &[
@@ -1252,11 +1204,7 @@ fn read_weather(o: &Keys, compressed: bool) -> Read<Option<Weather>> {
             .collect::<Read<Vec<WeatherField>>>()?,
     };
     Ok(Some(Weather {
-        wind_direction_degrees: if compressed {
-            w.stepped_by("wind_direction_degrees", 4.0, false)?
-        } else {
-            w.stepped("wind_direction_degrees")?
-        },
+        wind_direction_degrees: w.float("wind_direction_degrees")?,
         wind_speed_mph: w.float("wind_speed_mph")?,
         wind_gust_mph: w.float("wind_gust_mph")?,
         temperature_f: w.float("temperature_f")?,
@@ -1264,9 +1212,9 @@ fn read_weather(o: &Keys, compressed: bool) -> Read<Option<Weather>> {
         rain_24h_in: w.float("rain_24h_in")?,
         rain_midnight_in: w.float("rain_midnight_in")?,
         rain_raw: w.stepped("rain_raw")?,
-        humidity_percent: w.stepped("humidity_percent")?,
+        humidity_percent: w.float("humidity_percent")?,
         pressure_mbar: w.float("pressure_mbar")?,
-        luminosity_w_m2: w.stepped("luminosity_w_m2")?,
+        luminosity_w_m2: w.float("luminosity_w_m2")?,
         snow_24h_in: w.float("snow_24h_in")?,
         software: w.char("software")?,
         unit: w.string("unit")?,
