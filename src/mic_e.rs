@@ -493,7 +493,7 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
             pend.note(EncodeError::new(RefusalCode::ValueHasNoForm, "obsolete Mic-E binary telemetry is each 0-254"));
         }
         if r.legacy_telemetry.len() != 5 {
-            pend.note(EncodeError::new(RefusalCode::TooLong, "obsolete Mic-E binary telemetry is 5 values"));
+            pend.note(EncodeError::new(RefusalCode::Malformed, "obsolete Mic-E binary telemetry is 5 values"));
         }
         out.push(0x1D);
         out.extend_from_slice(&r.legacy_telemetry);
