@@ -128,3 +128,25 @@ fn area_symbol_and_mic_e_altitude_rulings() {
     let refused = Packet::create(Address::new("N0CALL").unwrap(), Address::new("APZ001").unwrap(), Vec::new(), mic_e);
     assert_eq!(refused.unwrap_err().code(), RefusalCode::ValueHasNoForm);
 }
+
+#[test]
+fn mic_e_altitude_after_legacy_telemetry_has_no_form() {
+    let mic_e = Data::MicE(pdn_aprs::MicEReport {
+        mic_e_message: pdn_aprs::MicEMessage::OffDuty,
+        old_data: true,
+        device_suffix: "=".into(),
+        legacy_telemetry: vec![38, 211, 197, 230, 8],
+        fields: Positioned {
+            position: Position { latitude: 35.509, longitude: 139.55583333333334, ambiguity: 0 },
+            symbol: Symbol { table: 'C', code: '1' },
+            course_degrees: Some(32.0),
+            speed_knots: Some(200.0),
+            altitude_feet: Some(1611469.8162729656),
+            comment: "X @King_nori_2002".into(),
+            ..Positioned::default()
+        },
+        ..pdn_aprs::MicEReport::default()
+    });
+    let refused = Packet::create(Address::new("N0CALL").unwrap(), Address::new("APZ001").unwrap(), Vec::new(), mic_e);
+    assert_eq!(refused.unwrap_err().code(), RefusalCode::ValueHasNoForm);
+}

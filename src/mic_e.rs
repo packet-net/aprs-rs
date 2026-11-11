@@ -525,9 +525,10 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
                 let at = out.len();
                 base91::encode(datum as u32, 3, &mut out);
                 out.push(b'}');
-                // With no type code before it, a first byte that is one reads back as the type code,
+                // With no type code before it (legacy telemetry is taken off first), a first byte that is one reads back as the type code,
                 // and beyond six digits no `/A=` can say the altitude instead.
-                if at == status_start
+                if r.type_code.is_none()
+                    && at == status_start + if r.legacy_telemetry.is_empty() { 0 } else { 6 }
                     && matches!(out[at], b'`' | b'\'' | b'>' | b']' | b' ')
                     && !(-99_999.0..=999_999.0).contains(&crate::steps::round(feet))
                 {
