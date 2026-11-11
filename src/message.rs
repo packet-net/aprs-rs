@@ -386,6 +386,13 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
     match data {
         Data::Message(m) => {
             addressee(&mut out, &m.addressee, &mut p);
+            // An addressee that makes a bulletin of it is not the form a message needs.
+            if matches!(bulletin_kind(&mut Context::new(ParseOptions::LENIENT), &m.addressee), Some(Some(_))) {
+                p.note(EncodeError::new(
+                    RefusalCode::InvalidAddressee,
+                    "an addressee of NWS-, NWS_ or BLN and a bulletin form makes a bulletin, not a message",
+                ));
+            }
             message_text(&mut out, &m.text, true, &mut p);
             id_and_reply(&mut out, &m.message_id, &m.reply_ack, &mut p);
         }

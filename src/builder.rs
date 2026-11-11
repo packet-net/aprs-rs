@@ -297,16 +297,9 @@ impl Common {
         let mut fields = self.fields.clone();
         // An ambiguous position reports the box that holds it: its digits cut, not rounded, then
         // blanked, and the box's centre is what a decoder reads (vectors README, Builder rules).
-        fields.position = if (1..=4).contains(&self.ambiguity) {
+        // A compressed report refuses ambiguity whatever the box, so it keeps the position as given.
+        fields.position = if (1..=4).contains(&self.ambiguity) && !fields.compressed {
             let (latitude, longitude) = (box_centre(position.latitude, self.ambiguity), box_centre(position.longitude, self.ambiguity));
-            // A position inside the range whose box is centred beyond it has no form.
-            if (position.latitude.abs() <= 90.0 && latitude.abs() > 90.0) || (position.longitude.abs() <= 180.0 && longitude.abs() > 180.0)
-            {
-                return Err(EncodeError::new(
-                    RefusalCode::ValueHasNoForm,
-                    "an ambiguous position at 90 degrees latitude or 180 degrees longitude has a box centred past it",
-                ));
-            }
             Position { latitude, longitude, ambiguity: self.ambiguity }
         } else {
             Position { ambiguity: self.ambiguity, ..position }
@@ -338,6 +331,25 @@ impl Common {
             }
         }
         Ok(fields)
+    }
+}
+
+impl Common {
+    /// A position inside the range whose ambiguity box is centred beyond it has no form. A form that
+    /// writes ambiguity (uncompressed and Mic-E) refuses it; a compressed report refuses ambiguity itself.
+    fn box_fault(&self, fields: &Positioned) -> Result<(), EncodeError> {
+        let Some(position) = self.position else { return Ok(()) };
+        if fields.compressed || !(1..=4).contains(&self.ambiguity) {
+            return Ok(());
+        }
+        let (latitude, longitude) = (box_centre(position.latitude, self.ambiguity), box_centre(position.longitude, self.ambiguity));
+        if (position.latitude.abs() <= 90.0 && latitude.abs() > 90.0) || (position.longitude.abs() <= 180.0 && longitude.abs() > 180.0) {
+            return Err(EncodeError::new(
+                RefusalCode::ValueHasNoForm,
+                "an ambiguous position at 90 degrees latitude or 180 degrees longitude has a box centred past it",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -511,7 +523,11 @@ impl PositionBuilder {
         Ok(Data::Position(PositionReport {
             timestamp: self.timestamp,
             messaging: self.messaging,
-            fields: self.common.positioned("a position report", false)?,
+            fields: {
+                let fields = self.common.positioned("a position report", false)?;
+                self.common.box_fault(&fields)?;
+                fields
+            },
         }))
     }
 
@@ -556,6 +572,11 @@ impl ObjectBuilder {
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
         let fields = self.common.positioned("an object", false)?;
+        // A name the encoder refuses is named first.
+        let name = self.name.as_bytes();
+        if (1..=9).contains(&name.len()) && crate::text::is_printable_ascii(name) {
+            self.common.box_fault(&fields)?;
+        }
         let timestamp = self.timestamp.ok_or_else(|| {
             EncodeError::new(RefusalCode::MissingField, "an object needs a timestamp: call timestamp(...) or permanent()")
         })?;
@@ -588,7 +609,13 @@ impl ItemBuilder {
 
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
-        Ok(Data::Item(ItemReport { name: self.name.clone(), killed: self.killed, fields: self.common.positioned("an item", false)? }))
+        let fields = self.common.positioned("an item", false)?;
+        // A name the encoder refuses is named first.
+        let name = self.name.as_bytes();
+        if (3..=9).contains(&name.len()) && crate::text::is_printable_ascii(name) && !name.contains(&b'!') && !name.contains(&b'_') {
+            self.common.box_fault(&fields)?;
+        }
+        Ok(Data::Item(ItemReport { name: self.name.clone(), killed: self.killed, fields }))
     }
 
     /// The packet: the station's header and this item, encoded.
@@ -631,7 +658,11 @@ impl MicEBuilder {
             type_code: Some(if self.messaging { '`' } else { '\'' }),
             // An altitude given in feet goes in a `/A=`, one in metres in the Mic-E altitude bytes.
             altitude_in_comment: self.common.altitude_m.is_none() && self.common.fields.altitude_feet.is_some(),
-            fields: self.common.positioned("a Mic-E report", true)?,
+            fields: {
+                let fields = self.common.positioned("a Mic-E report", true)?;
+                self.common.box_fault(&fields)?;
+                fields
+            },
             ..MicEReport::default()
         }))
     }

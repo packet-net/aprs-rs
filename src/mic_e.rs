@@ -651,13 +651,6 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
             return Ok((destination, out));
         }
     }
-    // A weather station symbol makes the status text read back as weather.
-    if comment::is_weather_symbol(f) && f.weather.is_none() {
-        return Err(EncodeError::new(
-            RefusalCode::SymbolMismatch,
-            "a report with the weather station symbol, _, is a weather report: give it weather (APRS12c ch. 12)",
-        ));
-    }
     Err(EncodeError::new(
         RefusalCode::TextReadsAsField,
         "the status text does not read back as given: a device suffix the database does not know, or text that decodes as a structured element; set the property instead",

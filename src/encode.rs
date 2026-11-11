@@ -171,6 +171,11 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned, mut p: Pending) -> R
         }
     }
 
+    // The area symbol makes a course and speed read back as an area.
+    if !f.compressed && course_speed && f.area.is_none() && f.symbol.table == '\\' && f.symbol.code == 'l' {
+        p.note(EncodeError::new(RefusalCode::SymbolMismatch, "a course and speed on the area symbol, \\l, read back as an area"));
+    }
+
     let dao_mode = match f.dao {
         Some(d) if d.precision != DaoPrecision::None && !f.compressed => Some(d.precision == DaoPrecision::Base91),
         _ => None,
@@ -424,6 +429,17 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned, p: &mut Pending) -> bool {
         }
         // The steps are 2 x 1.08^s miles for every whole s, and a range rounds to the nearest;
         // one whose s is below the byte's 0 is refused (1.95 miles is s 0, 1.9 is s -1).
+        if let Some(course) = f.course_degrees {
+            // A course of 0 has no form, whatever else is wrong.
+            match whole_degrees(course, "course") {
+                Err(e) => p.note(e),
+                Ok(0) => p.note(EncodeError::new(
+                    RefusalCode::ValueHasNoForm,
+                    "a compressed course of 0 would read back as 360, and the cs bytes have no unknown course",
+                )),
+                Ok(_) => {}
+            }
+        }
         if !range.is_finite() {
             p.note(EncodeError::new(RefusalCode::NotANumber, "a compressed range is a number"));
         } else if range <= 0.0 {

@@ -835,7 +835,14 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             let p = o.required("packet", o.object("packet", &["source", "destination", "path", "data", "diagnostics"])?)?;
             let source = p.text("source")?;
             let source = Address::third_party_source(&source).or_else(|_| unsupported("packet.source: not a third-party source".into()))?;
-            let destination = read_destination(&p.text("destination")?)?;
+            let destination_text = p.text("destination")?;
+            if destination_text.is_empty() {
+                return Err(Unreadable::Refused(
+                    pdn_aprs::RefusalCode::InvalidThirdPartyHeader,
+                    "the third-party packet has no destination".into(),
+                ));
+            }
+            let destination = read_destination(&destination_text)?;
             let path = p.strings("path")?.iter().map(|e| read_path_entry_checked(e)).collect::<Read<Vec<PathEntry>>>()?;
             let diagnostics = p.strings("diagnostics")?.iter().map(|d| read_diagnostic(d)).collect::<Read<Vec<Diagnostic>>>()?;
             // The header is written before the data, so a header the encoder cannot write back is
