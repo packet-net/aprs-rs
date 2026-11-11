@@ -172,7 +172,7 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned, mut p: Pending) -> R
     }
 
     // The area symbol makes a course and speed read back as an area.
-    if !f.compressed && course_speed && f.area.is_none() && f.symbol.table == '\\' && f.symbol.code == 'l' {
+    if !f.compressed && f.course_degrees.is_some() && f.area.is_none() && f.symbol.table == '\\' && f.symbol.code == 'l' {
         p.note(EncodeError::new(RefusalCode::SymbolMismatch, "a course and speed on the area symbol, \\l, read back as an area"));
     }
 

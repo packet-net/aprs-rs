@@ -90,3 +90,41 @@ fn a_mic_e_altitude_in_the_text_wins_even_when_equal() {
     let again = Packet::create(packet.source.clone(), packet.destination.clone(), packet.path.clone(), packet.data.clone()).unwrap();
     assert!(again.information.windows(8).any(|w| w == b"/A=00000"), "{:?}", String::from_utf8_lossy(&again.information));
 }
+
+#[test]
+fn area_symbol_and_mic_e_altitude_rulings() {
+    let area_symbol = Symbol { table: '\\', code: 'l' };
+    let at = Position { latitude: 32.84108241758242, longitude: -97.31199450549451, ambiguity: 0 };
+    let speed = Data::Position(PositionReport {
+        fields: Positioned { position: at, symbol: area_symbol, speed_knots: Some(12.0), ..Positioned::default() },
+        ..PositionReport::default()
+    });
+    assert_eq!(speed.encode().unwrap(), b"!3250.46N\\09718.72Wl.../012");
+    let course = Data::Position(PositionReport {
+        fields: Positioned {
+            position: at,
+            symbol: area_symbol,
+            course_degrees: Some(1.0),
+            speed_knots: Some(1.0),
+            ..Positioned::default()
+        },
+        ..PositionReport::default()
+    });
+    assert_eq!(code(course), RefusalCode::SymbolMismatch);
+
+    let mic_e = Data::MicE(pdn_aprs::MicEReport {
+        mic_e_message: pdn_aprs::MicEMessage::EnRoute,
+        old_data: true,
+        fields: Positioned {
+            position: Position { latitude: 47.20366666666666, longitude: -122.50216666666667, ambiguity: 0 },
+            symbol: Symbol { table: 'W', code: 'v' },
+            course_degrees: Some(26.0),
+            speed_knots: Some(0.0),
+            altitude_feet: Some(1597896.9816272964),
+            ..Positioned::default()
+        },
+        ..pdn_aprs::MicEReport::default()
+    });
+    let refused = Packet::create(Address::new("N0CALL").unwrap(), Address::new("APZ001").unwrap(), Vec::new(), mic_e);
+    assert_eq!(refused.unwrap_err().code(), RefusalCode::ValueHasNoForm);
+}
