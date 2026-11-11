@@ -837,13 +837,32 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             let source = Address::third_party_source(&source).or_else(|_| unsupported("packet.source: not a third-party source".into()))?;
             let destination = read_destination(&p.text("destination")?)?;
             let path = p.strings("path")?.iter().map(|e| read_path_entry_checked(e)).collect::<Read<Vec<PathEntry>>>()?;
+            let diagnostics = p.strings("diagnostics")?.iter().map(|d| read_diagnostic(d)).collect::<Read<Vec<Diagnostic>>>()?;
+            // The header is written before the data, so a header the encoder cannot write back is
+            // refused before the inner data is looked at.
+            let header_defect = diagnostics.iter().any(|d| {
+                matches!(
+                    d.code,
+                    Code::EmptyDestination
+                        | Code::EmptyPathEntry
+                        | Code::MultipleUsedMarkers
+                        | Code::NulPaddedAddress
+                        | Code::InvalidAx25AddressCharacters
+                )
+            });
+            let used_out_of_order = path.iter().rposition(|e| e.used).is_some_and(|last| path[..last].iter().any(|e| !e.used));
+            if header_defect || used_out_of_order {
+                return Err(Unreadable::Refused(
+                    pdn_aprs::RefusalCode::InvalidThirdPartyHeader,
+                    "the third-party packet's header cannot be written back".into(),
+                ));
+            }
             let data = try_read_data(p.required("data", p.get("data"))?)?;
             let information = match &data {
                 Data::Unrecognized(Unrecognized::Empty) => Vec::new(),
                 Data::Unrecognized(_) => return unsupported("packet.data: undecoded, and its bytes are not in the neutral form".into()),
                 data => data.encode().map_err(|e| Unreadable::Refused(e.code(), format!("the inner packet's data: {e}")))?,
             };
-            let diagnostics = p.strings("diagnostics")?.iter().map(|d| read_diagnostic(d)).collect::<Read<Vec<Diagnostic>>>()?;
             // Packet is non-exhaustive: start from decoding the information field, then say what the
             // neutral form says.
             let mut inner = Packet::decode(source, destination, path, &information, ParseOptions::LENIENT);

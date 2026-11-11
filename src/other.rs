@@ -9,6 +9,7 @@ use alloc::vec::Vec;
 
 use crate::RefusalCode;
 use crate::context::Context;
+use crate::refusal::Pending;
 use crate::weather;
 use crate::{
     AgreloDf, Capabilities, Code, Data, EncodeError, Footprint, MaidenheadBeacon, Nmea, Packet, ParseOptions, Query, RawWeather,
@@ -330,7 +331,7 @@ fn footprint_text(value: f64, text: &str, limit: f64, what: &str) -> Result<Stri
     }
     if value.is_nan() || value.abs() > limit {
         return Err(EncodeError::new(
-            RefusalCode::ValueOutOfRange,
+            RefusalCode::for_value(value),
             format!("a query footprint's {what} is decimal degrees within {limit} (a leading space only before a positive value)"),
         ));
     }
@@ -423,23 +424,33 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
         Data::Status(s) => return status::encode(s),
         Data::Telemetry(t) => return telemetry::encode(t),
         Data::Weather(w) => {
-            let Some(t) = w.timestamp.filter(|t| matches!(t, Timestamp::MonthDayHourMinute { .. })) else {
-                return Err(EncodeError::new(
-                    RefusalCode::InvalidTimestamp,
-                    "a positionless weather report has an MDHM timestamp (APRS12c ch. 12)",
-                ));
+            let mut p = Pending::default();
+            let t = match w.timestamp.filter(|t| matches!(t, Timestamp::MonthDayHourMinute { .. })) {
+                Some(t) => {
+                    p.run(crate::encode::check_timestamp(&t));
+                    Some(t)
+                }
+                None => {
+                    p.note(EncodeError::new(
+                        RefusalCode::InvalidTimestamp,
+                        "a positionless weather report has an MDHM timestamp (APRS12c ch. 12)",
+                    ));
+                    None
+                }
             };
-            crate::encode::check_timestamp(&t)?;
             if !w.comment.is_empty() {
-                return Err(EncodeError::new(RefusalCode::FieldNotAllowed, "a weather report has no comment field (APRS12c ch. 12)"));
+                p.note(EncodeError::new(RefusalCode::FieldNotAllowed, "a weather report has no comment field (APRS12c ch. 12)"));
             }
             let direction =
-                w.weather.wind_direction_degrees.map(|d| crate::encode::whole_degrees(d, "wind direction")).transpose()?.map(f64::from);
+                w.weather.wind_direction_degrees.and_then(|d| p.run(crate::encode::whole_degrees(d, "wind direction"))).map(f64::from);
             out.push(b'_');
-            out.extend_from_slice(&t.to_bytes());
-            weather::field(&mut out, b'c', direction, 3, false)?;
-            weather::field(&mut out, b's', w.weather.wind_speed_mph, 3, false)?;
-            weather::encode_fields(&mut out, &w.weather)?;
+            if let Some(t) = t {
+                out.extend_from_slice(&t.to_bytes());
+            }
+            p.run(weather::field(&mut out, b'c', direction, 3, false));
+            p.run(weather::field(&mut out, b's', w.weather.wind_speed_mph, 3, false));
+            weather::write_fields(&mut out, &w.weather, &mut p);
+            p.finish()?;
             // The software type and unit, and the extra fields, must not read back as fields.
             match positionless_weather(&mut Context::new(ParseOptions::LENIENT), &out) {
                 Some(Data::Weather(back)) if weather::text_parts(&back.weather) == weather::text_parts(&w.weather) => {}
@@ -465,18 +476,21 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
         }
         Data::Nmea(n) => return encode_nmea(n),
         Data::MaidenheadBeacon(m) => {
+            let mut p = Pending::default();
             if !status::is_locator(m.locator.as_bytes()) {
-                return Err(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 characters, e.g. IO91 or IO91SX"));
+                p.note(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 characters, e.g. IO91 or IO91SX"));
             }
-            printable(&m.comment, "a beacon comment")?;
+            p.run(printable(&m.comment, "a beacon comment"));
+            p.finish()?;
             out.push(b'[');
             out.extend_from_slice(m.locator.to_ascii_uppercase().as_bytes());
             out.push(b']');
             out.extend_from_slice(m.comment.as_bytes());
         }
         Data::Query(q) => {
+            let mut p = Pending::default();
             if q.query_type.is_empty() || !q.query_type.bytes().all(|b| b.is_ascii_uppercase()) {
-                return Err(EncodeError::new(RefusalCode::InvalidCode, "a query type is upper-case letters (APRS12c ch. 15)"));
+                p.note(EncodeError::new(RefusalCode::InvalidCode, "a query type is upper-case letters (APRS12c ch. 15)"));
             }
             out.push(b'?');
             out.extend_from_slice(q.query_type.as_bytes());
@@ -486,38 +500,41 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                 // telemetry values are (vectors README, "Numbers as sent").
                 let radius = crate::steps::round(f.radius_miles);
                 if !(0.0..=9999.0).contains(&radius) {
-                    return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "a query footprint's radius is 0-9999 miles once rounded"));
+                    p.note(EncodeError::new(
+                        RefusalCode::for_value(f.radius_miles),
+                        "a query footprint's radius is 0-9999 miles once rounded",
+                    ));
                 }
-                let latitude = footprint_text(f.latitude, &f.latitude_text, 90.0, "latitude")?;
-                let longitude = footprint_text(f.longitude, &f.longitude_text, 180.0, "longitude")?;
+                let latitude = p.run(footprint_text(f.latitude, &f.latitude_text, 90.0, "latitude")).unwrap_or_default();
+                let longitude = p.run(footprint_text(f.longitude, &f.longitude_text, 180.0, "longitude")).unwrap_or_default();
                 out.extend_from_slice(format!("{latitude},{longitude},{:04}", radius as u32).as_bytes());
             }
+            p.finish()?;
         }
         Data::Capabilities(c) => {
             if c.capabilities.is_empty() {
                 return Err(EncodeError::new(RefusalCode::MissingField, "a capabilities report lists at least one token"));
             }
-            // What would not read back the same: spaces around a value are padding.
-            let bad_token = |t: &str| t.is_empty() || t.chars().any(|c| c <= ' ' || c == '\x7F' || c == ',' || c == '=');
-            let bad_value = |v: &str| v.starts_with(' ') || v.ends_with(' ') || v.chars().any(|c| c < ' ' || c == '\x7F' || c == ',');
-            if c.capabilities.iter().any(|(t, v)| bad_token(t) || v.as_deref().is_some_and(bad_value)) {
-                let code = c.capabilities.iter().find(|(t, v)| bad_token(t) || v.as_deref().is_some_and(bad_value)).map_or(
-                    RefusalCode::InvalidCharacter,
-                    |(t, v)| {
-                        if t.is_empty() {
-                            RefusalCode::TooLong
-                        } else if !bad_token(t) && v.as_deref().is_some_and(|v| !v.chars().any(|c| c < ' ' || c == '\x7F' || c == ',')) {
-                            RefusalCode::PaddingSpace
-                        } else {
-                            RefusalCode::InvalidCharacter
-                        }
-                    },
-                );
-                return Err(EncodeError::new(
-                    code,
-                    "capability tokens and values are text without ',' or control characters, tokens without '=' or spaces, and values not starting or ending with a space",
-                ));
+            // What would not read back the same: a token is fixed-form, a value is free text whose
+            // spaces around it would be taken for padding.
+            let mut p = Pending::default();
+            for (t, v) in &c.capabilities {
+                if t.is_empty() || t.chars().any(|c| c <= ' ' || c == '\x7F' || c == ',' || c == '=') {
+                    p.note(EncodeError::new(
+                        RefusalCode::Malformed,
+                        "a capability token is not empty and has no spaces, ',', '=' or control characters",
+                    ));
+                }
+                if let Some(v) = v {
+                    if v.chars().any(|c| c < ' ' || c == '\x7F' || c == ',') {
+                        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "a capability value has no ',' or control characters"));
+                    }
+                    if v.starts_with(' ') || v.ends_with(' ') {
+                        p.note(EncodeError::new(RefusalCode::PaddingSpace, "a capability value does not start or end with a space"));
+                    }
+                }
             }
+            p.finish()?;
             out.push(b'<');
             let items: Vec<String> = c
                 .capabilities
@@ -584,59 +601,63 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
 /// its checksum (if any) right and ending it, a comment only after a checksum, and every field
 /// given agreeing with what the sentence says.
 fn encode_nmea(n: &Nmea) -> Result<Vec<u8>, EncodeError> {
+    let mut p = Pending::default();
     let sentence = n.sentence.as_bytes();
+    if text::has_line_break(n.comment.as_bytes()) {
+        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "an NMEA comment cannot contain a line break"));
+    }
     // $ULTW is raw weather, not NMEA, so such a sentence would not read back.
-    let Some(structure) = nmea_sentence(sentence).filter(|s| s.len == sentence.len() && !n.sentence.starts_with("ULTW")) else {
-        return Err(EncodeError::new(
+    match nmea_sentence(sentence).filter(|s| s.len == sentence.len() && !n.sentence.starts_with("ULTW")) {
+        None => p.note(EncodeError::new(
             RefusalCode::InvalidNmea,
             "not an NMEA 0183 sentence: printable ASCII, an address field such as GPRMC, then fields, and at most a *hh checksum at the end",
-        ));
-    };
-    match structure.checksum {
-        Some(sum) if sum != nmea_checksum(structure.content) => {
-            return Err(EncodeError::new(RefusalCode::InvalidNmea, "the NMEA checksum does not match the sentence"));
+        )),
+        Some(structure) => {
+            match structure.checksum {
+                Some(sum) if sum != nmea_checksum(structure.content) => {
+                    p.note(EncodeError::new(RefusalCode::InvalidNmea, "the NMEA checksum does not match the sentence"));
+                }
+                Some(_) if !n.has_checksum => {
+                    p.note(EncodeError::new(RefusalCode::InvalidNmea, "the sentence has a *hh checksum but has_checksum is not set"));
+                }
+                None if n.has_checksum => {
+                    p.note(EncodeError::new(RefusalCode::InvalidNmea, "has_checksum is set but the sentence has no *hh checksum"));
+                }
+                None if !n.comment.is_empty() => {
+                    p.note(EncodeError::new(
+                        RefusalCode::InvalidNmea,
+                        "an NMEA comment goes after a *hh checksum, which is what ends the sentence",
+                    ));
+                }
+                _ => {}
+            }
+            let read = nmea_fields(structure.content);
+            fn agrees<T: PartialEq>(given: &Option<T>, read: &Option<T>) -> bool {
+                given.is_none() || given == read
+            }
+            // Degrees reached by other arithmetic differ in the last bits, so numbers agree within a
+            // part in 10^9 (absolute below 1), as the vectors compare them.
+            fn near(given: &Option<f64>, read: &Option<f64>) -> bool {
+                match (given, read) {
+                    (None, _) => true,
+                    (Some(g), Some(r)) => (g - r).abs() <= 1e-9 * g.abs().max(r.abs()).max(1.0),
+                    (Some(_), None) => false,
+                }
+            }
+            if !(near(&n.latitude, &read.latitude)
+                && near(&n.longitude, &read.longitude)
+                && agrees(&n.fix_valid, &read.fix_valid)
+                && near(&n.course_degrees, &read.course_degrees)
+                && near(&n.speed_knots, &read.speed_knots)
+                && near(&n.altitude_m, &read.altitude_m)
+                && agrees(&n.time, &read.time)
+                && agrees(&n.waypoint, &read.waypoint))
+            {
+                p.note(EncodeError::new(RefusalCode::InvalidNmea, "a field given does not match what the NMEA sentence says"));
+            }
         }
-        Some(_) if !n.has_checksum => {
-            return Err(EncodeError::new(RefusalCode::InvalidNmea, "the sentence has a *hh checksum but has_checksum is not set"));
-        }
-        None if n.has_checksum => {
-            return Err(EncodeError::new(RefusalCode::InvalidNmea, "has_checksum is set but the sentence has no *hh checksum"));
-        }
-        None if !n.comment.is_empty() => {
-            return Err(EncodeError::new(
-                RefusalCode::InvalidNmea,
-                "an NMEA comment goes after a *hh checksum, which is what ends the sentence",
-            ));
-        }
-        _ => {}
     }
-    if text::has_line_break(n.comment.as_bytes()) {
-        return Err(EncodeError::new(RefusalCode::InvalidCharacter, "an NMEA comment cannot contain a line break"));
-    }
-    let read = nmea_fields(structure.content);
-    fn agrees<T: PartialEq>(given: &Option<T>, read: &Option<T>) -> bool {
-        given.is_none() || given == read
-    }
-    // Degrees reached by other arithmetic differ in the last bits, so numbers agree within a
-    // part in 10^9 (absolute below 1), as the vectors compare them.
-    fn near(given: &Option<f64>, read: &Option<f64>) -> bool {
-        match (given, read) {
-            (None, _) => true,
-            (Some(g), Some(r)) => (g - r).abs() <= 1e-9 * g.abs().max(r.abs()).max(1.0),
-            (Some(_), None) => false,
-        }
-    }
-    if !(near(&n.latitude, &read.latitude)
-        && near(&n.longitude, &read.longitude)
-        && agrees(&n.fix_valid, &read.fix_valid)
-        && near(&n.course_degrees, &read.course_degrees)
-        && near(&n.speed_knots, &read.speed_knots)
-        && near(&n.altitude_m, &read.altitude_m)
-        && agrees(&n.time, &read.time)
-        && agrees(&n.waypoint, &read.waypoint))
-    {
-        return Err(EncodeError::new(RefusalCode::InvalidNmea, "a field given does not match what the NMEA sentence says"));
-    }
+    p.finish()?;
     let mut out = Vec::with_capacity(1 + sentence.len() + n.comment.len());
     out.push(b'$');
     out.extend_from_slice(sentence);

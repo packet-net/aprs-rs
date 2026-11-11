@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 
 use crate::RefusalCode;
 use crate::context::Context;
+use crate::refusal::Pending;
 use crate::{Code, CompressionFix, CompressionOrigin, CompressionSource, CompressionType, EncodeError, Position, Symbol, base91};
 
 /// The compressed course/speed, range or altitude bytes, kept raw: what they mean depends on the
@@ -286,29 +287,20 @@ pub(crate) fn check_symbol(symbol: Symbol) -> Result<(), EncodeError> {
     Ok(())
 }
 
-/// Writes an uncompressed position with its symbol. For a `!DAO!`, `dao_digits` receives the
-/// extra latitude and longitude digits (thousandths, or base-91 when `base91`).
+/// Writes an uncompressed position with its symbol. For a `!DAO!`, the result holds the extra
+/// latitude and longitude digits (thousandths, or base-91 when `base91`). What is wrong is noted
+/// in `p`, and what is written then is thrown away.
 pub(crate) fn encode_uncompressed(
     out: &mut Vec<u8>,
     position: &Position,
     symbol: Symbol,
     dao: Option<bool>,
-) -> Result<Option<(u8, u8)>, EncodeError> {
-    check_symbol(symbol)?;
-    if !(-90.0..=90.0).contains(&position.latitude) || position.latitude.is_nan() {
-        return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "latitude must be -90 to 90 degrees"));
-    }
-    if !(-180.0..=180.0).contains(&position.longitude) || position.longitude.is_nan() {
-        return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "longitude must be -180 to 180 degrees"));
-    }
-    if position.ambiguity > 4 {
-        return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "position ambiguity is 0-4 digits"));
-    }
+    p: &mut Pending,
+) -> Option<(u8, u8)> {
+    p.run(check_symbol(symbol));
+    let position = checked_position(position, p);
     if position.ambiguity > 0 && dao.is_some() {
-        return Err(EncodeError::new(
-            RefusalCode::FieldNotAllowed,
-            "a !DAO! adds precision to an ambiguous position, which contradicts it",
-        ));
+        p.note(EncodeError::new(RefusalCode::FieldNotAllowed, "a !DAO! adds precision to an ambiguous position, which contradicts it"));
     }
     let (lat_text, lat_extra) = coordinate(position.latitude, 2, position.ambiguity, dao);
     let (lon_text, lon_extra) = coordinate(position.longitude, 3, position.ambiguity, dao);
@@ -318,7 +310,26 @@ pub(crate) fn encode_uncompressed(
     out.extend_from_slice(&lon_text);
     out.push(if position.longitude.is_sign_negative() { b'W' } else { b'E' });
     out.push(symbol.code as u8);
-    Ok(dao.map(|_| (lat_extra, lon_extra)))
+    dao.map(|_| (lat_extra, lon_extra))
+}
+
+/// The position if it is one that can be written, else a harmless one, with what is wrong noted.
+fn checked_position(position: &Position, p: &mut Pending) -> Position {
+    let mut fine = true;
+    for (value, limit, what) in [
+        (position.latitude, 90.0, "latitude must be -90 to 90 degrees"),
+        (position.longitude, 180.0, "longitude must be -180 to 180 degrees"),
+    ] {
+        if !(-limit..=limit).contains(&value) {
+            p.note(EncodeError::new(RefusalCode::for_value(value), what));
+            fine = false;
+        }
+    }
+    if position.ambiguity > 4 {
+        p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "position ambiguity is 0-4 digits"));
+        fine = false;
+    }
+    if fine { *position } else { Position { latitude: 0.0, longitude: 0.0, ambiguity: 0 } }
 }
 
 /// The `!DAO!` digits for a position: latitude, then longitude, each the digit (`base91`: the
@@ -361,15 +372,18 @@ fn coordinate(value: f64, degree_digits: usize, ambiguity: u8, dao: Option<bool>
 }
 
 /// Writes a compressed position: table, latitude, longitude, symbol code. The cs and type bytes follow separately.
-pub(crate) fn encode_compressed(out: &mut Vec<u8>, position: &Position, symbol: Symbol) -> Result<(), EncodeError> {
-    check_symbol(symbol)?;
+pub(crate) fn encode_compressed(out: &mut Vec<u8>, position: &Position, symbol: Symbol, p: &mut Pending) {
+    p.run(check_symbol(symbol));
     if position.ambiguity != 0 {
-        return Err(EncodeError::new(RefusalCode::FieldNotAllowed, "a compressed position cannot be ambiguous"));
+        p.note(EncodeError::new(RefusalCode::FieldNotAllowed, "a compressed position cannot be ambiguous"));
     }
+    let mut position = *position;
     if !(-90.0..=90.0).contains(&position.latitude) || !(-180.0..=180.0).contains(&position.longitude) {
-        return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "the position is out of range"));
+        let value = if (-90.0..=90.0).contains(&position.latitude) { position.longitude } else { position.latitude };
+        p.note(EncodeError::new(RefusalCode::for_value(value), "the position is out of range"));
+        position = Position { latitude: 0.0, longitude: 0.0, ambiguity: 0 };
     }
-    let (y, x) = compressed_steps(position);
+    let (y, x) = compressed_steps(&position);
     out.push(match symbol.table {
         d @ '0'..='9' => b'a' + (d as u8 - b'0'),
         t => t as u8,
@@ -377,7 +391,6 @@ pub(crate) fn encode_compressed(out: &mut Vec<u8>, position: &Position, symbol: 
     base91::encode(y, 4, out);
     base91::encode(x, 4, out);
     out.push(symbol.code as u8);
-    Ok(())
 }
 
 /// The compressed latitude and longitude steps for a position.

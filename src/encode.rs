@@ -10,6 +10,7 @@ use crate::RefusalCode;
 use crate::comment::{self, KNOTS_TO_MPH, beacon_rate_char};
 use crate::context::Context;
 use crate::position::{self, type_to_bits};
+use crate::refusal::Pending;
 use crate::weather::{self, push_digits};
 use crate::{
     CompressionFix, CompressionOrigin, CompressionSource, CompressionType, DaoPrecision, Data, EncodeError, ItemReport, ObjectReport,
@@ -49,6 +50,7 @@ impl Data {
 }
 
 fn position_report(out: &mut Vec<u8>, r: &PositionReport) -> Result<(), EncodeError> {
+    let mut p = Pending::default();
     out.push(match (r.timestamp.is_some(), r.messaging) {
         (false, false) => b'!',
         (false, true) => b'=',
@@ -56,9 +58,9 @@ fn position_report(out: &mut Vec<u8>, r: &PositionReport) -> Result<(), EncodeEr
         (true, true) => b'@',
     });
     if let Some(t) = &r.timestamp {
-        dhm_or_hms(out, t)?;
+        p.run(dhm_or_hms(out, t));
     }
-    positioned(out, &r.fields)
+    positioned(out, &r.fields, p)
 }
 
 fn object(out: &mut Vec<u8>, o: &ObjectReport) -> Result<(), EncodeError> {
@@ -66,21 +68,21 @@ fn object(out: &mut Vec<u8>, o: &ObjectReport) -> Result<(), EncodeError> {
     if name.is_empty() || name.len() > 9 || !crate::text::is_printable_ascii(name) {
         return Err(EncodeError::new(RefusalCode::InvalidName, "an object name is 1-9 printable ASCII characters (APRS12c ch. 11)"));
     }
+    let mut p = Pending::default();
     if name.ends_with(b" ") {
-        return Err(EncodeError::new(
-            RefusalCode::PaddingSpace,
-            "an object name cannot end in a space, which would be read back as padding",
-        ));
+        p.note(EncodeError::new(RefusalCode::PaddingSpace, "an object name cannot end in a space, which would be read back as padding"));
     }
     out.push(b';');
     out.extend_from_slice(name);
     out.extend(core::iter::repeat_n(b' ', 9 - name.len()));
     out.push(if o.killed { b'_' } else { b'*' });
-    let Some(t) = &o.timestamp else {
-        return Err(EncodeError::new(RefusalCode::MissingField, "an object report must have a timestamp (APRS12c ch. 11)"));
-    };
-    dhm_or_hms(out, t)?;
-    positioned(out, &o.fields)
+    match &o.timestamp {
+        None => p.note(EncodeError::new(RefusalCode::MissingField, "an object report must have a timestamp (APRS12c ch. 11)")),
+        Some(t) => {
+            p.run(dhm_or_hms(out, t));
+        }
+    }
+    positioned(out, &o.fields, p)
 }
 
 fn item(out: &mut Vec<u8>, i: &ItemReport) -> Result<(), EncodeError> {
@@ -94,7 +96,7 @@ fn item(out: &mut Vec<u8>, i: &ItemReport) -> Result<(), EncodeError> {
     out.push(b')');
     out.extend_from_slice(name);
     out.push(if i.killed { b'_' } else { b'!' });
-    positioned(out, &i.fields)
+    positioned(out, &i.fields, Pending::default())
 }
 
 pub(crate) fn dhm_or_hms(out: &mut Vec<u8>, t: &Timestamp) -> Result<(), EncodeError> {
@@ -120,43 +122,49 @@ pub(crate) fn check_timestamp(t: &Timestamp) -> Result<(), EncodeError> {
     }
 }
 
-/// The position, symbol, extension, weather and comment of a position, object or item.
-pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), EncodeError> {
+/// The position, symbol, extension, weather and comment of a position, object or item. `p` holds
+/// what is already wrong with the report around it.
+pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned, mut p: Pending) -> Result<(), EncodeError> {
     let weather_symbol = comment::is_weather_symbol(f);
     if weather_symbol && f.weather.is_none() {
         // A report with the weather station symbol reads back as weather, whatever it holds.
-        return Err(EncodeError::new(
+        p.note(EncodeError::new(
             RefusalCode::SymbolMismatch,
             "a report with the weather station symbol, _, is a weather report: give it weather (APRS12c ch. 12)",
         ));
     }
+    if f.storm.is_some() && !comment::is_storm_symbol(f) {
+        p.note(EncodeError::new(RefusalCode::SymbolMismatch, "storm data needs the hurricane symbol, @ (APRS12c ch. 12)"));
+    }
+    let course_speed = f.course_degrees.is_some() || f.speed_knots.is_some();
     if f.weather.is_some() {
         if !weather_symbol {
-            return Err(EncodeError::new(RefusalCode::SymbolMismatch, "weather needs the weather station symbol, _ (APRS12c ch. 12)"));
+            p.note(EncodeError::new(RefusalCode::SymbolMismatch, "weather needs the weather station symbol, _ (APRS12c ch. 12)"));
         }
         if !f.comment.is_empty() {
-            return Err(EncodeError::new(
-                RefusalCode::FieldNotAllowed,
-                "a weather report has no comment field (APRS12c ch. 12, UAP 2.7.1)",
-            ));
+            p.note(EncodeError::new(RefusalCode::FieldNotAllowed, "a weather report has no comment field (APRS12c ch. 12, UAP 2.7.1)"));
         }
-        if f.telemetry.is_some() || f.frequency.is_some() || f.signpost.is_some() || (f.altitude_feet.is_some() && !f.compressed) {
-            return Err(EncodeError::new(
+        let gga = f.compression.is_some_and(|t| t.source == CompressionSource::Gga);
+        if f.telemetry.is_some() || f.frequency.is_some() || f.signpost.is_some() || (f.altitude_feet.is_some() && !(f.compressed && gga)) {
+            p.note(EncodeError::new(
                 RefusalCode::FieldNotAllowed,
                 "a weather report has no comment, so it cannot carry telemetry, frequency, signpost or /A= altitude (APRS12c ch. 12)",
             ));
         }
         // Its data extension, or its cs bytes, are the wind.
-        if f.course_degrees.is_some()
-            || f.speed_knots.is_some()
-            || f.phg.is_some()
-            || f.dfs.is_some()
-            || f.area.is_some()
-            || f.df_bearing.is_some()
-            || f.storm.is_some()
-            || (f.range_miles.is_some() && !f.compressed)
-        {
-            return Err(EncodeError::new(
+        let conflict = if f.compressed {
+            course_speed
+        } else {
+            course_speed
+                || f.phg.is_some()
+                || f.dfs.is_some()
+                || f.area.is_some()
+                || f.df_bearing.is_some()
+                || f.storm.is_some()
+                || f.range_miles.is_some()
+        };
+        if conflict {
+            p.note(EncodeError::new(
                 RefusalCode::ExtensionConflict,
                 "a weather report's data extension is its wind, so it cannot carry a course, speed, PHG, RNG, DFS, area, DF bearing or storm data (APRS12c ch. 12)",
             ));
@@ -174,18 +182,20 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
 
     if f.compressed {
         if f.phg.is_some() || f.dfs.is_some() || f.area.is_some() || f.df_bearing.is_some() || f.storm.is_some() {
-            return Err(EncodeError::new(
+            p.note(EncodeError::new(
                 RefusalCode::FieldNotAllowed,
                 "a compressed position cannot carry a 7-byte data extension (PHG, DFS, area, DF bearing, storm) (APRS12c ch. 9)",
             ));
         }
-        position::encode_compressed(out, &f.position, f.symbol)?;
+        position::encode_compressed(out, &f.position, f.symbol, &mut p);
         // A compressed weather report has no comment, so an altitude the cs bytes cannot carry
         // exactly is rounded to their step and has no /A= (vectors README, Encoding).
-        altitude_in_cs = compressed_cs(out, f)?;
+        altitude_in_cs = compressed_cs(out, f, &mut p);
     } else {
+        // The 7-byte data extension holds one thing: course/speed (with a DF bearing or storm data,
+        // which ride on it), PHG, RNG, DFS or an area object.
         let count = [
-            f.course_degrees.is_some() || f.speed_knots.is_some(),
+            f.course_degrees.is_some() || f.speed_knots.is_some() || f.df_bearing.is_some() || f.storm.is_some(),
             f.phg.is_some(),
             f.range_miles.is_some(),
             f.dfs.is_some(),
@@ -194,18 +204,18 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
         .iter()
         .filter(|x| **x)
         .count();
-        if count > 1 {
-            return Err(EncodeError::new(
+        if count > 1 || (f.df_bearing.is_some() && f.storm.is_some()) {
+            p.note(EncodeError::new(
                 RefusalCode::ExtensionConflict,
                 "only one data extension (course/speed, PHG, RNG, DFS or area object) fits in a report (APRS12c ch. 7)",
             ));
         }
-        dao_digits = position::encode_uncompressed(out, &f.position, f.symbol, dao_mode)?;
-        extension = uncompressed_extension(out, f)?;
+        dao_digits = position::encode_uncompressed(out, &f.position, f.symbol, dao_mode, &mut p);
+        extension = uncompressed_extension(out, f, &mut p);
     }
 
     if let Some(w) = &f.weather {
-        weather::encode_fields(out, w)?;
+        weather::write_fields(out, w, &mut p);
     }
 
     // After the data extension, in this order: the voice frequency and its fields, in the first
@@ -219,23 +229,17 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
             if extension && out.last() != Some(&b'/') {
                 out.push(b'/');
             }
-            frequency(out, fr)?;
+            frequency(out, fr, &mut p);
         }
         if let Some(sign) = &f.signpost {
-            if !(f.symbol.table == '\\' && f.symbol.code == 'm')
-                || sign.is_empty()
-                || sign.len() > 3
-                || sign.contains(['{', '}'])
-                || !crate::text::is_printable_ascii(sign.as_bytes())
-            {
-                let code = if !(f.symbol.table == '\\' && f.symbol.code == 'm') {
-                    RefusalCode::SymbolMismatch
-                } else if sign.is_empty() || sign.len() > 3 {
-                    RefusalCode::Malformed
-                } else {
-                    RefusalCode::InvalidCharacter
-                };
-                return Err(EncodeError::new(code, "signpost text is 1-3 characters on the signpost symbol, \\m"));
+            if !(f.symbol.table == '\\' && f.symbol.code == 'm') {
+                p.note(EncodeError::new(RefusalCode::SymbolMismatch, "a signpost needs the signpost symbol, \\m"));
+            }
+            if sign.contains(['{', '}']) || !crate::text::is_printable_ascii(sign.as_bytes()) {
+                p.note(EncodeError::new(RefusalCode::InvalidCharacter, "signpost text is printable ASCII without braces"));
+            }
+            if sign.is_empty() || sign.len() > 3 {
+                p.note(EncodeError::new(RefusalCode::Malformed, "signpost text is 1-3 characters"));
             }
             out.push(b'{');
             out.extend_from_slice(sign.as_bytes());
@@ -243,16 +247,15 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
         }
         if let Some(w) = f.area.and_then(|a| a.corridor_width_miles) {
             if w > 999 {
-                return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "an area corridor width is at most 999 miles"));
+                p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "an area corridor width is at most 999 miles"));
             }
             out.extend_from_slice(format!("{{{w}}}").as_bytes());
         }
         if let Some(feet) = f.altitude_feet.filter(|_| !altitude_in_cs) {
             let n = crate::steps::round(feet);
             if !(-99_999.0..=999_999.0).contains(&n) {
-                return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "/A= altitude must fit in 6 digits (or - and 5 digits)"));
-            }
-            if n < 0.0 {
+                p.note(EncodeError::new(RefusalCode::for_value(feet), "/A= altitude must fit in 6 digits (or - and 5 digits)"));
+            } else if n < 0.0 {
                 out.extend_from_slice(b"/A=-");
                 push_digits(out, (-n) as u32, 5);
             } else {
@@ -264,22 +267,22 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
 
     let text = f.comment.as_bytes();
     if crate::text::has_line_break(text) {
-        return Err(EncodeError::new(RefusalCode::InvalidCharacter, "comment text cannot contain a line break"));
+        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "comment text cannot contain a line break"));
     }
     let text_at = out.len();
     let mut trailer = Vec::new();
     if let Some(t) = &f.telemetry {
-        telemetry_into(&mut trailer, t)?;
+        telemetry_into(&mut trailer, t, &mut p);
     }
     if let Some(d) = f.dao {
         // Whatever its precision: even `!W  !` reads back as `dao-with-ambiguity`.
         if f.position.ambiguity > 0 {
-            return Err(EncodeError::new(
+            p.note(EncodeError::new(
                 RefusalCode::FieldNotAllowed,
                 "a !DAO! on an ambiguous position contradicts it, whatever its precision",
             ));
         }
-        check_dao_datum(d)?;
+        p.run(check_dao_datum(d));
         trailer.push(b'!');
         match (d.precision, dao_digits) {
             (DaoPrecision::Thousandths, Some((lat, lon))) => trailer.extend_from_slice(&[d.datum as u8, b'0' + lat, b'0' + lon]),
@@ -300,6 +303,8 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
         }
         trailer.push(b'!');
     }
+    // What is wrong on its own, or between fields, is named before the read-back is tried.
+    p.finish()?;
 
     // Write the text as it is (after a frequency, a space first); if it does not read back
     // unchanged, try it without the space, then after a '/' delimiter.
@@ -344,7 +349,7 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned) -> Result<(), Encode
 /// weather station). Whatever else would have to go in them is refused, not dropped, and so is a
 /// compression type with nothing to carry, since blank cs bytes have no type byte (vectors
 /// interpretations.md, "Re-encoding into compressed bytes rounds").
-fn compressed_cs(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError> {
+fn compressed_cs(out: &mut Vec<u8>, f: &Positioned, p: &mut Pending) -> bool {
     let wind = f.weather.as_ref().filter(|w| w.wind_direction_degrees.is_some() || w.wind_speed_mph.is_some());
     let course_speed = f.course_degrees.is_some() || f.speed_knots.is_some();
     let t = f.compression.unwrap_or(CompressionType {
@@ -353,109 +358,139 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError>
         origin: CompressionOrigin::Software,
     });
     let log = |x: f64, base: f64| libm::log(x) / libm::log(base);
-    let (c, s, altitude) = if t.source == CompressionSource::Gga {
+    let mut altitude = false;
+    let (mut c, mut s) = (0u8, 0u8);
+    if t.source == CompressionSource::Gga {
         // GGA cs bytes are read as an altitude, whatever else was meant.
-        let Some(feet) = f.altitude_feet else {
-            return Err(EncodeError::new(
+        if f.altitude_feet.is_none() {
+            p.note(EncodeError::new(
                 RefusalCode::MissingField,
                 "a GGA compression type carries an altitude in the cs bytes, and there is none",
             ));
-        };
+        }
         if course_speed || f.range_miles.is_some() || wind.is_some() {
-            return Err(EncodeError::new(
+            p.note(EncodeError::new(
                 RefusalCode::ExtensionConflict,
                 "the cs bytes carry the GGA altitude, so a compressed position cannot also carry a course, speed, range or wind",
             ));
         }
-        if feet.is_nan() {
-            return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "the altitude is not a number"));
+        if let Some(feet) = f.altitude_feet {
+            if !feet.is_finite() {
+                p.note(EncodeError::new(RefusalCode::NotANumber, "the altitude is not a number"));
+            } else {
+                // 1.002^cs feet cannot be 1 foot or less: the nearest is cs 0, and /A= carries the rest.
+                let cs = if feet <= 1.0 { 0 } else { crate::steps::round(log(feet, 1.002)) as i64 };
+                if cs > 90 * 91 + 90 {
+                    p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "the altitude is too high for a compressed position"));
+                } else {
+                    // The cs bytes carry altitude only to 0.2%; one they cannot carry exactly is also written
+                    // as /A=, which the decoder prefers.
+                    altitude = (libm::pow(1.002, cs as f64) - feet).abs() <= 1e-9 * feet.abs();
+                    (c, s) = ((cs / 91) as u8, (cs % 91) as u8);
+                }
+            }
         }
-        // 1.002^cs feet cannot be 1 foot or less: the nearest is cs 0, and /A= carries the rest.
-        let cs = if feet <= 1.0 { 0 } else { crate::steps::round(log(feet, 1.002)) as i64 };
-        if cs > 90 * 91 + 90 {
-            return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "the altitude is too high for a compressed position"));
-        }
-        // The cs bytes carry altitude only to 0.2%; one they cannot carry exactly is also written
-        // as /A=, which the decoder prefers.
-        let exact = (libm::pow(1.002, cs as f64) - feet).abs() <= 1e-9 * feet.abs();
-        ((cs / 91) as u8, (cs % 91) as u8, exact)
     } else if let Some(w) = wind {
         // A weather station's cs course and speed are its wind.
         if f.range_miles.is_some() {
-            return Err(EncodeError::new(RefusalCode::ExtensionConflict, "the cs bytes carry the wind or a range, not both"));
+            p.note(EncodeError::new(RefusalCode::ExtensionConflict, "the cs bytes carry the wind or a range, not both"));
         }
         // The cs bytes carry a direction and a speed together; one without the other would read
         // back as 0.
-        let (Some(dir), Some(mph)) = (w.wind_direction_degrees, w.wind_speed_mph) else {
-            return Err(EncodeError::new(
+        if w.wind_direction_degrees.is_none() || w.wind_speed_mph.is_none() {
+            p.note(EncodeError::new(
                 RefusalCode::MissingField,
                 "the cs bytes carry the wind as a direction and a speed together, so both are needed",
             ));
-        };
-        let knots = mph / KNOTS_TO_MPH;
-        (direction_code(dir, "wind direction")?, speed_code(knots)?, false)
+        }
+        if let Some(dir) = w.wind_direction_degrees {
+            match direction_code(dir, "wind direction") {
+                Ok(v) => c = v,
+                Err(e) => p.note(e),
+            }
+        }
+        if let Some(mph) = w.wind_speed_mph {
+            match speed_code(mph / KNOTS_TO_MPH) {
+                Ok(v) => s = v,
+                Err(e) => p.note(e),
+            }
+        }
     } else if let Some(range) = f.range_miles {
         if course_speed {
-            return Err(EncodeError::new(
+            p.note(EncodeError::new(
                 RefusalCode::ExtensionConflict,
                 "the cs bytes carry a course and speed or a range, not both (APRS12c ch. 9)",
             ));
         }
         // The steps are 2 x 1.08^s miles for every whole s, and a range rounds to the nearest;
         // one whose s is below the byte's 0 is refused (1.95 miles is s 0, 1.9 is s -1).
-        if range.is_nan() || range <= 0.0 {
-            return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "a compressed range must be at least 2 miles"));
+        if !range.is_finite() {
+            p.note(EncodeError::new(RefusalCode::NotANumber, "a compressed range is a number"));
+        } else if range <= 0.0 {
+            p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "a compressed range must be at least 2 miles"));
+        } else {
+            let step = crate::steps::round(log(range / 2.0, 1.08));
+            if step < 0.0 {
+                p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "a compressed range must round to at least 2 miles"));
+            } else if step > 90.0 {
+                p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "the range is too far for a compressed position"));
+            } else {
+                (c, s) = (b'{' - 33, step as u8);
+            }
         }
-        let s = crate::steps::round(log(range / 2.0, 1.08));
-        if s < 0.0 {
-            return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "a compressed range must round to at least 2 miles"));
-        }
-        if s > 90.0 {
-            return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "the range is too far for a compressed position"));
-        }
-        (b'{' - 33, s as u8, false)
     } else if course_speed {
         // The cs bytes hold a course and a speed together, so writing one alone would add a value
         // the data does not have; and they have no unknown course, since a c of 0 reads back as
         // 360 (vectors README, Encoding).
-        let (Some(course), Some(knots)) = (f.course_degrees, f.speed_knots) else {
-            return Err(EncodeError::new(
+        if f.course_degrees.is_none() || f.speed_knots.is_none() {
+            p.note(EncodeError::new(
                 RefusalCode::MissingField,
                 "the cs bytes carry a course and a speed together, so a compressed report needs both",
             ));
-        };
-        // Unknown (0) and in range (1-360) are decided in whole degrees; a known course is then rounded
-        // once to the 4-degree step, where the step at north is 360.
-        let whole = whole_degrees(course, "course")?;
-        if whole == 0 {
-            return Err(EncodeError::new(
-                RefusalCode::ValueHasNoForm,
-                "a compressed course of 0 would read back as 360, and the cs bytes have no unknown course",
-            ));
         }
-        (direction_code(course, "course")?, speed_code(knots)?, false)
+        if let Some(course) = f.course_degrees {
+            // Unknown (0) and in range (1-360) are decided in whole degrees; a known course is then rounded
+            // once to the 4-degree step, where the step at north is 360.
+            match whole_degrees(course, "course") {
+                Err(e) => p.note(e),
+                Ok(0) => p.note(EncodeError::new(
+                    RefusalCode::ValueHasNoForm,
+                    "a compressed course of 0 would read back as 360, and the cs bytes have no unknown course",
+                )),
+                Ok(_) => match direction_code(course, "course") {
+                    Ok(v) => c = v,
+                    Err(e) => p.note(e),
+                },
+            }
+        }
+        if let Some(knots) = f.speed_knots {
+            match speed_code(knots) {
+                Ok(v) => s = v,
+                Err(e) => p.note(e),
+            }
+        }
     } else {
         // No course/speed, range or altitude: the spec's own form for that, which has no type byte.
         if f.compression.is_some() {
-            return Err(EncodeError::new(
+            p.note(EncodeError::new(
                 RefusalCode::MissingField,
                 "a compression type needs something in the cs bytes: a course and speed, range, altitude or wind",
             ));
         }
         out.extend_from_slice(b" sT");
-        return Ok(false);
-    };
+        return false;
+    }
     out.push(c + 33);
     out.push(s + 33);
     out.push(type_to_bits(t) + 33);
-    Ok(altitude)
+    altitude
 }
 
 /// A course or wind direction rounded once to whole degrees, which must be 0-360.
 pub(crate) fn whole_degrees(degrees: f64, what: &str) -> Result<u32, EncodeError> {
     let rounded = crate::steps::round(degrees);
     if !(0.0..=360.0).contains(&rounded) {
-        return Err(EncodeError::new(RefusalCode::ValueOutOfRange, format!("{what} must round to 0-360 degrees")));
+        return Err(EncodeError::new(RefusalCode::for_value(degrees), format!("{what} must round to 0-360 degrees")));
     }
     Ok(rounded as u32)
 }
@@ -466,7 +501,7 @@ pub(crate) fn whole_degrees(degrees: f64, what: &str) -> Result<u32, EncodeError
 fn direction_code(degrees: f64, what: &str) -> Result<u8, EncodeError> {
     let steps = crate::steps::round(degrees / 4.0);
     if !(0.0..=90.0).contains(&steps) {
-        return Err(EncodeError::new(RefusalCode::ValueOutOfRange, format!("{what} must round to 0-360 degrees")));
+        return Err(EncodeError::new(RefusalCode::for_value(degrees), format!("{what} must round to 0-360 degrees")));
     }
     Ok((steps as u32 % 90) as u8)
 }
@@ -474,7 +509,10 @@ fn direction_code(degrees: f64, what: &str) -> Result<u8, EncodeError> {
 fn speed_code(knots: f64) -> Result<u8, EncodeError> {
     // The steps are 1.08^s - 1 knots for every whole s, and a value rounds to the nearest; one
     // whose s is below the byte's 0 is refused (-0.03 knots is s 0, -0.3 is s -5).
-    if knots.is_nan() || knots <= -1.0 {
+    if !knots.is_finite() {
+        return Err(EncodeError::new(RefusalCode::NotANumber, "speed is a number"));
+    }
+    if knots <= -1.0 {
         return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "speed cannot be negative"));
     }
     let s = crate::steps::round(libm::log(knots + 1.0) / libm::log(1.08));
@@ -497,30 +535,33 @@ fn three(out: &mut Vec<u8>, v: Option<u32>, max: u32, what: &str) -> Result<(), 
 }
 
 /// Writes the 7-byte data extension of an uncompressed position; `true` if there is one.
-fn uncompressed_extension(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, EncodeError> {
+fn uncompressed_extension(out: &mut Vec<u8>, f: &Positioned, p: &mut Pending) -> bool {
     if let Some(w) = f.weather.as_ref() {
-        let direction = w.wind_direction_degrees.map(|d| whole_degrees(d, "wind direction")).transpose()?;
-        three(out, direction, 360, "wind direction")?;
+        let direction = w.wind_direction_degrees.and_then(|d| p.run(whole_degrees(d, "wind direction")));
+        p.run(three(out, direction, 360, "wind direction"));
         out.push(b'/');
-        three(out, whole(w.wind_speed_mph, "wind speed")?, 999, "wind speed")?;
-        return Ok(true);
+        let speed = p.run(whole(w.wind_speed_mph, "wind speed")).flatten();
+        p.run(three(out, speed, 999, "wind speed"));
+        return true;
     }
     if f.course_degrees.is_some() || f.speed_knots.is_some() || f.df_bearing.is_some() || f.storm.is_some() {
-        let course = f.course_degrees.map(|c| whole_degrees(c, "course")).transpose()?;
-        three(out, course, 360, "course")?;
+        let course = f.course_degrees.and_then(|c| p.run(whole_degrees(c, "course")));
+        p.run(three(out, course, 360, "course"));
         out.push(b'/');
-        three(out, whole(f.speed_knots, "speed")?, 999, "speed")?;
+        let speed = p.run(whole(f.speed_knots, "speed")).flatten();
+        p.run(three(out, speed, 999, "speed"));
         if let Some(b) = f.df_bearing {
             if !(f.symbol.table == '/' && f.symbol.code == '\\') {
-                return Err(EncodeError::new(RefusalCode::SymbolMismatch, "a DF bearing needs the DF symbol, /\\"));
+                p.note(EncodeError::new(RefusalCode::SymbolMismatch, "a DF bearing needs the DF symbol, /\\"));
             }
             if b.bearing_degrees > 360 || b.number > 9 || b.range > 9 || b.quality > 9 {
-                return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "DF bearing is 0-360 and N, R, Q are single digits"));
+                p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "DF bearing is 0-360 and N, R, Q are single digits"));
+            } else {
+                out.push(b'/');
+                push_digits(out, u32::from(b.bearing_degrees), 3);
+                out.push(b'/');
+                out.extend_from_slice(&[b'0' + b.number, b'0' + b.range, b'0' + b.quality]);
             }
-            out.push(b'/');
-            push_digits(out, u32::from(b.bearing_degrees), 3);
-            out.push(b'/');
-            out.extend_from_slice(&[b'0' + b.number, b'0' + b.range, b'0' + b.quality]);
         }
         if let Some(s) = f.storm {
             out.push(b'/');
@@ -537,45 +578,49 @@ fn uncompressed_extension(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, Enc
                 (b'&', s.tropical_storm_radius_nm, 3),
             ] {
                 out.push(marker);
-                storm_value(out, value, width)?;
+                p.run(storm_value(out, value, width));
             }
             if let Some(g) = s.whole_gale_radius_nm {
                 out.push(b'%');
-                storm_value(out, Some(g), 3)?;
+                p.run(storm_value(out, Some(g), 3));
             }
         }
-        return Ok(true);
+        return true;
     }
-    if let Some(p) = f.phg {
-        phg_codes(out, p)?;
-        if let Some(rate) = p.beacons_per_hour {
-            let Some(c) = beacon_rate_char(rate) else {
-                return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "PHGR beacons per hour is 1-35"));
-            };
-            out.push(c);
-            out.push(b'/');
+    if let Some(ph) = f.phg {
+        p.run(phg_codes(out, ph));
+        if let Some(rate) = ph.beacons_per_hour {
+            match beacon_rate_char(rate) {
+                Some(c) => {
+                    out.push(c);
+                    out.push(b'/');
+                }
+                None => p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "PHGR beacons per hour is 1-35")),
+            }
         }
-        return Ok(true);
+        return true;
     }
     if let Some(r) = f.range_miles {
         let n = crate::steps::round(r);
         if !(0.0..=9999.0).contains(&n) {
-            return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "RNG range is 0-9999 miles"));
+            p.note(EncodeError::new(RefusalCode::for_value(r), "RNG range is 0-9999 miles"));
+        } else {
+            out.extend_from_slice(b"RNG");
+            push_digits(out, n as u32, 4);
         }
-        out.extend_from_slice(b"RNG");
-        push_digits(out, n as u32, 4);
-        return Ok(true);
+        return true;
     }
     if let Some(d) = f.dfs {
-        dfs_codes(out, d)?;
-        return Ok(true);
+        p.run(dfs_codes(out, d));
+        return true;
     }
     if let Some(a) = f.area {
         if !(f.symbol.table == '\\' && f.symbol.code == 'l') {
-            return Err(EncodeError::new(RefusalCode::SymbolMismatch, "an area object needs the area symbol, \\l"));
+            p.note(EncodeError::new(RefusalCode::SymbolMismatch, "an area object needs the area symbol, \\l"));
         }
         if a.lat_offset > 99 || a.lon_offset > 99 {
-            return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "area offsets are two digits"));
+            p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "area offsets are two digits"));
+            return true;
         }
         out.push(b'0' + a.shape as u8);
         push_digits(out, u32::from(a.lat_offset), 2);
@@ -588,9 +633,9 @@ fn uncompressed_extension(out: &mut Vec<u8>, f: &Positioned) -> Result<bool, Enc
         }
         push_digits(out, u32::from(a.lon_offset), 2);
         // A line's corridor width, {www}, is written with the comment's braces.
-        return Ok(true);
+        return true;
     }
-    Ok(false)
+    false
 }
 
 /// The highest PHG or DFS height code: `~`, the last printable character after `0` (APRS12c ch.
@@ -655,9 +700,10 @@ fn storm_value(out: &mut Vec<u8>, v: Option<u16>, width: usize) -> Result<(), En
     Ok(())
 }
 
-pub(crate) fn frequency(out: &mut Vec<u8>, f: &crate::VoiceFrequency) -> Result<(), EncodeError> {
+pub(crate) fn frequency(out: &mut Vec<u8>, f: &crate::VoiceFrequency, p: &mut Pending) {
     if !(0.0..24_300.0).contains(&f.mhz) {
-        return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "the frequency must be below 24300 MHz"));
+        p.note(EncodeError::new(RefusalCode::for_value(f.mhz), "the frequency must be below 24300 MHz"));
+        return;
     }
     let (per_mhz, decimals) = if f.ten_khz_resolution { (100u64, 2usize) } else { (1000, 3) };
     let units = crate::steps::round(f.mhz * per_mhz as f64) as u64;
@@ -665,10 +711,13 @@ pub(crate) fn frequency(out: &mut Vec<u8>, f: &crate::VoiceFrequency) -> Result<
     let head = if whole < 1000 {
         format!("{whole:03}")
     } else {
-        let Some((letter, _)) = comment::MICROWAVE_PREFIXES.iter().find(|(_, p)| u64::from(*p) == whole / 100) else {
-            return Err(EncodeError::new(RefusalCode::ValueHasNoForm, "APRS12c ch. 18 has no letter for this frequency above 999 MHz"));
-        };
-        format!("{}{:02}", *letter as char, whole % 100)
+        match comment::MICROWAVE_PREFIXES.iter().find(|(_, p)| u64::from(*p) == whole / 100) {
+            Some((letter, _)) => format!("{}{:02}", *letter as char, whole % 100),
+            None => {
+                p.note(EncodeError::new(RefusalCode::ValueHasNoForm, "APRS12c ch. 18 has no letter for this frequency above 999 MHz"));
+                return;
+            }
+        }
     };
     out.extend_from_slice(head.as_bytes());
     out.push(b'.');
@@ -690,59 +739,62 @@ pub(crate) fn frequency(out: &mut Vec<u8>, f: &crate::VoiceFrequency) -> Result<
             Tone::Dcs => Some(b'D'),
         };
         if let Some(letter) = letter {
-            let Some(value) = f.tone_value.filter(|v| *v <= 999) else {
-                let code = if f.tone_value.is_none() { RefusalCode::MissingField } else { RefusalCode::ValueOutOfRange };
-                return Err(EncodeError::new(code, "a tone needs a value of up to three digits"));
-            };
-            out.push(if f.narrow { letter.to_ascii_lowercase() } else { letter });
-            push_digits(out, u32::from(value), 3);
+            match f.tone_value {
+                Some(value) if value <= 999 => {
+                    out.push(if f.narrow { letter.to_ascii_lowercase() } else { letter });
+                    push_digits(out, u32::from(value), 3);
+                }
+                Some(_) => p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "a tone's value is up to three digits")),
+                None => p.note(EncodeError::new(RefusalCode::MissingField, "a tone needs a value of up to three digits")),
+            }
         }
     } else if f.narrow {
-        return Err(EncodeError::new(RefusalCode::MissingField, "narrow band is written with the tone field, so it needs a tone"));
+        p.note(EncodeError::new(RefusalCode::MissingField, "narrow band is written with the tone field, so it needs a tone"));
     }
     if let Some(offset) = f.offset_khz {
-        if offset % 10 != 0 || offset.abs() > 9990 {
-            let code = if offset % 10 != 0 { RefusalCode::ValueHasNoForm } else { RefusalCode::ValueOutOfRange };
-            return Err(EncodeError::new(code, "the offset is in 10 kHz steps, up to 9.99 MHz"));
+        if offset.abs() > 9990 {
+            p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "the offset is up to 9.99 MHz"));
+        } else if offset % 10 != 0 {
+            p.note(EncodeError::new(RefusalCode::ValueHasNoForm, "the offset is in 10 kHz steps"));
+        } else {
+            out.push(b' ');
+            out.push(if offset < 0 { b'-' } else { b'+' });
+            push_digits(out, (offset.abs() / 10) as u32, 3);
         }
-        out.push(b' ');
-        out.push(if offset < 0 { b'-' } else { b'+' });
-        push_digits(out, (offset.abs() / 10) as u32, 3);
     }
     if let Some(range) = f.range {
         if range > 99 {
-            return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "the frequency range is two digits"));
+            p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "the frequency range is two digits"));
+        } else {
+            out.extend_from_slice(b" R");
+            push_digits(out, u32::from(range), 2);
+            out.push(if f.range_km { b'k' } else { b'm' });
         }
-        out.extend_from_slice(b" R");
-        push_digits(out, u32::from(range), 2);
-        out.push(if f.range_km { b'k' } else { b'm' });
     } else if f.range_km {
-        return Err(EncodeError::new(RefusalCode::MissingField, "range_km needs a range"));
+        p.note(EncodeError::new(RefusalCode::MissingField, "range_km needs a range"));
     }
-    Ok(())
 }
 
-pub(crate) fn telemetry_into(out: &mut Vec<u8>, t: &crate::CommentTelemetry) -> Result<(), EncodeError> {
+pub(crate) fn telemetry_into(out: &mut Vec<u8>, t: &crate::CommentTelemetry, p: &mut Pending) {
+    let max = 91 * 91 - 1;
+    if t.sequence > max || t.analog.iter().any(|v| *v > max) {
+        p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "comment telemetry values are 0-8280"));
+    }
     if t.analog.is_empty() || t.analog.len() > 5 || (t.digital.is_some() && t.analog.len() != 5) {
-        return Err(EncodeError::new(
+        p.note(EncodeError::new(
             RefusalCode::Malformed,
             "comment telemetry has 1-5 analog values, and the digital bits only after all five",
         ));
     }
-    let max = 91 * 91 - 1;
-    if t.sequence > max || t.analog.iter().any(|v| *v > max) {
-        return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "comment telemetry values are 0-8280"));
-    }
     out.push(b'|');
-    crate::base91::encode(u32::from(t.sequence), 2, out);
+    crate::base91::encode(u32::from(t.sequence.min(max)), 2, out);
     for v in &t.analog {
-        crate::base91::encode(u32::from(*v), 2, out);
+        crate::base91::encode(u32::from((*v).min(max)), 2, out);
     }
     if let Some(d) = t.digital {
         crate::base91::encode(u32::from(d), 2, out);
     }
     out.push(b'|');
-    Ok(())
 }
 
 /// Whether what was written for `f` (from the position on) decodes back to the same comment and

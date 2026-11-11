@@ -29,7 +29,7 @@ fn is_area_symbol(fields: &Positioned) -> bool {
 }
 
 /// The hurricane symbol, in either table or with an overlay.
-fn is_storm_symbol(fields: &Positioned) -> bool {
+pub(crate) fn is_storm_symbol(fields: &Positioned) -> bool {
     fields.symbol.code == '@'
 }
 

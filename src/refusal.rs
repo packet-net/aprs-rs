@@ -125,6 +125,11 @@ impl RefusalCode {
         }
     }
 
+    /// The code for a number a check refused: not-a-number for NaN or an infinity, else out of range.
+    pub(crate) fn for_value(x: f64) -> RefusalCode {
+        if x.is_finite() { RefusalCode::ValueOutOfRange } else { RefusalCode::NotANumber }
+    }
+
     /// The code with this vectors id, if there is one.
     pub fn from_id(id: &str) -> Option<RefusalCode> {
         RefusalCode::ALL.iter().copied().find(|c| c.id() == id)
@@ -134,5 +139,71 @@ impl RefusalCode {
 impl fmt::Display for RefusalCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.id())
+    }
+}
+
+/// The order in which a refusal with several faults names its code (vectors DESIGN.md, ruling 1):
+/// the first code that applies.
+const ORDER: [RefusalCode; 26] = [
+    RefusalCode::NotEncodable,
+    RefusalCode::InvalidAddress,
+    RefusalCode::Ax25CannotCarry,
+    RefusalCode::Tnc2CannotCarry,
+    RefusalCode::InvalidThirdPartyHeader,
+    RefusalCode::InvalidAddressee,
+    RefusalCode::InvalidName,
+    RefusalCode::InvalidTimestamp,
+    RefusalCode::NotANumber,
+    RefusalCode::ValueOutOfRange,
+    RefusalCode::ValueHasNoForm,
+    RefusalCode::InvalidCode,
+    RefusalCode::InvalidSymbol,
+    RefusalCode::InvalidCharacter,
+    RefusalCode::TooLong,
+    RefusalCode::PaddingSpace,
+    RefusalCode::Malformed,
+    RefusalCode::InvalidMessageId,
+    RefusalCode::InvalidNmea,
+    RefusalCode::ExtensionConflict,
+    RefusalCode::FieldNotAllowed,
+    RefusalCode::SymbolMismatch,
+    RefusalCode::MissingField,
+    RefusalCode::ValueGivenTwice,
+    RefusalCode::TextReadsAsField,
+    RefusalCode::DoesNotReadBack,
+];
+
+impl RefusalCode {
+    fn rank(self) -> usize {
+        ORDER.iter().position(|c| *c == self).unwrap_or(ORDER.len())
+    }
+}
+
+/// Collects the faults of one piece of data and keeps the one whose code comes first in the order
+/// above, so the refusal does not depend on which check happens to run first. The encoder goes on
+/// after a fault, writing bytes that are thrown away, and gives the result at the end.
+#[derive(Default)]
+pub(crate) struct Pending(Option<crate::EncodeError>);
+
+impl Pending {
+    pub(crate) fn note(&mut self, e: crate::EncodeError) {
+        if self.0.as_ref().is_none_or(|old| e.code().rank() < old.code().rank()) {
+            self.0 = Some(e);
+        }
+    }
+
+    /// Notes a fault, if there is one, and gives the value of a success.
+    pub(crate) fn run<T>(&mut self, r: Result<T, crate::EncodeError>) -> Option<T> {
+        match r {
+            Ok(v) => Some(v),
+            Err(e) => {
+                self.note(e);
+                None
+            }
+        }
+    }
+
+    pub(crate) fn finish(self) -> Result<(), crate::EncodeError> {
+        self.0.map_or(Ok(()), Err)
     }
 }

@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 
 use crate::RefusalCode;
 use crate::context::Context;
+use crate::refusal::Pending;
 use crate::{BeamHeading, Code, Data, EncodeError, ParseOptions, Status, Symbol, Timestamp, position, text};
 
 pub(crate) fn decode(ctx: &mut Context, info: &[u8]) -> Option<Data> {
@@ -80,24 +81,26 @@ pub(crate) fn is_locator(b: &[u8]) -> bool {
 
 pub(crate) fn encode(s: &Status) -> Result<Vec<u8>, EncodeError> {
     let mut out = Vec::from(&b">"[..]);
+    let mut p = Pending::default();
     if let Some(t) = &s.timestamp {
         if !matches!(t, Timestamp::DayHourMinute { utc: true, .. }) {
-            return Err(EncodeError::new(RefusalCode::InvalidTimestamp, "a status timestamp is DHM zulu, DDHHMMz (APRS12c ch. 16)"));
+            p.note(EncodeError::new(RefusalCode::InvalidTimestamp, "a status timestamp is DHM zulu, DDHHMMz (APRS12c ch. 16)"));
+        } else {
+            p.run(crate::encode::dhm_or_hms(&mut out, t));
         }
         if s.locator.is_some() {
-            return Err(EncodeError::new(
+            p.note(EncodeError::new(
                 RefusalCode::FieldNotAllowed,
                 "a status report with a grid locator cannot have a timestamp (APRS12c ch. 16)",
             ));
         }
-        crate::encode::dhm_or_hms(&mut out, t)?;
     }
     match (&s.locator, s.symbol) {
         (Some(loc), Some(symbol)) => {
             if !is_locator(loc.as_bytes()) {
-                return Err(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 characters, e.g. IO91 or IO91SX"));
+                p.note(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 characters, e.g. IO91 or IO91SX"));
             }
-            position::check_symbol(symbol)?;
+            p.run(position::check_symbol(symbol));
             out.extend_from_slice(loc.to_ascii_uppercase().as_bytes());
             out.push(symbol.table as u8);
             out.push(symbol.code as u8);
@@ -106,22 +109,23 @@ pub(crate) fn encode(s: &Status) -> Result<Vec<u8>, EncodeError> {
             }
         }
         (None, None) => {}
-        _ => return Err(EncodeError::new(RefusalCode::MissingField, "a status grid locator and its symbol go together")),
+        _ => p.note(EncodeError::new(RefusalCode::MissingField, "a status grid locator and its symbol go together")),
     }
     if crate::text::has_line_break(s.text.as_bytes()) {
-        return Err(EncodeError::new(RefusalCode::InvalidCharacter, "status text cannot contain a line break"));
+        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "status text cannot contain a line break"));
     }
     out.extend_from_slice(s.text.as_bytes());
     if let Some(b) = s.beam {
-        let (h, p) = (b.heading_code as u8, b.power_code as u8);
-        if !(h.is_ascii_digit() || h.is_ascii_uppercase()) || !(b'1'..=b'K').contains(&p) || (b'L'..=b'Z').contains(&p) {
-            return Err(EncodeError::new(
+        let (h, pw) = (b.heading_code as u8, b.power_code as u8);
+        if !(h.is_ascii_digit() || h.is_ascii_uppercase()) || !(b'1'..=b'K').contains(&pw) || (b'L'..=b'Z').contains(&pw) {
+            p.note(EncodeError::new(
                 RefusalCode::InvalidCode,
                 "a beam heading is 0-9 or A-Z, and the power code 1-9 or : to K (APRS12c ch. 16)",
             ));
         }
-        out.extend_from_slice(&[b'^', h, p]);
+        out.extend_from_slice(&[b'^', h, pw]);
     }
+    p.finish()?;
     // The text must read back as itself: status text that looks like a timestamp or a grid
     // locator would not.
     let mut ctx = Context::new(ParseOptions::LENIENT);

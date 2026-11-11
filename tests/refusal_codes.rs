@@ -65,3 +65,18 @@ fn builder_refusals_and_ids() {
         assert_eq!(RefusalCode::from_id(c.id()), Some(c));
     }
 }
+
+#[test]
+fn several_faults_name_the_first_code_in_the_order() {
+    // Out of range comes before a line break, which comes before a too-long text.
+    let at = |latitude| Positioned {
+        position: Position { latitude, longitude: 0.0, ambiguity: 0 },
+        comment: "a\nb".into(),
+        ..Positioned::default()
+    };
+    assert_eq!(code(position(at(95.0))), RefusalCode::ValueOutOfRange);
+    assert_eq!(code(position(at(f64::NAN))), RefusalCode::NotANumber);
+    assert_eq!(code(message("N0CALL", &format!("{{{}", "x".repeat(70)), None)), RefusalCode::InvalidCharacter);
+    // A message to a bulletin addressee reads back as a bulletin: the addressee is the fault.
+    assert_eq!(code(message("BLN1", "hi", None)), RefusalCode::InvalidAddressee);
+}

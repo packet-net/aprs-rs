@@ -298,11 +298,16 @@ impl Common {
         // An ambiguous position reports the box that holds it: its digits cut, not rounded, then
         // blanked, and the box's centre is what a decoder reads (vectors README, Builder rules).
         fields.position = if (1..=4).contains(&self.ambiguity) {
-            Position {
-                latitude: box_centre(position.latitude, self.ambiguity),
-                longitude: box_centre(position.longitude, self.ambiguity),
-                ambiguity: self.ambiguity,
+            let (latitude, longitude) = (box_centre(position.latitude, self.ambiguity), box_centre(position.longitude, self.ambiguity));
+            // A position inside the range whose box is centred beyond it has no form.
+            if (position.latitude.abs() <= 90.0 && latitude.abs() > 90.0) || (position.longitude.abs() <= 180.0 && longitude.abs() > 180.0)
+            {
+                return Err(EncodeError::new(
+                    RefusalCode::ValueHasNoForm,
+                    "an ambiguous position at 90 degrees latitude or 180 degrees longitude has a box centred past it",
+                ));
             }
+            Position { latitude, longitude, ambiguity: self.ambiguity }
         } else {
             Position { ambiguity: self.ambiguity, ..position }
         };
