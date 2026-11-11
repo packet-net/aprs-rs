@@ -3,6 +3,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::RefusalCode;
 use crate::context::Context;
 use crate::{Code, EncodeError, Weather, WeatherField};
 
@@ -278,9 +279,11 @@ pub(crate) fn encode_fields(out: &mut Vec<u8>, w: &Weather) -> Result<(), Encode
     if let Some(h) = w.humidity_percent {
         // Rounded once to a whole percent: 99.7 is `h00`, and 0.4, which rounds to 0, is refused
         // since `h00` means 100.
+        let original = h;
         let h = crate::steps::round(h);
         if !(1.0..=100.0).contains(&h) {
-            return Err(EncodeError::new("humidity must round to 1-100 percent"));
+            let code = if (0.0..1.0).contains(&h) && original >= 0.0 { RefusalCode::ValueHasNoForm } else { RefusalCode::ValueOutOfRange };
+            return Err(EncodeError::new(code, "humidity must round to 1-100 percent"));
         }
         out.push(b'h');
         push_digits(out, h as u32 % 100, 2);
@@ -296,7 +299,7 @@ pub(crate) fn encode_fields(out: &mut Vec<u8>, w: &Weather) -> Result<(), Encode
             out.push(b'l');
             push_digits(out, l as u32 - 1000, 3);
         } else {
-            return Err(EncodeError::new("luminosity must round to 0-1999 W/m2"));
+            return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "luminosity must round to 0-1999 W/m2"));
         }
     }
     if let Some(snow) = w.snow_24h_in {
@@ -305,7 +308,7 @@ pub(crate) fn encode_fields(out: &mut Vec<u8>, w: &Weather) -> Result<(), Encode
     }
     if let Some(r) = w.rain_raw {
         if r > 999 {
-            return Err(EncodeError::new("the raw rain counter must be 0-999"));
+            return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "the raw rain counter must be 0-999"));
         }
         out.push(b'#');
         push_digits(out, r, 3);
@@ -320,7 +323,10 @@ pub(crate) fn encode_fields(out: &mut Vec<u8>, w: &Weather) -> Result<(), Encode
             || !v.iter().all(|&b| b.is_ascii_digit() || b == b'.' || b == b'-')
             || !v[v.len() - 1].is_ascii_digit()
         {
-            return Err(EncodeError::new("an extra weather field is a letter the spec does not define and a number"));
+            return Err(EncodeError::new(
+                RefusalCode::TextReadsAsField,
+                "an extra weather field is a letter the spec does not define and a number",
+            ));
         }
         out.push(extra.letter as u8);
         out.extend_from_slice(extra.value.as_bytes());
@@ -331,7 +337,12 @@ pub(crate) fn encode_fields(out: &mut Vec<u8>, w: &Weather) -> Result<(), Encode
             out.extend_from_slice(u.as_bytes());
         }
         (None, None) => {}
-        _ => return Err(EncodeError::new("weather software is a letter, and the unit 2-4 letters, digits, - or _, not all digits")),
+        _ => {
+            return Err(EncodeError::new(
+                RefusalCode::TextReadsAsField,
+                "weather software is a letter, and the unit 2-4 letters, digits, - or _, not all digits",
+            ));
+        }
     }
     Ok(())
 }
@@ -359,12 +370,12 @@ fn optional(out: &mut Vec<u8>, letter: u8, value: Option<f64>, width: usize) -> 
 fn number_field(out: &mut Vec<u8>, value: f64, width: usize, signed: bool) -> Result<(), EncodeError> {
     let n = crate::steps::round(value);
     if n.is_nan() {
-        return Err(EncodeError::new("a weather value is not a number"));
+        return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "a weather value is not a number"));
     }
     let max = libm::pow(10.0, width as f64) - 1.0;
     let min = if signed { -(libm::pow(10.0, width as f64 - 1.0) - 1.0) } else { 0.0 };
     if n > max || n < min {
-        return Err(EncodeError::new("a weather value is outside what its fixed-width field can carry"));
+        return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "a weather value is outside what its fixed-width field can carry"));
     }
     if n < 0.0 {
         out.push(b'-');
@@ -382,7 +393,7 @@ fn number_field(out: &mut Vec<u8>, value: f64, width: usize, signed: bool) -> Re
 /// other as a digit, `.` and a digit (`1.5`). One that rounds past 999 is refused.
 fn snowfall(out: &mut Vec<u8>, inches: f64) -> Result<(), EncodeError> {
     if inches.is_nan() || crate::steps::round(inches * 100.0) < 0.0 {
-        return Err(EncodeError::new("snowfall must be 0-999 inches"));
+        return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "snowfall must be 0-999 inches"));
     }
     let hundredths = crate::steps::round(inches * 100.0) as u32;
     let tenths = crate::steps::round(inches * 10.0) as u32;
@@ -397,7 +408,7 @@ fn snowfall(out: &mut Vec<u8>, inches: f64) -> Result<(), EncodeError> {
     } else {
         let whole = crate::steps::round(inches);
         if whole > 999.0 {
-            return Err(EncodeError::new("snowfall must be 0-999 inches"));
+            return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "snowfall must be 0-999 inches"));
         }
         alloc::format!("{:03}", whole as u32)
     };

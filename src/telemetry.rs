@@ -3,6 +3,7 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::RefusalCode;
 use crate::context::Context;
 use crate::message::{is_decimal, telemetry_value};
 use crate::{Code, Data, EncodeError, ParseOptions, Telemetry, text};
@@ -79,14 +80,18 @@ pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
     let seq_ok = !t.sequence.is_empty() && t.sequence.bytes().all(|b| b.is_ascii_alphanumeric());
     let bits_ok = t.bits.as_ref().is_some_and(|b| b.len() == 8 && b.bytes().all(|x| x == b'0' || x == b'1'));
     if !seq_ok || t.analog.len() != 5 || !bits_ok {
-        return Err(EncodeError::new("a telemetry report carries 5 analog values and the 8 digital bits (APRS12c ch. 13)"));
+        let code = if !seq_ok { RefusalCode::InvalidCharacter } else { RefusalCode::Malformed };
+        return Err(EncodeError::new(code, "a telemetry report carries 5 analog values and the 8 digital bits (APRS12c ch. 13)"));
     }
     // No form reads back with the first channel empty after MIC (vectors README, Encoding).
     if t.sequence == "MIC" && t.analog[0].is_none() {
-        return Err(EncodeError::new("T#MIC with an empty first channel does not read back as given, so it cannot be sent"));
+        return Err(EncodeError::new(
+            RefusalCode::ValueHasNoForm,
+            "T#MIC with an empty first channel does not read back as given, so it cannot be sent",
+        ));
     }
     if crate::text::has_line_break(t.comment.as_bytes()) {
-        return Err(EncodeError::new("telemetry comment text cannot contain a line break"));
+        return Err(EncodeError::new(RefusalCode::InvalidCharacter, "telemetry comment text cannot contain a line break"));
     }
     let mut out = Vec::from(&b"T#"[..]);
     out.extend_from_slice(t.sequence.as_bytes());
@@ -119,6 +124,9 @@ pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
         {
             Ok(out)
         }
-        _ => Err(EncodeError::new("the telemetry report would not read back as given (a sequence starting MIC is MIC itself)")),
+        _ => Err(EncodeError::new(
+            RefusalCode::TextReadsAsField,
+            "the telemetry report would not read back as given (a sequence starting MIC is MIC itself)",
+        )),
     }
 }

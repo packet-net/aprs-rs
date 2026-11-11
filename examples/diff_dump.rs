@@ -31,8 +31,8 @@ use flate2::Compression;
 use flate2::read::MultiGzDecoder;
 use flate2::write::GzEncoder;
 use pdn_aprs::{
-    Address, BeamHeading, CommentTelemetry, Data, EncodeError, MicEMessage, Packet, ParseOptions, Phg, Station, Symbol, Timestamp, Tone,
-    WeatherBuilder,
+    Address, BeamHeading, CommentTelemetry, Data, EncodeError, MicEMessage, Packet, ParseOptions, Phg, RefusalCode, Station, Symbol,
+    Timestamp, Tone, WeatherBuilder,
 };
 use serde_json::{Map, Value, json};
 
@@ -89,8 +89,11 @@ fn address(text: &str) -> Address {
 fn decode_record(n: u64, line: &[u8]) -> Value {
     let (lenient, packet) = result(line, ParseOptions::LENIENT);
     let (strict, _) = result(line, ParseOptions::STRICT);
-    let (how, written) = reencode(packet.as_ref());
+    let (how, written, refusal) = reencode(packet.as_ref());
     let mut record = json!({"n": n, "lenient": lenient, "strict": strict, "reencode": how});
+    if let Some(code) = refusal {
+        record["reencode_refusal"] = json!(code.id());
+    }
     if let Some((info, destination)) = written {
         record["written"] = json!(hex(&info));
         if let Some(destination) = destination {
@@ -122,30 +125,33 @@ type Written = Option<(Vec<u8>, Option<String>)>;
 
 /// What encoding the lenient data again gives, as the vectors' reencode check sees it, and what it
 /// wrote.
-fn reencode(packet: Option<&Packet>) -> (&'static str, Written) {
-    let Some(packet) = packet else { return ("none", None) };
+fn reencode(packet: Option<&Packet>) -> (&'static str, Written, Option<RefusalCode>) {
+    let Some(packet) = packet else { return ("none", None, None) };
     if matches!(packet.data, Data::Unrecognized(_)) {
-        return ("none", None);
+        return ("none", None, None);
     }
     let written = match &packet.data {
         Data::MicE(m) => Packet::create(packet.source.clone(), packet.destination.clone(), packet.path.clone(), Data::MicE(m.clone()))
             .map(|p| (p.information, p.destination)),
         data => data.encode().map(|info| (info, packet.destination.clone())),
     };
-    let Ok((info, destination)) = written else { return ("refused", None) };
+    let (info, destination) = match written {
+        Ok(w) => w,
+        Err(e) => return ("refused", None, Some(e.code())),
+    };
     let wrote = Some((info.clone(), matches!(packet.data, Data::MicE(_)).then(|| destination.as_str().to_string())));
     let mut original: &[u8] = &packet.information;
     while let [rest @ .., b'\r' | b'\n'] = original {
         original = rest;
     }
     if info == original && destination == packet.destination {
-        return ("identical", wrote);
+        return ("identical", wrote, None);
     }
     let again = Packet::decode(packet.source.clone(), destination, packet.path.clone(), &info, ParseOptions::LENIENT);
     let mut differences = Vec::new();
     compare::differences(&neutral::data(&packet.data), &neutral::data(&again.data), "", &mut differences);
     let how = if differences.is_empty() && !again.has_warnings() && !again.has_errors() { "equivalent" } else { "fails" };
-    (how, wrote)
+    (how, wrote, None)
 }
 
 /// The API view: what the packet's own public accessors say, as a program would read them.
@@ -168,7 +174,13 @@ fn api(p: &Packet) -> Value {
     o.insert("has_errors".into(), json!(p.has_errors()));
     o.insert("has_warnings".into(), json!(p.has_warnings()));
     o.insert("tnc2".into(), json!(hex(&p.to_tnc2())));
-    o.insert("ax25".into(), p.to_ax25().map_or(json!("refused"), |frame| json!(hex(&frame))));
+    match p.to_ax25() {
+        Ok(frame) => o.insert("ax25".into(), json!(hex(&frame))),
+        Err(e) => {
+            o.insert("ax25_refusal".into(), json!(e.code().id()));
+            o.insert("ax25".into(), json!("refused"))
+        }
+    };
     let device = p.device().map(|d| {
         let mut named = Map::new();
         for (k, v) in [("vendor", d.vendor), ("model", d.model), ("class", d.class)] {
@@ -214,7 +226,7 @@ fn encode_record(input: &Value) -> Value {
     let data = match neutral::try_read_data(&input["data"]) {
         Ok(data) => data,
         Err(neutral::Unreadable::Unsupported(why)) => return json!({"n": n, "result": "unsupported", "reason": why}),
-        Err(neutral::Unreadable::Refused(why)) => return json!({"n": n, "result": "refused", "reason": why}),
+        Err(neutral::Unreadable::Refused(code, why)) => return json!({"n": n, "result": "refused", "reason": why, "refusal": code.id()}),
     };
     let written = match data {
         Data::MicE(m) => {
@@ -223,7 +235,7 @@ fn encode_record(input: &Value) -> Value {
         data => data.encode().map(|info| (info, address("APZ001"))),
     };
     match written {
-        Err(e) => json!({"n": n, "result": "refused", "reason": e.message()}),
+        Err(e) => json!({"n": n, "result": "refused", "reason": e.message(), "refusal": e.code().id()}),
         Ok((info, destination)) => {
             // The bytes decoded leniently under N0CALL> and the destination.
             let p = Packet::decode(address("N0CALL"), destination.clone(), Vec::new(), &info, ParseOptions::LENIENT);
@@ -239,12 +251,12 @@ fn encode_record(input: &Value) -> Value {
 /// naming the key), or it declined (`refused`).
 enum NotBuilt {
     Unsupported(String),
-    Refused(String),
+    Refused(RefusalCode, String),
 }
 
 impl From<EncodeError> for NotBuilt {
     fn from(e: EncodeError) -> NotBuilt {
-        NotBuilt::Refused(e.message().to_string())
+        NotBuilt::Refused(e.code(), e.message().to_string())
     }
 }
 
@@ -263,7 +275,7 @@ fn build_record(input: &Value) -> Value {
             json!({"n": n, "result": "built", "tnc2": hex(&line), "again": decoded})
         }
         Err(NotBuilt::Unsupported(why)) => json!({"n": n, "result": "unsupported", "reason": why}),
-        Err(NotBuilt::Refused(why)) => json!({"n": n, "result": "refused", "reason": why}),
+        Err(NotBuilt::Refused(code, why)) => json!({"n": n, "result": "refused", "reason": why, "refusal": code.id()}),
     }
 }
 
@@ -582,7 +594,7 @@ fn build(input: &Value) -> Built<Packet> {
 
 fn station(v: &Value) -> Built<Station> {
     let text = |k: &str| v.get(k).and_then(Value::as_str);
-    let refused = |e: pdn_aprs::InvalidAddress| NotBuilt::Refused(e.to_string());
+    let refused = |e: pdn_aprs::InvalidAddress| NotBuilt::Refused(RefusalCode::InvalidAddress, e.to_string());
     let mut station = Station::new(text("source").unwrap_or("")).map_err(refused)?;
     if let Some(d) = text("destination") {
         station = station.to(d).map_err(refused)?;

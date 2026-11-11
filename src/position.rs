@@ -3,6 +3,7 @@
 use alloc::format;
 use alloc::vec::Vec;
 
+use crate::RefusalCode;
 use crate::context::Context;
 use crate::{Code, CompressionFix, CompressionOrigin, CompressionSource, CompressionType, EncodeError, Position, Symbol, base91};
 
@@ -277,10 +278,10 @@ pub(crate) fn symbol(ctx: &mut Context, table: u8, code: u8, table_offset: usize
 pub(crate) fn check_symbol(symbol: Symbol) -> Result<(), EncodeError> {
     let table_ok = matches!(symbol.table, '/' | '\\' | '0'..='9' | 'A'..='Z');
     if !table_ok {
-        return Err(EncodeError::new(format!("symbol table '{}' is not /, \\, 0-9 or A-Z", symbol.table)));
+        return Err(EncodeError::new(RefusalCode::InvalidSymbol, format!("symbol table '{}' is not /, \\, 0-9 or A-Z", symbol.table)));
     }
     if !('!'..='~').contains(&symbol.code) {
-        return Err(EncodeError::new("the symbol code is not printable ASCII"));
+        return Err(EncodeError::new(RefusalCode::InvalidSymbol, "the symbol code is not printable ASCII"));
     }
     Ok(())
 }
@@ -295,16 +296,19 @@ pub(crate) fn encode_uncompressed(
 ) -> Result<Option<(u8, u8)>, EncodeError> {
     check_symbol(symbol)?;
     if !(-90.0..=90.0).contains(&position.latitude) || position.latitude.is_nan() {
-        return Err(EncodeError::new("latitude must be -90 to 90 degrees"));
+        return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "latitude must be -90 to 90 degrees"));
     }
     if !(-180.0..=180.0).contains(&position.longitude) || position.longitude.is_nan() {
-        return Err(EncodeError::new("longitude must be -180 to 180 degrees"));
+        return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "longitude must be -180 to 180 degrees"));
     }
     if position.ambiguity > 4 {
-        return Err(EncodeError::new("position ambiguity is 0-4 digits"));
+        return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "position ambiguity is 0-4 digits"));
     }
     if position.ambiguity > 0 && dao.is_some() {
-        return Err(EncodeError::new("a !DAO! adds precision to an ambiguous position, which contradicts it"));
+        return Err(EncodeError::new(
+            RefusalCode::FieldNotAllowed,
+            "a !DAO! adds precision to an ambiguous position, which contradicts it",
+        ));
     }
     let (lat_text, lat_extra) = coordinate(position.latitude, 2, position.ambiguity, dao);
     let (lon_text, lon_extra) = coordinate(position.longitude, 3, position.ambiguity, dao);
@@ -360,10 +364,10 @@ fn coordinate(value: f64, degree_digits: usize, ambiguity: u8, dao: Option<bool>
 pub(crate) fn encode_compressed(out: &mut Vec<u8>, position: &Position, symbol: Symbol) -> Result<(), EncodeError> {
     check_symbol(symbol)?;
     if position.ambiguity != 0 {
-        return Err(EncodeError::new("a compressed position cannot be ambiguous"));
+        return Err(EncodeError::new(RefusalCode::FieldNotAllowed, "a compressed position cannot be ambiguous"));
     }
     if !(-90.0..=90.0).contains(&position.latitude) || !(-180.0..=180.0).contains(&position.longitude) {
-        return Err(EncodeError::new("the position is out of range"));
+        return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "the position is out of range"));
     }
     let (y, x) = compressed_steps(position);
     out.push(match symbol.table {

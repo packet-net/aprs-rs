@@ -5,6 +5,7 @@ use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::RefusalCode;
 use crate::context::Context;
 use crate::{Code, Data, Diagnostic, ParseOptions, Severity};
 
@@ -158,16 +159,22 @@ impl core::error::Error for HeaderError {}
 /// A packet that cannot be written as asked, with the reason.
 ///
 /// The reason is text for people, naming the field at fault; its wording is not part of the stable
-/// API. A machine-readable reason can be added later without a major version.
+/// API. [`code`](EncodeError::code) is the machine-readable reason.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct EncodeError {
+    code: RefusalCode,
     message: String,
 }
 
 impl EncodeError {
-    pub(crate) fn new(message: impl Into<String>) -> EncodeError {
-        EncodeError { message: message.into() }
+    pub(crate) fn new(code: RefusalCode, message: impl Into<String>) -> EncodeError {
+        EncodeError { code, message: message.into() }
+    }
+
+    /// Why the data was refused, as a code a program can act on. Callers must allow codes they do not know.
+    pub fn code(&self) -> RefusalCode {
+        self.code
     }
 
     /// Why the data was refused, in a sentence.
@@ -396,7 +403,7 @@ impl Packet {
     /// cannot be sent over the air, or the path is longer than 8 entries.
     pub fn to_ax25(&self) -> Result<Vec<u8>, EncodeError> {
         if self.path.len() > 8 {
-            return Err(EncodeError::new("an AX.25 frame has room for at most 8 digipeaters"));
+            return Err(EncodeError::new(RefusalCode::Ax25CannotCarry, "an AX.25 frame has room for at most 8 digipeaters"));
         }
         let mut out = Vec::with_capacity(16 + 7 * self.path.len() + self.information.len());
         let all = [(&self.destination, 0xE0u8), (&self.source, 0x60u8)];
@@ -477,9 +484,10 @@ fn ax25_address(ctx: &mut Context, bytes: &[u8], offset: usize) -> Result<Addres
 
 fn write_ax25_address(out: &mut Vec<u8>, address: &Address, flags: u8) -> Result<(), EncodeError> {
     if !address.is_ax25() {
-        return Err(EncodeError::new(format!(
-            "'{address}' cannot be sent in an AX.25 frame: 1-6 upper-case letters and digits, SSID 0-15"
-        )));
+        return Err(EncodeError::new(
+            RefusalCode::Ax25CannotCarry,
+            format!("'{address}' cannot be sent in an AX.25 frame: 1-6 upper-case letters and digits, SSID 0-15"),
+        ));
     }
     let call = address.callsign().as_bytes();
     for i in 0..6 {

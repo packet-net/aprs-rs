@@ -7,6 +7,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use crate::RefusalCode;
 use crate::context::Context;
 use crate::weather;
 use crate::{
@@ -328,9 +329,10 @@ fn footprint_text(value: f64, text: &str, limit: f64, what: &str) -> Result<Stri
         }
     }
     if value.is_nan() || value.abs() > limit {
-        return Err(EncodeError::new(format!(
-            "a query footprint's {what} is decimal degrees within {limit} (a leading space only before a positive value)"
-        )));
+        return Err(EncodeError::new(
+            RefusalCode::ValueOutOfRange,
+            format!("a query footprint's {what} is decimal degrees within {limit} (a leading space only before a positive value)"),
+        ));
     }
     let digits = crate::steps::number_text(value);
     Ok(if value < 0.0 { digits } else { format!(" {digits}") })
@@ -412,7 +414,7 @@ pub(crate) fn agrelo(ctx: &mut Context, info: &[u8]) -> Option<Data> {
 pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
     let printable = |t: &str, what: &str| -> Result<(), EncodeError> {
         if crate::text::has_line_break(t.as_bytes()) {
-            return Err(EncodeError::new(format!("{what} cannot contain a line break")));
+            return Err(EncodeError::new(RefusalCode::InvalidCharacter, format!("{what} cannot contain a line break")));
         }
         Ok(())
     };
@@ -422,11 +424,14 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
         Data::Telemetry(t) => return telemetry::encode(t),
         Data::Weather(w) => {
             let Some(t) = w.timestamp.filter(|t| matches!(t, Timestamp::MonthDayHourMinute { .. })) else {
-                return Err(EncodeError::new("a positionless weather report has an MDHM timestamp (APRS12c ch. 12)"));
+                return Err(EncodeError::new(
+                    RefusalCode::InvalidTimestamp,
+                    "a positionless weather report has an MDHM timestamp (APRS12c ch. 12)",
+                ));
             };
             crate::encode::check_timestamp(&t)?;
             if !w.comment.is_empty() {
-                return Err(EncodeError::new("a weather report has no comment field (APRS12c ch. 12)"));
+                return Err(EncodeError::new(RefusalCode::FieldNotAllowed, "a weather report has no comment field (APRS12c ch. 12)"));
             }
             let direction =
                 w.weather.wind_direction_degrees.map(|d| crate::encode::whole_degrees(d, "wind direction")).transpose()?.map(f64::from);
@@ -440,6 +445,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                 Some(Data::Weather(back)) if weather::text_parts(&back.weather) == weather::text_parts(&w.weather) => {}
                 _ => {
                     return Err(EncodeError::new(
+                        RefusalCode::TextReadsAsField,
                         "the weather does not read back as given: a software type and unit, or an extra field, that would read as weather fields",
                     ));
                 }
@@ -447,7 +453,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
         }
         Data::RawWeather(r) => {
             if !text::is_printable_ascii(r.data.as_bytes()) {
-                return Err(EncodeError::new("raw weather station data is printable ASCII"));
+                return Err(EncodeError::new(RefusalCode::InvalidCharacter, "raw weather station data is printable ASCII"));
             }
             out.extend_from_slice(match r.format {
                 RawWeatherFormat::PeetBrosHash => b"#",
@@ -460,7 +466,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
         Data::Nmea(n) => return encode_nmea(n),
         Data::MaidenheadBeacon(m) => {
             if !status::is_locator(m.locator.as_bytes()) {
-                return Err(EncodeError::new("a grid locator is 4 or 6 characters, e.g. IO91 or IO91SX"));
+                return Err(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 characters, e.g. IO91 or IO91SX"));
             }
             printable(&m.comment, "a beacon comment")?;
             out.push(b'[');
@@ -470,7 +476,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
         }
         Data::Query(q) => {
             if q.query_type.is_empty() || !q.query_type.bytes().all(|b| b.is_ascii_uppercase()) {
-                return Err(EncodeError::new("a query type is upper-case letters (APRS12c ch. 15)"));
+                return Err(EncodeError::new(RefusalCode::InvalidCode, "a query type is upper-case letters (APRS12c ch. 15)"));
             }
             out.push(b'?');
             out.extend_from_slice(q.query_type.as_bytes());
@@ -480,7 +486,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                 // telemetry values are (vectors README, "Numbers as sent").
                 let radius = crate::steps::round(f.radius_miles);
                 if !(0.0..=9999.0).contains(&radius) {
-                    return Err(EncodeError::new("a query footprint's radius is 0-9999 miles once rounded"));
+                    return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "a query footprint's radius is 0-9999 miles once rounded"));
                 }
                 let latitude = footprint_text(f.latitude, &f.latitude_text, 90.0, "latitude")?;
                 let longitude = footprint_text(f.longitude, &f.longitude_text, 180.0, "longitude")?;
@@ -489,13 +495,26 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
         }
         Data::Capabilities(c) => {
             if c.capabilities.is_empty() {
-                return Err(EncodeError::new("a capabilities report lists at least one token"));
+                return Err(EncodeError::new(RefusalCode::MissingField, "a capabilities report lists at least one token"));
             }
             // What would not read back the same: spaces around a value are padding.
             let bad_token = |t: &str| t.is_empty() || t.chars().any(|c| c <= ' ' || c == '\x7F' || c == ',' || c == '=');
             let bad_value = |v: &str| v.starts_with(' ') || v.ends_with(' ') || v.chars().any(|c| c < ' ' || c == '\x7F' || c == ',');
             if c.capabilities.iter().any(|(t, v)| bad_token(t) || v.as_deref().is_some_and(bad_value)) {
+                let code = c.capabilities.iter().find(|(t, v)| bad_token(t) || v.as_deref().is_some_and(bad_value)).map_or(
+                    RefusalCode::InvalidCharacter,
+                    |(t, v)| {
+                        if t.is_empty() {
+                            RefusalCode::TooLong
+                        } else if !bad_token(t) && v.as_deref().is_some_and(|v| !v.chars().any(|c| c < ' ' || c == '\x7F' || c == ',')) {
+                            RefusalCode::PaddingSpace
+                        } else {
+                            RefusalCode::InvalidCharacter
+                        }
+                    },
+                );
                 return Err(EncodeError::new(
+                    code,
                     "capability tokens and values are text without ',' or control characters, tokens without '=' or spaces, and values not starting or ending with a space",
                 ));
             }
@@ -517,14 +536,20 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             // The information field is written as received; only a line break at its very end
             // would not read back.
             if matches!(out.last(), Some(b'\r' | b'\n')) {
-                return Err(EncodeError::new("a third-party packet's information field cannot end with a line break"));
+                return Err(EncodeError::new(
+                    RefusalCode::InvalidCharacter,
+                    "a third-party packet's information field cannot end with a line break",
+                ));
             }
         }
         Data::UserDefined(u) => {
             // APRS12c ch. 19 puts no restriction on user-defined data, these two characters
             // included: any byte is written back as it came.
             let (Ok(user_id), Ok(packet_type)) = (u8::try_from(u.user_id), u8::try_from(u.packet_type)) else {
-                return Err(EncodeError::new("the user ID and packet type are one byte each (U+0000 to U+00FF)"));
+                return Err(EncodeError::new(
+                    RefusalCode::ValueOutOfRange,
+                    "the user ID and packet type are one byte each (U+0000 to U+00FF)",
+                ));
             };
             out.push(b'{');
             out.push(user_id);
@@ -532,7 +557,10 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             out.extend_from_slice(&u.data);
             // A line break at the very end would be taken for the end of the line and dropped.
             if matches!(out.last(), Some(b'\r' | b'\n')) {
-                return Err(EncodeError::new("user-defined data cannot end with a line break, which would not read back"));
+                return Err(EncodeError::new(
+                    RefusalCode::InvalidCharacter,
+                    "user-defined data cannot end with a line break, which would not read back",
+                ));
             }
         }
         Data::Test(t) => {
@@ -542,12 +570,12 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
         }
         Data::AgreloDf(a) => {
             if a.bearing_degrees > 360 || a.quality > 9 {
-                return Err(EncodeError::new("an Agrelo bearing is 0-360 and the quality 0-9"));
+                return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "an Agrelo bearing is 0-360 and the quality 0-9"));
             }
             out.extend_from_slice(format!("%{:03}/{}", a.bearing_degrees, a.quality).as_bytes());
         }
-        Data::Unrecognized(_) => return Err(EncodeError::new("undecoded data has nothing to encode")),
-        _ => return Err(EncodeError::new("not one of the other data types")),
+        Data::Unrecognized(_) => return Err(EncodeError::new(RefusalCode::NotEncodable, "undecoded data has nothing to encode")),
+        _ => return Err(EncodeError::new(RefusalCode::NotEncodable, "not one of the other data types")),
     }
     Ok(out)
 }
@@ -560,22 +588,30 @@ fn encode_nmea(n: &Nmea) -> Result<Vec<u8>, EncodeError> {
     // $ULTW is raw weather, not NMEA, so such a sentence would not read back.
     let Some(structure) = nmea_sentence(sentence).filter(|s| s.len == sentence.len() && !n.sentence.starts_with("ULTW")) else {
         return Err(EncodeError::new(
+            RefusalCode::InvalidNmea,
             "not an NMEA 0183 sentence: printable ASCII, an address field such as GPRMC, then fields, and at most a *hh checksum at the end",
         ));
     };
     match structure.checksum {
         Some(sum) if sum != nmea_checksum(structure.content) => {
-            return Err(EncodeError::new("the NMEA checksum does not match the sentence"));
+            return Err(EncodeError::new(RefusalCode::InvalidNmea, "the NMEA checksum does not match the sentence"));
         }
-        Some(_) if !n.has_checksum => return Err(EncodeError::new("the sentence has a *hh checksum but has_checksum is not set")),
-        None if n.has_checksum => return Err(EncodeError::new("has_checksum is set but the sentence has no *hh checksum")),
+        Some(_) if !n.has_checksum => {
+            return Err(EncodeError::new(RefusalCode::InvalidNmea, "the sentence has a *hh checksum but has_checksum is not set"));
+        }
+        None if n.has_checksum => {
+            return Err(EncodeError::new(RefusalCode::InvalidNmea, "has_checksum is set but the sentence has no *hh checksum"));
+        }
         None if !n.comment.is_empty() => {
-            return Err(EncodeError::new("an NMEA comment goes after a *hh checksum, which is what ends the sentence"));
+            return Err(EncodeError::new(
+                RefusalCode::InvalidNmea,
+                "an NMEA comment goes after a *hh checksum, which is what ends the sentence",
+            ));
         }
         _ => {}
     }
     if text::has_line_break(n.comment.as_bytes()) {
-        return Err(EncodeError::new("an NMEA comment cannot contain a line break"));
+        return Err(EncodeError::new(RefusalCode::InvalidCharacter, "an NMEA comment cannot contain a line break"));
     }
     let read = nmea_fields(structure.content);
     fn agrees<T: PartialEq>(given: &Option<T>, read: &Option<T>) -> bool {
@@ -599,7 +635,7 @@ fn encode_nmea(n: &Nmea) -> Result<Vec<u8>, EncodeError> {
         && agrees(&n.time, &read.time)
         && agrees(&n.waypoint, &read.waypoint))
     {
-        return Err(EncodeError::new("a field given does not match what the NMEA sentence says"));
+        return Err(EncodeError::new(RefusalCode::InvalidNmea, "a field given does not match what the NMEA sentence says"));
     }
     let mut out = Vec::with_capacity(1 + sentence.len() + n.comment.len());
     out.push(b'$');
@@ -615,14 +651,23 @@ fn encode_nmea(n: &Nmea) -> Result<Vec<u8>, EncodeError> {
 /// no clean form reproduces it.
 fn third_party_header(p: &Packet) -> Result<(), EncodeError> {
     if !crate::Address::is_third_party_source(p.source.as_str()) {
-        return Err(EncodeError::new("a third-party source is 1-9 printable ASCII characters other than > and : (APRS12c ch. 17)"));
+        return Err(EncodeError::new(
+            RefusalCode::InvalidThirdPartyHeader,
+            "a third-party source is 1-9 printable ASCII characters other than > and : (APRS12c ch. 17)",
+        ));
     }
     if !crate::Address::is_valid(p.destination.as_str()) || p.path.iter().any(|e| !crate::Address::is_valid(e.address.as_str())) {
-        return Err(EncodeError::new("a third-party destination and path entries are addresses: 1-9 letters, digits or -"));
+        return Err(EncodeError::new(
+            RefusalCode::InvalidThirdPartyHeader,
+            "a third-party destination and path entries are addresses: 1-9 letters, digits or -",
+        ));
     }
     if let Some(last) = p.path.iter().rposition(|e| e.used) {
         if p.path[..last].iter().any(|e| !e.used) {
-            return Err(EncodeError::new("a used path entry after one that is not used cannot be written in TNC2 form"));
+            return Err(EncodeError::new(
+                RefusalCode::InvalidThirdPartyHeader,
+                "a used path entry after one that is not used cannot be written in TNC2 form",
+            ));
         }
     }
     let header_defect = |c: Code| {
@@ -637,6 +682,7 @@ fn third_party_header(p: &Packet) -> Result<(), EncodeError> {
     };
     if p.diagnostics.iter().any(|d| header_defect(d.code)) {
         return Err(EncodeError::new(
+            RefusalCode::InvalidThirdPartyHeader,
             "the third-party packet's header has a defect that was tolerated, which is part of its data and cannot be written back",
         ));
     }
