@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.0.0 (2026-11-10)
+
+This is the first stable release. The public API is now frozen under semantic versioning. From 1.0 the major and minor version are shared with aprs-vectors: a ruling round is a minor version for all five implementations, this library's own fixes are patch versions, and an API break is a major version.
 
 The 1.0 API cleanup: one naming rule, fractional numbers where the encoder rounds, one way to say each thing. Nothing about what the encoder writes or the decoder reads changes: the vectors suite, and a differential run over 100,000 generated encode cases, 100,000 builder recipes and 1,831 captured packets, give the same bytes and results as 0.4.0.
 
