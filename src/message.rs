@@ -441,7 +441,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                 ));
             }
             if labels.len() > 13 {
-                p.note(EncodeError::new(RefusalCode::Malformed, "telemetry metadata names at most 13 channels (APRS12c ch. 13)"));
+                p.note(EncodeError::new(RefusalCode::TooLong, "telemetry metadata names at most 13 channels (APRS12c ch. 13)"));
             }
             addressee(&mut out, to, &mut p);
             out.extend_from_slice(if matches!(data, Data::TelemetryNames(_)) { b"PARM." } else { b"UNIT." });
