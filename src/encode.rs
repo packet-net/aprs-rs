@@ -271,7 +271,8 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned, mut p: Pending) -> R
     }
 
     let text = f.comment.as_bytes();
-    if crate::text::has_line_break(text) {
+    // A weather report has no comment: that is the fault, and the characters are not looked at.
+    if f.weather.is_none() && crate::text::has_line_break(text) {
         p.note(EncodeError::new(RefusalCode::InvalidCharacter, "comment text cannot contain a line break"));
     }
     let text_at = out.len();
@@ -373,6 +374,10 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned, p: &mut Pending) -> bool {
                 "a GGA compression type carries an altitude in the cs bytes, and there is none",
             ));
         }
+        if let Some(range) = f.range_miles {
+            // A range that is itself wrong is named before it is found to clash.
+            range_step(range, p);
+        }
         if course_speed || f.range_miles.is_some() || wind.is_some() {
             p.note(EncodeError::new(
                 RefusalCode::ExtensionConflict,
@@ -397,7 +402,8 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned, p: &mut Pending) -> bool {
         }
     } else if let Some(w) = wind {
         // A weather station's cs course and speed are its wind.
-        if f.range_miles.is_some() {
+        if let Some(range) = f.range_miles {
+            range_step(range, p);
             p.note(EncodeError::new(RefusalCode::ExtensionConflict, "the cs bytes carry the wind or a range, not both"));
         }
         // The cs bytes carry a direction and a speed together; one without the other would read
@@ -440,19 +446,8 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned, p: &mut Pending) -> bool {
                 Ok(_) => {}
             }
         }
-        if !range.is_finite() {
-            p.note(EncodeError::new(RefusalCode::NotANumber, "a compressed range is a number"));
-        } else if range <= 0.0 {
-            p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "a compressed range must be at least 2 miles"));
-        } else {
-            let step = crate::steps::round(log(range / 2.0, 1.08));
-            if step < 0.0 {
-                p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "a compressed range must round to at least 2 miles"));
-            } else if step > 90.0 {
-                p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "the range is too far for a compressed position"));
-            } else {
-                (c, s) = (b'{' - 33, step as u8);
-            }
+        if let Some(step) = range_step(range, p) {
+            (c, s) = (b'{' - 33, step);
         }
     } else if course_speed {
         // The cs bytes hold a course and a speed together, so writing one alone would add a value
@@ -500,6 +495,26 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned, p: &mut Pending) -> bool {
     out.push(s + 33);
     out.push(type_to_bits(t) + 33);
     altitude
+}
+
+/// A compressed range's s byte: the steps are 2 x 1.08^s miles for every whole s, and a range rounds
+/// to the nearest; one whose s is below the byte's 0 is refused (1.95 miles is s 0, 1.9 is s -1).
+fn range_step(range: f64, p: &mut Pending) -> Option<u8> {
+    if !range.is_finite() {
+        p.note(EncodeError::new(RefusalCode::NotANumber, "a compressed range is a number"));
+    } else if range <= 0.0 {
+        p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "a compressed range must be at least 2 miles"));
+    } else {
+        let step = crate::steps::round(libm::log(range / 2.0) / libm::log(1.08));
+        if step < 0.0 {
+            p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "a compressed range must round to at least 2 miles"));
+        } else if step > 90.0 {
+            p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "the range is too far for a compressed position"));
+        } else {
+            return Some(step as u8);
+        }
+    }
+    None
 }
 
 /// A course or wind direction rounded once to whole degrees, which must be 0-360.

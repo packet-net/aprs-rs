@@ -80,3 +80,13 @@ fn several_faults_name_the_first_code_in_the_order() {
     // A message to a bulletin addressee reads back as a bulletin: the addressee is the fault.
     assert_eq!(code(message("BLN1", "hi", None)), RefusalCode::InvalidAddressee);
 }
+
+#[test]
+fn a_mic_e_altitude_in_the_text_wins_even_when_equal() {
+    let line = b"DO1BR-9>UR1QW0:`~\\(\x1c\x1d;(/3\"3r}DO1BR6W&/A=00000070cm";
+    let packet = Packet::decode_tnc2(line, pdn_aprs::ParseOptions::LENIENT).unwrap();
+    let Data::MicE(report) = &packet.data else { panic!("not Mic-E") };
+    assert!(report.altitude_in_comment);
+    let again = Packet::create(packet.source.clone(), packet.destination.clone(), packet.path.clone(), packet.data.clone()).unwrap();
+    assert!(again.information.windows(8).any(|w| w == b"/A=00000"), "{:?}", String::from_utf8_lossy(&again.information));
+}

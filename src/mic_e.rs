@@ -269,9 +269,14 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
         }
     }
     let altitude_before = report.fields.altitude_feet;
+    // A `/A=` in the text wins over the Mic-E bytes, even when it says the same: whether the text
+    // gave one is seen by letting it write into an empty field.
+    report.fields.altitude_feet = None;
     let ok = comment::tail(ctx, &mut report.fields, &s, offset, joined);
-    // A `/A=` in the text wins over the Mic-E bytes, so an altitude that changed (or came) there is one.
-    report.altitude_in_comment = report.fields.altitude_feet.is_some() && report.fields.altitude_feet != altitude_before;
+    report.altitude_in_comment = report.fields.altitude_feet.is_some();
+    if !report.altitude_in_comment {
+        report.fields.altitude_feet = altitude_before;
+    }
     ok
 }
 
@@ -586,7 +591,8 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     }
 
     let text = f.comment.as_bytes();
-    if crate::text::has_line_break(text) {
+    // A weather report has no comment: that is the fault, and the characters are not looked at.
+    if f.weather.is_none() && crate::text::has_line_break(text) {
         pend.note(EncodeError::new(RefusalCode::InvalidCharacter, "comment text cannot contain a line break"));
     }
     let mut trailer = Vec::new();
