@@ -141,24 +141,14 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned, mut p: Pending) -> R
         if !weather_symbol {
             p.note(EncodeError::new(RefusalCode::SymbolMismatch, "weather needs the weather station symbol, _ (APRS12c ch. 12)"));
         }
-        let gga = f.compression.is_some_and(|t| t.source == CompressionSource::Gga);
-        // What needs a comment is refused; on a compressed report with a GGA altitude the cs bytes
-        // are wanted twice, which is named instead.
-        let needs_comment =
-            if f.compressed && gga && f.altitude_feet.is_some() { RefusalCode::ExtensionConflict } else { RefusalCode::FieldNotAllowed };
         if !f.comment.is_empty() {
-            p.note(EncodeError::new(needs_comment, "a weather report has no comment field (APRS12c ch. 12, UAP 2.7.1)"));
+            p.note(EncodeError::new(RefusalCode::FieldNotAllowed, "a weather report has no comment field (APRS12c ch. 12, UAP 2.7.1)"));
         }
-        if f.telemetry.is_some() || f.frequency.is_some() || f.signpost.is_some() {
-            p.note(EncodeError::new(
-                needs_comment,
-                "a weather report has no comment, so it cannot carry telemetry, frequency or signpost (APRS12c ch. 12)",
-            ));
-        }
-        if f.altitude_feet.is_some() && !(f.compressed && gga) {
+        let gga = f.compression.is_some_and(|t| t.source == CompressionSource::Gga);
+        if f.telemetry.is_some() || f.frequency.is_some() || f.signpost.is_some() || (f.altitude_feet.is_some() && !(f.compressed && gga)) {
             p.note(EncodeError::new(
                 RefusalCode::FieldNotAllowed,
-                "a weather report has no comment, so it cannot carry an /A= altitude (APRS12c ch. 12)",
+                "a weather report has no comment, so it cannot carry telemetry, frequency, signpost or /A= altitude (APRS12c ch. 12)",
             ));
         }
         // Its data extension, or its cs bytes, are the wind.
