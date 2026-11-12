@@ -158,6 +158,21 @@ assert!(too_long.encode().unwrap_err().message().contains("67 characters"));
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
+### Reading why a refusal happened
+
+Every refusal has a code a program can act on, from the same list as the other implementations (the ids are in the vectors' `codes.json`, under `refusals`).
+
+```rust
+use pdn_aprs::{Data, Message, RefusalCode};
+
+let too_long = Data::Message(Message { addressee: "N0CALL".into(), text: "x".repeat(68), ..Message::default() });
+let refused = too_long.encode().unwrap_err();
+assert_eq!(refused.code(), RefusalCode::TooLong);
+assert_eq!(refused.code().id(), "too-long");
+```
+
+New codes may be added in later 1.x releases, so match with a wildcard arm. `DoesNotReadBack` is the fallback, for a refusal no named rule explains. The message text is still for people and may change.
+
 ## Mic-E and device identification
 
 Mic-E carries half its position in the destination address, so [`Packet::create`] works that address out (the destination you pass is not used), and [`Data::encode`] refuses a Mic-E report rather than drop it. [`Packet::device`] names the sending device or program from the [APRS device identification database](https://github.com/aprsorg/aprs-deviceid): from the Mic-E type code and suffix, or from the destination address for everything else.

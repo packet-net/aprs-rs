@@ -365,13 +365,14 @@ pub enum Unreadable {
     Unsupported(String),
     /// Its encoder refused a part that has to be encoded to be held: a third-party packet keeps
     /// its inner packet's information field, which the neutral form does not carry.
-    Refused(String),
+    #[allow(dead_code)] // the code is read by the dump tool, which shares this file
+    Refused(pdn_aprs::RefusalCode, String),
 }
 
 impl std::fmt::Display for Unreadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Unreadable::Unsupported(why) | Unreadable::Refused(why) => f.write_str(why),
+            Unreadable::Unsupported(why) | Unreadable::Refused(_, why) => f.write_str(why),
         }
     }
 }
@@ -463,14 +464,16 @@ impl<'a> Keys<'a> {
     fn stepped<T: TryFrom<i128>>(&self, k: &str) -> Read<Option<T>> {
         let Some(v) = self.get(k) else { return Ok(None) };
         if let Some(n) = whole(v) {
-            return T::try_from(n).map(Some).map_err(|_| Unreadable::Refused(format!("{}: outside its field", self.name(k))));
+            return T::try_from(n)
+                .map(Some)
+                .map_err(|_| Unreadable::Refused(pdn_aprs::RefusalCode::ValueOutOfRange, format!("{}: outside its field", self.name(k))));
         }
         let Some(x) = v.as_f64().filter(|x| x.is_finite()) else {
             return unsupported(format!("{}: not a number", self.name(k)));
         };
-        T::try_from(round_steps(x) as i128)
-            .map(Some)
-            .map_err(|_| Unreadable::Refused(format!("{}: outside its field once rounded", self.name(k))))
+        T::try_from(round_steps(x) as i128).map(Some).map_err(|_| {
+            Unreadable::Refused(pdn_aprs::RefusalCode::ValueOutOfRange, format!("{}: outside its field once rounded", self.name(k)))
+        })
     }
 
     fn required_int<T: TryFrom<i128>>(&self, k: &str) -> Read<T> {
@@ -832,15 +835,41 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             let p = o.required("packet", o.object("packet", &["source", "destination", "path", "data", "diagnostics"])?)?;
             let source = p.text("source")?;
             let source = Address::third_party_source(&source).or_else(|_| unsupported("packet.source: not a third-party source".into()))?;
-            let destination = read_destination(&p.text("destination")?)?;
+            let destination_text = p.text("destination")?;
+            if destination_text.is_empty() {
+                return Err(Unreadable::Refused(
+                    pdn_aprs::RefusalCode::InvalidThirdPartyHeader,
+                    "the third-party packet has no destination".into(),
+                ));
+            }
+            let destination = read_destination(&destination_text)?;
             let path = p.strings("path")?.iter().map(|e| read_path_entry_checked(e)).collect::<Read<Vec<PathEntry>>>()?;
+            let diagnostics = p.strings("diagnostics")?.iter().map(|d| read_diagnostic(d)).collect::<Read<Vec<Diagnostic>>>()?;
+            // The header is written before the data, so a header the encoder cannot write back is
+            // refused before the inner data is looked at.
+            let header_defect = diagnostics.iter().any(|d| {
+                matches!(
+                    d.code,
+                    Code::EmptyDestination
+                        | Code::EmptyPathEntry
+                        | Code::MultipleUsedMarkers
+                        | Code::NulPaddedAddress
+                        | Code::InvalidAx25AddressCharacters
+                )
+            });
+            let used_out_of_order = path.iter().rposition(|e| e.used).is_some_and(|last| path[..last].iter().any(|e| !e.used));
+            if header_defect || used_out_of_order {
+                return Err(Unreadable::Refused(
+                    pdn_aprs::RefusalCode::InvalidThirdPartyHeader,
+                    "the third-party packet's header cannot be written back".into(),
+                ));
+            }
             let data = try_read_data(p.required("data", p.get("data"))?)?;
             let information = match &data {
                 Data::Unrecognized(Unrecognized::Empty) => Vec::new(),
                 Data::Unrecognized(_) => return unsupported("packet.data: undecoded, and its bytes are not in the neutral form".into()),
-                data => data.encode().map_err(|e| Unreadable::Refused(format!("the inner packet's data: {e}")))?,
+                data => data.encode().map_err(|e| Unreadable::Refused(e.code(), format!("the inner packet's data: {e}")))?,
             };
-            let diagnostics = p.strings("diagnostics")?.iter().map(|d| read_diagnostic(d)).collect::<Read<Vec<Diagnostic>>>()?;
             // Packet is non-exhaustive: start from decoding the information field, then say what the
             // neutral form says.
             let mut inner = Packet::decode(source, destination, path, &information, ParseOptions::LENIENT);

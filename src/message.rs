@@ -5,7 +5,9 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use crate::RefusalCode;
 use crate::context::Context;
+use crate::refusal::Pending;
 use crate::{
     Ack, Address, Bulletin, Code, Data, DirectedQuery, EncodeError, Message, ParseOptions, Reject, TelemetryBits, TelemetryCoefficients,
     TelemetryNames, TelemetryUnits, text,
@@ -298,7 +300,7 @@ pub(crate) fn number_as_sent(value: f64, text: Option<&str>, form: fn(&str) -> b
         return Ok(t.to_string());
     }
     if !value.is_finite() {
-        return Err(EncodeError::new(format!("{what} is a finite number")));
+        return Err(EncodeError::new(RefusalCode::NotANumber, format!("{what} is a finite number")));
     }
     Ok(crate::steps::number_text(value))
 }
@@ -380,24 +382,35 @@ fn query_type_ok(t: &str) -> bool {
 
 pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
     let mut out = Vec::new();
+    let mut p = Pending::default();
     match data {
         Data::Message(m) => {
-            addressee(&mut out, &m.addressee)?;
-            message_text(&mut out, &m.text, true)?;
-            id_and_reply(&mut out, &m.message_id, &m.reply_ack)?;
+            addressee(&mut out, &m.addressee, &mut p);
+            // An addressee that makes a bulletin of it is not the form a message needs.
+            if matches!(bulletin_kind(&mut Context::new(ParseOptions::LENIENT), &m.addressee), Some(Some(_))) {
+                p.note(EncodeError::new(
+                    RefusalCode::InvalidAddressee,
+                    "an addressee of NWS-, NWS_ or BLN and a bulletin form makes a bulletin, not a message",
+                ));
+            }
+            message_text(&mut out, &m.text, true, &mut p);
+            id_and_reply(&mut out, &m.message_id, &m.reply_ack, &mut p);
         }
         Data::Ack(a) => {
-            addressee(&mut out, &a.addressee)?;
-            ack_or_reject(&mut out, b"ack", &a.acked_id, &a.message_id, &a.reply_ack)?;
+            addressee(&mut out, &a.addressee, &mut p);
+            ack_or_reject(&mut out, b"ack", &a.acked_id, &a.message_id, &a.reply_ack, &mut p);
         }
         Data::Reject(r) => {
-            addressee(&mut out, &r.addressee)?;
-            ack_or_reject(&mut out, b"rej", &r.rejected_id, &r.message_id, &r.reply_ack)?;
+            addressee(&mut out, &r.addressee, &mut p);
+            ack_or_reject(&mut out, b"rej", &r.rejected_id, &r.message_id, &r.reply_ack, &mut p);
         }
         Data::Bulletin(b) | Data::NwsBulletin(b) => {
             let nws = b.addressee.starts_with("NWS-") || b.addressee.starts_with("NWS_");
             if matches!(data, Data::NwsBulletin(_)) != nws {
-                return Err(EncodeError::new("an NWS bulletin is addressed NWS-xxxxx, and other bulletins are not"));
+                p.note(EncodeError::new(
+                    RefusalCode::InvalidAddressee,
+                    "an NWS bulletin is addressed NWS-xxxxx, and other bulletins are not",
+                ));
             }
             if !nws {
                 let rest = b.addressee.strip_prefix("BLN").unwrap_or("");
@@ -408,71 +421,88 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                     _ => false,
                 };
                 if !ok {
-                    return Err(EncodeError::new(
+                    p.note(EncodeError::new(
+                        RefusalCode::InvalidAddressee,
                         "a bulletin is addressed BLN and a digit or letter, or BLN, a digit and a group name of up to 5 (APRS12c ch. 14)",
                     ));
                 }
             }
-            addressee(&mut out, &b.addressee)?;
+            addressee(&mut out, &b.addressee, &mut p);
             // NWS bulletin text has no length limit; the 67 characters are for messages and other bulletins.
-            message_text(&mut out, &b.text, !nws)?;
-            id_and_reply(&mut out, &b.message_id, &None)?;
+            message_text(&mut out, &b.text, !nws, &mut p);
+            id_and_reply(&mut out, &b.message_id, &None, &mut p);
         }
         Data::TelemetryNames(TelemetryNames { addressee: to, names: labels, message_id })
         | Data::TelemetryUnits(TelemetryUnits { addressee: to, units: labels, message_id }) => {
-            if labels.len() > 13 || labels.iter().any(|l| l.contains(',') || l.contains('{') || crate::text::has_line_break(l.as_bytes())) {
-                return Err(EncodeError::new("telemetry metadata names at most 13 channels, without commas or braces (APRS12c ch. 13)"));
+            if labels.iter().any(|l| l.contains(',') || l.contains('{') || crate::text::has_line_break(l.as_bytes())) {
+                p.note(EncodeError::new(
+                    RefusalCode::InvalidCharacter,
+                    "telemetry metadata names are without commas, braces or line breaks (APRS12c ch. 13)",
+                ));
             }
-            addressee(&mut out, to)?;
+            if labels.len() > 13 {
+                p.note(EncodeError::new(RefusalCode::TooLong, "telemetry metadata names at most 13 channels (APRS12c ch. 13)"));
+            }
+            addressee(&mut out, to, &mut p);
             out.extend_from_slice(if matches!(data, Data::TelemetryNames(_)) { b"PARM." } else { b"UNIT." });
             out.extend_from_slice(labels.join(",").as_bytes());
-            id_and_reply(&mut out, message_id, &None)?;
+            id_and_reply(&mut out, message_id, &None, &mut p);
         }
         Data::TelemetryCoefficients(t) => {
             if t.coefficients.len() > 15 {
-                return Err(EncodeError::new("telemetry equations are up to 15 numbers (APRS12c ch. 13)"));
+                p.note(EncodeError::new(RefusalCode::TooLong, "telemetry equations are up to 15 numbers (APRS12c ch. 13)"));
             }
             let mut texts = Vec::with_capacity(t.coefficients.len());
             for (i, &c) in t.coefficients.iter().enumerate() {
-                texts.push(number_as_sent(c, t.coefficients_text.get(i).map(String::as_str), is_coefficient, "a telemetry coefficient")?);
+                if let Some(text) =
+                    p.run(number_as_sent(c, t.coefficients_text.get(i).map(String::as_str), is_coefficient, "a telemetry coefficient"))
+                {
+                    texts.push(text);
+                }
             }
-            addressee(&mut out, &t.addressee)?;
+            addressee(&mut out, &t.addressee, &mut p);
             out.extend_from_slice(b"EQNS.");
             out.extend_from_slice(texts.join(",").as_bytes());
-            id_and_reply(&mut out, &t.message_id, &None)?;
+            id_and_reply(&mut out, &t.message_id, &None, &mut p);
         }
         Data::TelemetryBits(t) => {
-            if t.bits.len() != 8
-                || !t.bits.bytes().all(|b| b == b'0' || b == b'1')
-                || t.project.chars().count() > 23
-                || t.project.contains('{')
-                || crate::text::has_line_break(t.project.as_bytes())
-            {
-                return Err(EncodeError::new(
-                    "telemetry bit sense is eight 0 or 1 characters, and the project title up to 23, without a { (APRS12c ch. 13)",
+            if t.project.contains('{') || crate::text::has_line_break(t.project.as_bytes()) {
+                p.note(EncodeError::new(
+                    RefusalCode::InvalidCharacter,
+                    "a telemetry project title has no { or line break (APRS12c ch. 13)",
                 ));
             }
-            addressee(&mut out, &t.addressee)?;
+            if t.project.chars().count() > 23 {
+                p.note(EncodeError::new(RefusalCode::TooLong, "a telemetry project title is up to 23 characters (APRS12c ch. 13)"));
+            }
+            if t.bits.len() != 8 || !t.bits.bytes().all(|b| b == b'0' || b == b'1') {
+                p.note(EncodeError::new(RefusalCode::Malformed, "telemetry bit sense is eight 0 or 1 characters (APRS12c ch. 13)"));
+            }
+            addressee(&mut out, &t.addressee, &mut p);
             out.extend_from_slice(b"BITS.");
             out.extend_from_slice(t.bits.as_bytes());
             if !t.project.is_empty() {
                 out.push(b',');
                 out.extend_from_slice(t.project.as_bytes());
             }
-            id_and_reply(&mut out, &t.message_id, &None)?;
+            id_and_reply(&mut out, &t.message_id, &None, &mut p);
         }
         Data::DirectedQuery(q) => {
             if !query_type_ok(&q.query_type) {
-                return Err(EncodeError::new(
+                p.note(EncodeError::new(
+                    RefusalCode::InvalidCode,
                     "a directed query type is upper-case letters: ?APRSD, ?APRSH, ?APRSM, ?APRSO, ?APRSP, ?APRSS, ?APRST, ?PING? or one the spec does not define (APRS12c ch. 15)",
                 ));
             }
-            addressee(&mut out, &q.addressee)?;
+            addressee(&mut out, &q.addressee, &mut p);
             out.push(b'?');
             out.extend_from_slice(q.query_type.as_bytes());
             if let Some(t) = &q.target {
                 if !Address::is_valid(t) {
-                    return Err(EncodeError::new("a directed query's target is one callsign: 1-9 letters, digits or -"));
+                    p.note(EncodeError::new(
+                        RefusalCode::InvalidAddressee,
+                        "a directed query's target is one callsign: 1-9 letters, digits or -",
+                    ));
                 }
                 // Straight after a type the spec defines, APRSH's padded to 9 characters ("APRSH:
                 // callsigns must be padded to 9 characters", APRS12c's 1.2 notes); after one space
@@ -482,96 +512,108 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                 }
                 out.extend_from_slice(t.as_bytes());
                 if q.query_type == "APRSH" {
-                    out.extend(core::iter::repeat_n(b' ', 9 - t.len()));
+                    out.extend(core::iter::repeat_n(b' ', 9usize.saturating_sub(t.len())));
                 }
             }
         }
-        _ => return Err(EncodeError::new("not a message")),
+        _ => return Err(EncodeError::new(RefusalCode::NotEncodable, "not a message")),
     }
+    p.finish()?;
     // What was written must read back as what was given: a message whose text looks like an ack,
     // telemetry metadata or a query, or whose addressee makes it a bulletin, would not.
     let mut ctx = Context::new(ParseOptions::LENIENT);
     if decode(&mut ctx, &out).as_ref() != Some(data) {
+        // An addressee that makes a bulletin of it is not the form this report needs.
+        let to = match data {
+            Data::Message(m) => Some(&m.addressee),
+            Data::Ack(a) => Some(&a.addressee),
+            Data::Reject(r) => Some(&r.addressee),
+            _ => None,
+        };
+        if to.is_some_and(|a| matches!(bulletin_kind(&mut Context::new(ParseOptions::LENIENT), a), Some(Some(_)))) {
+            return Err(EncodeError::new(
+                RefusalCode::InvalidAddressee,
+                "an addressee of NWS-, NWS_ or BLN and a bulletin form makes a bulletin, not this report",
+            ));
+        }
         return Err(EncodeError::new(
+            RefusalCode::TextReadsAsField,
             "it would read back as something else: text that reads as an ack, telemetry metadata or a query, or an addressee that makes it a bulletin",
         ));
     }
     Ok(out)
 }
 
-fn addressee(out: &mut Vec<u8>, a: &str) -> Result<(), EncodeError> {
+/// An addressee, which is nine characters with no space or `:`.
+fn addressee(out: &mut Vec<u8>, a: &str, p: &mut Pending) {
     let b = a.as_bytes();
     if b.is_empty() || b.len() > 9 || !text::is_printable_ascii(b) || b.contains(&b' ') || b.contains(&b':') {
-        return Err(EncodeError::new("an addressee is 1-9 printable characters without spaces or : (APRS12c ch. 14)"));
+        p.note(EncodeError::new(
+            RefusalCode::InvalidAddressee,
+            "an addressee is 1-9 printable characters without spaces or : (APRS12c ch. 14)",
+        ));
     }
     out.push(b':');
     out.extend_from_slice(b);
-    out.extend(core::iter::repeat_n(b' ', 9 - b.len()));
+    out.extend(core::iter::repeat_n(b' ', 9usize.saturating_sub(b.len())));
     out.push(b':');
-    Ok(())
 }
 
-fn message_text(out: &mut Vec<u8>, t: &str, limited: bool) -> Result<(), EncodeError> {
-    if limited && t.chars().count() > MAX_TEXT {
-        return Err(EncodeError::new("message text is limited to 67 characters (APRS12c ch. 14)"));
-    }
+fn message_text(out: &mut Vec<u8>, t: &str, limited: bool, p: &mut Pending) {
     if t.contains('{') {
-        return Err(EncodeError::new("message text must not contain '{', which starts the message ID (APRS12c ch. 14)"));
+        p.note(EncodeError::new(
+            RefusalCode::InvalidCharacter,
+            "message text must not contain '{', which starts the message ID (APRS12c ch. 14)",
+        ));
     }
     if crate::text::has_line_break(t.as_bytes()) {
-        return Err(EncodeError::new("message text cannot contain a line break"));
+        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "message text cannot contain a line break"));
+    }
+    if limited && t.chars().count() > MAX_TEXT {
+        p.note(EncodeError::new(RefusalCode::TooLong, "message text is limited to 67 characters (APRS12c ch. 14)"));
     }
     out.extend_from_slice(t.as_bytes());
-    Ok(())
 }
 
 fn id_ok(id: &str) -> bool {
     (1..=5).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
-fn id_and_reply(out: &mut Vec<u8>, id: &Option<String>, reply_ack: &Option<String>) -> Result<(), EncodeError> {
+fn id_and_reply(out: &mut Vec<u8>, id: &Option<String>, reply_ack: &Option<String>, p: &mut Pending) {
     match (id, reply_ack) {
         (None, None) => {}
-        (None, Some(_)) => return Err(EncodeError::new("a reply-ack goes with a message ID")),
+        (None, Some(_)) => p.note(EncodeError::new(RefusalCode::MissingField, "a reply-ack goes with a message ID")),
         (Some(id), reply) => {
             if !id_ok(id) {
-                return Err(EncodeError::new("a message ID is 1-5 letters or digits (APRS12c ch. 14)"));
+                p.note(EncodeError::new(RefusalCode::InvalidMessageId, "a message ID is 1-5 letters or digits (APRS12c ch. 14)"));
             }
             out.push(b'{');
             out.extend_from_slice(id.as_bytes());
             if let Some(r) = reply {
                 if !r.is_empty() && !id_ok(r) {
-                    return Err(EncodeError::new("a reply-ack is 1-5 letters or digits"));
+                    p.note(EncodeError::new(RefusalCode::InvalidMessageId, "a reply-ack is 1-5 letters or digits"));
                 }
                 out.push(b'}');
                 out.extend_from_slice(r.as_bytes());
             }
         }
     }
-    Ok(())
 }
 
-fn ack_or_reject(
-    out: &mut Vec<u8>,
-    kind: &[u8],
-    id: &str,
-    message_id: &Option<String>,
-    reply_ack: &Option<String>,
-) -> Result<(), EncodeError> {
+fn ack_or_reject(out: &mut Vec<u8>, kind: &[u8], id: &str, message_id: &Option<String>, reply_ack: &Option<String>, p: &mut Pending) {
     if message_id.is_some() {
-        return Err(EncodeError::new("an ack or rej carries no message ID of its own (UAP 5.32)"));
+        p.note(EncodeError::new(RefusalCode::FieldNotAllowed, "an ack or rej carries no message ID of its own (UAP 5.32)"));
     }
     if !id_ok(id) {
-        return Err(EncodeError::new("the message ID being acked or rejected is 1-5 letters or digits"));
+        p.note(EncodeError::new(RefusalCode::InvalidMessageId, "the message ID being acked or rejected is 1-5 letters or digits"));
     }
     out.extend_from_slice(kind);
     out.extend_from_slice(id.as_bytes());
     if let Some(r) = reply_ack {
         if !r.is_empty() && !id_ok(r) {
-            return Err(EncodeError::new("a reply-ack is 1-5 letters or digits"));
+            p.note(EncodeError::new(RefusalCode::InvalidMessageId, "a reply-ack is 1-5 letters or digits"));
         }
         out.push(b'}');
         out.extend_from_slice(r.as_bytes());
     }
-    Ok(())
 }

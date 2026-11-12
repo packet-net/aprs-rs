@@ -315,7 +315,7 @@ fn encode(case: &Value) -> Result<(), String> {
     let expect = &case["expect"];
     let written = match neutral::try_read_data(&input["encode"]) {
         Err(neutral::Unreadable::Unsupported(why)) => return Err(format!("encode: this crate's data cannot hold it: {why}")),
-        Err(neutral::Unreadable::Refused(why)) => Err(why),
+        Err(neutral::Unreadable::Refused(_, why)) => Err(why),
         Ok(data) => Packet::create(source(input), destination(input), Vec::new(), data).map_err(|e| e.to_string()),
     };
     let packet = match written {
@@ -358,7 +358,7 @@ fn readback(case: &Value) -> Result<(), String> {
         Ok(data) => neutral::data(&data),
         // A third-party packet keeps its inner information field, which the neutral form does not
         // carry, so one whose inner data the encoder refuses cannot be made from it.
-        Err(neutral::Unreadable::Refused(_)) => return Ok(()),
+        Err(neutral::Unreadable::Refused(..)) => return Ok(()),
         Err(e) => return Err(format!("readback: {e}")),
     };
     let mut out = Vec::new();

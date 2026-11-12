@@ -4,6 +4,7 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 
+use crate::RefusalCode;
 use crate::packet::{Address, EncodeError, InvalidAddress, Packet, PathEntry};
 use crate::{
     Ack, BeamHeading, Bulletin, CommentTelemetry, Dao, DaoPrecision, Data, ItemReport, Message, MicEMessage, MicEReport, ObjectReport, Phg,
@@ -287,18 +288,19 @@ impl Common {
 
     /// The shared fields, checked for what the builder itself needs; the encoder checks the rest.
     fn positioned(&self, what: &str, mic_e: bool) -> Result<Positioned, EncodeError> {
-        let position = self.position.ok_or_else(|| EncodeError::new(format!("{what} needs a position: call at(latitude, longitude)")))?;
-        let symbol =
-            self.symbol.ok_or_else(|| EncodeError::new(format!("{what} needs a symbol: call symbol(...), e.g. symbol(Symbol::CAR)")))?;
+        let position = self
+            .position
+            .ok_or_else(|| EncodeError::new(RefusalCode::MissingField, format!("{what} needs a position: call at(latitude, longitude)")))?;
+        let symbol = self.symbol.ok_or_else(|| {
+            EncodeError::new(RefusalCode::MissingField, format!("{what} needs a symbol: call symbol(...), e.g. symbol(Symbol::CAR)"))
+        })?;
         let mut fields = self.fields.clone();
         // An ambiguous position reports the box that holds it: its digits cut, not rounded, then
         // blanked, and the box's centre is what a decoder reads (vectors README, Builder rules).
-        fields.position = if (1..=4).contains(&self.ambiguity) {
-            Position {
-                latitude: box_centre(position.latitude, self.ambiguity),
-                longitude: box_centre(position.longitude, self.ambiguity),
-                ambiguity: self.ambiguity,
-            }
+        // A compressed report refuses ambiguity whatever the box, so it keeps the position as given.
+        fields.position = if (1..=4).contains(&self.ambiguity) && !fields.compressed {
+            let (latitude, longitude) = (box_centre(position.latitude, self.ambiguity), box_centre(position.longitude, self.ambiguity));
+            Position { latitude, longitude, ambiguity: self.ambiguity }
         } else {
             Position { ambiguity: self.ambiguity, ..position }
         };
@@ -316,10 +318,9 @@ impl Common {
             fields.course_degrees = None;
         }
         if self.tone.is_some() || self.offset_khz.is_some() {
-            let frequency = fields
-                .frequency
-                .as_mut()
-                .ok_or_else(|| EncodeError::new("a tone or offset needs a frequency: call frequency(mhz) first"))?;
+            let frequency = fields.frequency.as_mut().ok_or_else(|| {
+                EncodeError::new(RefusalCode::MissingField, "a tone or offset needs a frequency: call frequency(mhz) first")
+            })?;
             if let Some((tone, value)) = self.tone {
                 frequency.tone = Some(tone);
                 // `Toff` and the 1750 Hz burst have no value of their own.
@@ -330,6 +331,25 @@ impl Common {
             }
         }
         Ok(fields)
+    }
+}
+
+impl Common {
+    /// A position inside the range whose ambiguity box is centred beyond it has no form. A form that
+    /// writes ambiguity (uncompressed and Mic-E) refuses it; a compressed report refuses ambiguity itself.
+    fn box_fault(&self, fields: &Positioned) -> Result<(), EncodeError> {
+        let Some(position) = self.position else { return Ok(()) };
+        if fields.compressed || !(1..=4).contains(&self.ambiguity) {
+            return Ok(());
+        }
+        let (latitude, longitude) = (box_centre(position.latitude, self.ambiguity), box_centre(position.longitude, self.ambiguity));
+        if (position.latitude.abs() <= 90.0 && latitude.abs() > 90.0) || (position.longitude.abs() <= 180.0 && longitude.abs() > 180.0) {
+            return Err(EncodeError::new(
+                RefusalCode::ValueHasNoForm,
+                "an ambiguous position at 90 degrees latitude or 180 degrees longitude has a box centred past it",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -503,7 +523,11 @@ impl PositionBuilder {
         Ok(Data::Position(PositionReport {
             timestamp: self.timestamp,
             messaging: self.messaging,
-            fields: self.common.positioned("a position report", false)?,
+            fields: {
+                let fields = self.common.positioned("a position report", false)?;
+                self.common.box_fault(&fields)?;
+                fields
+            },
         }))
     }
 
@@ -548,8 +572,14 @@ impl ObjectBuilder {
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
         let fields = self.common.positioned("an object", false)?;
-        let timestamp =
-            self.timestamp.ok_or_else(|| EncodeError::new("an object needs a timestamp: call timestamp(...) or permanent()"))?;
+        // A name the encoder refuses is named first.
+        let name = self.name.as_bytes();
+        if (1..=9).contains(&name.len()) && crate::text::is_printable_ascii(name) {
+            self.common.box_fault(&fields)?;
+        }
+        let timestamp = self.timestamp.ok_or_else(|| {
+            EncodeError::new(RefusalCode::MissingField, "an object needs a timestamp: call timestamp(...) or permanent()")
+        })?;
         Ok(Data::Object(ObjectReport { name: self.name.clone(), killed: self.killed, timestamp: Some(timestamp), fields }))
     }
 
@@ -579,7 +609,13 @@ impl ItemBuilder {
 
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
-        Ok(Data::Item(ItemReport { name: self.name.clone(), killed: self.killed, fields: self.common.positioned("an item", false)? }))
+        let fields = self.common.positioned("an item", false)?;
+        // A name the encoder refuses is named first.
+        let name = self.name.as_bytes();
+        if (3..=9).contains(&name.len()) && crate::text::is_printable_ascii(name) && !name.contains(&b'!') && !name.contains(&b'_') {
+            self.common.box_fault(&fields)?;
+        }
+        Ok(Data::Item(ItemReport { name: self.name.clone(), killed: self.killed, fields }))
     }
 
     /// The packet: the station's header and this item, encoded.
@@ -622,7 +658,11 @@ impl MicEBuilder {
             type_code: Some(if self.messaging { '`' } else { '\'' }),
             // An altitude given in feet goes in a `/A=`, one in metres in the Mic-E altitude bytes.
             altitude_in_comment: self.common.altitude_m.is_none() && self.common.fields.altitude_feet.is_some(),
-            fields: self.common.positioned("a Mic-E report", true)?,
+            fields: {
+                let fields = self.common.positioned("a Mic-E report", true)?;
+                self.common.box_fault(&fields)?;
+                fields
+            },
             ..MicEReport::default()
         }))
     }
@@ -800,11 +840,17 @@ impl WeatherBuilder {
             return Ok(Data::Position(PositionReport { timestamp: self.timestamp, messaging: self.messaging, fields }));
         }
         if self.messaging || self.compressed || self.dao.is_some() || self.symbol != Symbol::WEATHER_STATION {
-            return Err(EncodeError::new("a symbol, messaging, compression and DAO need a position: call at(latitude, longitude)"));
+            return Err(EncodeError::new(
+                RefusalCode::MissingField,
+                "a symbol, messaging, compression and DAO need a position: call at(latitude, longitude)",
+            ));
         }
-        let timestamp = self
-            .timestamp
-            .ok_or_else(|| EncodeError::new("a positionless weather report needs a timestamp: call timestamp(Timestamp::mdhm(...))"))?;
+        let timestamp = self.timestamp.ok_or_else(|| {
+            EncodeError::new(
+                RefusalCode::MissingField,
+                "a positionless weather report needs a timestamp: call timestamp(Timestamp::mdhm(...))",
+            )
+        })?;
         Ok(Data::Weather(WeatherReport { timestamp: Some(timestamp), weather, comment: String::new() }))
     }
 
@@ -960,10 +1006,10 @@ impl TelemetryBuilder {
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
         if self.sequence > 999 {
-            return Err(EncodeError::new("a telemetry sequence is 0-999, three digits (APRS12c ch. 13)"));
+            return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "a telemetry sequence is 0-999, three digits (APRS12c ch. 13)"));
         }
         if self.analog.len() > 5 {
-            return Err(EncodeError::new("a telemetry report carries at most 5 analog values (APRS12c ch. 13)"));
+            return Err(EncodeError::new(RefusalCode::TooLong, "a telemetry report carries at most 5 analog values (APRS12c ch. 13)"));
         }
         let mut analog = self.analog.clone();
         analog.resize(5, None);

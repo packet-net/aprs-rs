@@ -3,8 +3,10 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::RefusalCode;
 use crate::context::Context;
 use crate::message::{is_decimal, telemetry_value};
+use crate::refusal::Pending;
 use crate::{Code, Data, EncodeError, ParseOptions, Telemetry, text};
 
 pub(crate) fn report(ctx: &mut Context, info: &[u8]) -> Option<Data> {
@@ -76,17 +78,30 @@ pub(crate) fn report(ctx: &mut Context, info: &[u8]) -> Option<Data> {
 }
 
 pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
-    let seq_ok = !t.sequence.is_empty() && t.sequence.bytes().all(|b| b.is_ascii_alphanumeric());
-    let bits_ok = t.bits.as_ref().is_some_and(|b| b.len() == 8 && b.bytes().all(|x| x == b'0' || x == b'1'));
-    if !seq_ok || t.analog.len() != 5 || !bits_ok {
-        return Err(EncodeError::new("a telemetry report carries 5 analog values and the 8 digital bits (APRS12c ch. 13)"));
+    let mut p = Pending::default();
+    // The sequence is fixed-form text: letters and digits, or MIC.
+    if t.sequence.is_empty() || !t.sequence.bytes().all(|b| b.is_ascii_alphanumeric()) {
+        p.note(EncodeError::new(RefusalCode::Malformed, "a telemetry sequence is letters and digits"));
+    }
+    if t.analog.len() != 5 {
+        p.note(EncodeError::new(RefusalCode::Malformed, "a telemetry report carries 5 analog values (APRS12c ch. 13)"));
+    }
+    match t.bits.as_deref() {
+        None => p.note(EncodeError::new(RefusalCode::MissingField, "a telemetry report carries the 8 digital bits (APRS12c ch. 13)")),
+        Some(b) if b.len() != 8 || !b.bytes().all(|x| x == b'0' || x == b'1') => {
+            p.note(EncodeError::new(RefusalCode::Malformed, "telemetry bits are eight 0 or 1 characters (APRS12c ch. 13)"))
+        }
+        Some(_) => {}
     }
     // No form reads back with the first channel empty after MIC (vectors README, Encoding).
-    if t.sequence == "MIC" && t.analog[0].is_none() {
-        return Err(EncodeError::new("T#MIC with an empty first channel does not read back as given, so it cannot be sent"));
+    if t.sequence == "MIC" && t.analog.first().is_some_and(Option::is_none) {
+        p.note(EncodeError::new(
+            RefusalCode::ValueHasNoForm,
+            "T#MIC with an empty first channel does not read back as given, so it cannot be sent",
+        ));
     }
     if crate::text::has_line_break(t.comment.as_bytes()) {
-        return Err(EncodeError::new("telemetry comment text cannot contain a line break"));
+        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "telemetry comment text cannot contain a line break"));
     }
     let mut out = Vec::from(&b"T#"[..]);
     out.extend_from_slice(t.sequence.as_bytes());
@@ -97,12 +112,15 @@ pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
     for (i, v) in t.analog.iter().enumerate() {
         if let Some(v) = v {
             let text = t.analog_text.get(i).map(String::as_str).filter(|t| !t.is_empty());
-            out.extend_from_slice(telemetry_value(*v, text)?.as_bytes());
+            if let Some(written) = p.run(telemetry_value(*v, text)) {
+                out.extend_from_slice(written.as_bytes());
+            }
         }
         out.push(b',');
     }
     out.extend_from_slice(t.bits.as_deref().unwrap_or_default().as_bytes());
     out.extend_from_slice(t.comment.as_bytes());
+    p.finish()?;
     // A sequence that starts MIC but is not MIC would not read back, for one.
     let mut ctx = Context::new(ParseOptions::LENIENT);
     match report(&mut ctx, &out) {
@@ -119,6 +137,9 @@ pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
         {
             Ok(out)
         }
-        _ => Err(EncodeError::new("the telemetry report would not read back as given (a sequence starting MIC is MIC itself)")),
+        _ => Err(EncodeError::new(
+            RefusalCode::TextReadsAsField,
+            "the telemetry report would not read back as given (a sequence starting MIC is MIC itself)",
+        )),
     }
 }

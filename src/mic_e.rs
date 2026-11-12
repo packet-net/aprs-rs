@@ -6,9 +6,11 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::RefusalCode;
 use crate::comment::{self, METRES_TO_FEET};
 use crate::context::Context;
 use crate::encode;
+use crate::refusal::Pending;
 use crate::{
     Address, Code, DaoPrecision, Data, EncodeError, MicEMessage, MicEReport, ParseOptions, Position, Positioned, base91, deviceid, position,
 };
@@ -267,9 +269,14 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
         }
     }
     let altitude_before = report.fields.altitude_feet;
+    // A `/A=` in the text wins over the Mic-E bytes, even when it says the same: whether the text
+    // gave one is seen by letting it write into an empty field.
+    report.fields.altitude_feet = None;
     let ok = comment::tail(ctx, &mut report.fields, &s, offset, joined);
-    // A `/A=` in the text wins over the Mic-E bytes, so an altitude that changed (or came) there is one.
-    report.altitude_in_comment = report.fields.altitude_feet.is_some() && report.fields.altitude_feet != altitude_before;
+    report.altitude_in_comment = report.fields.altitude_feet.is_some();
+    if !report.altitude_in_comment {
+        report.fields.altitude_feet = altitude_before;
+    }
     ok
 }
 
@@ -324,34 +331,59 @@ fn locator_len(s: &[u8]) -> Option<usize> {
 /// (vectors README, Builder rules).
 pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> {
     let f = &r.fields;
-    position::check_symbol(f.symbol)?;
-    let p = f.position;
-    if !(-90.0..=90.0).contains(&p.latitude) || !(-180.0..180.0).contains(&p.longitude) {
-        return Err(EncodeError::new("a Mic-E position must be within -90 to 90 and -180 to 180 degrees"));
+    let mut pend = Pending::default();
+    pend.run(position::check_symbol(f.symbol));
+    let given = f.position;
+    let mut fine = true;
+    if !given.latitude.is_finite() || !given.longitude.is_finite() {
+        pend.note(EncodeError::new(RefusalCode::NotANumber, "a Mic-E position is made of numbers"));
+        fine = false;
+    } else if !(-90.0..=90.0).contains(&given.latitude) || !(-180.0..=180.0).contains(&given.longitude) {
+        pend.note(EncodeError::new(RefusalCode::ValueOutOfRange, "a Mic-E position must be within -90 to 90 and -180 to 180 degrees"));
+        fine = false;
+    } else if given.longitude == 180.0 {
+        pend.note(EncodeError::new(RefusalCode::ValueHasNoForm, "Mic-E cannot carry a longitude of 180 degrees"));
+        fine = false;
     }
-    if p.ambiguity > 4 {
-        return Err(EncodeError::new("position ambiguity is 0-4 digits"));
+    if given.ambiguity > 4 {
+        pend.note(EncodeError::new(RefusalCode::ValueOutOfRange, "position ambiguity is 0-4 digits"));
+        fine = false;
     }
+    // The rest is worked out from a position that is safe to write when this one is not.
+    let p = if fine { given } else { Position { latitude: 0.0, longitude: 0.0, ambiguity: 0 } };
     if f.compressed || f.weather.is_some() || f.area.is_some() || f.df_bearing.is_some() || f.storm.is_some() || f.signpost.is_some() {
-        return Err(EncodeError::new("Mic-E carries no compression, weather, area, DF bearing, storm or signpost"));
+        pend.note(EncodeError::new(
+            RefusalCode::FieldNotAllowed,
+            "Mic-E carries no compression, weather, area, DF bearing, storm or signpost",
+        ));
     }
     if [f.phg.is_some(), f.range_miles.is_some(), f.dfs.is_some()].iter().filter(|x| **x).count() > 1 {
-        return Err(EncodeError::new("only one data extension (PHG, RNG or DFS) fits in a report"));
+        pend.note(EncodeError::new(RefusalCode::ExtensionConflict, "only one data extension (PHG, RNG or DFS) fits in a report"));
     }
     if r.destination_ssid > 15 {
-        return Err(EncodeError::new("the destination SSID is 0-15"));
+        pend.note(EncodeError::new(RefusalCode::ValueOutOfRange, "the destination SSID is 0-15"));
     }
     let (bits, custom) = match r.mic_e_message {
         MicEMessage::Unknown => {
-            return Err(EncodeError::new("an unknown Mic-E message code (mixed standard and custom bits) cannot be sent"));
+            pend.note(EncodeError::new(
+                RefusalCode::InvalidCode,
+                "an unknown Mic-E message code (mixed standard and custom bits) cannot be sent",
+            ));
+            (0, false)
         }
-        MicEMessage::Custom(n) if n > 6 => return Err(EncodeError::new("custom Mic-E messages are C0-C6")),
+        MicEMessage::Custom(n) if n > 6 => {
+            pend.note(EncodeError::new(RefusalCode::InvalidCode, "custom Mic-E messages are C0-C6"));
+            (0, false)
+        }
         MicEMessage::Custom(n) => (7 - usize::from(n), true),
         m => (MESSAGES.iter().position(|x| *x == m).unwrap_or(0), false),
     };
     // Whatever its precision: even `!W  !` reads back as `dao-with-ambiguity`.
-    if f.dao.is_some() && p.ambiguity > 0 {
-        return Err(EncodeError::new("a !DAO! on an ambiguous position contradicts it, whatever its precision"));
+    if f.dao.is_some() && given.ambiguity > 0 {
+        pend.note(EncodeError::new(
+            RefusalCode::FieldNotAllowed,
+            "a !DAO! on an ambiguous position contradicts it, whatever its precision",
+        ));
     }
     let dao = match f.dao {
         Some(d) if d.precision != DaoPrecision::None => Some(d.precision == DaoPrecision::Base91),
@@ -372,7 +404,10 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     // The box, in hundredths of a minute, that each level of ambiguity blanks.
     let box_size = [1u64, 10, 100, 1000, 6000][p.ambiguity as usize];
     if p.ambiguity > 0 && lat_units / box_size * box_size + box_size / 2 > 90 * 6000 {
-        return Err(EncodeError::new("an ambiguous latitude whose box is centred past 90 degrees cannot be sent"));
+        pend.note(EncodeError::new(
+            RefusalCode::ValueHasNoForm,
+            "an ambiguous latitude whose box is centred past 90 degrees cannot be sent",
+        ));
     }
     let lat_text = format!("{:02}{:02}{:02}", lat_units / 6000, lat_units % 6000 / 100, lat_units % 100);
     let mut lon_units = crate::steps::round(p.longitude.abs() * 60.0 * per_minute) as u64;
@@ -387,7 +422,7 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     let lon_min = (lon_units % 6000 / 100) as u32;
     let lon_hun = (lon_units % 100) as u32;
     if lon_deg >= 180 {
-        return Err(EncodeError::new("Mic-E cannot carry a longitude of 180 degrees"));
+        pend.note(EncodeError::new(RefusalCode::ValueHasNoForm, "Mic-E cannot carry a longitude of 180 degrees"));
     }
     let offset = !(10..=99).contains(&lon_deg);
 
@@ -428,15 +463,19 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         None => 0,
         // Rounded first, so -0.3 is 0 and 799.4 is 799.
         Some(s) if (0.0..=799.0).contains(&crate::steps::round(s)) => crate::steps::round(s) as u32,
-        Some(_) => return Err(EncodeError::new("Mic-E speed is 0-799 knots")),
+        Some(s) => {
+            pend.note(EncodeError::new(RefusalCode::for_value(s), "Mic-E speed is 0-799 knots"));
+            0
+        }
     };
     let course = match f.course_degrees {
         None => 0,
         Some(c) => {
-            let whole = encode::whole_degrees(c, "course")?;
+            let whole = pend.run(encode::whole_degrees(c, "course")).unwrap_or(0);
             // A course of 0 is how Mic-E sends no course, so it would read back as none.
             if whole == 0 {
-                return Err(EncodeError::new(
+                pend.note(EncodeError::new(
+                    RefusalCode::ValueHasNoForm,
                     "a Mic-E course of 0 means an unknown course (APRS12c ch. 10), so it cannot be sent: due north is 360",
                 ));
             }
@@ -455,15 +494,18 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     let status_start = out.len();
     if !r.legacy_telemetry.is_empty() {
         // A 255 would be taken for Kenwood 0xFF padding and removed on the way back in.
-        if r.legacy_telemetry.len() != 5 || r.legacy_telemetry.contains(&255) {
-            return Err(EncodeError::new("obsolete Mic-E binary telemetry is 5 values, each 0-254"));
+        if r.legacy_telemetry.contains(&255) {
+            pend.note(EncodeError::new(RefusalCode::ValueHasNoForm, "obsolete Mic-E binary telemetry is each 0-254"));
+        }
+        if r.legacy_telemetry.len() != 5 {
+            pend.note(EncodeError::new(RefusalCode::Malformed, "obsolete Mic-E binary telemetry is 5 values"));
         }
         out.push(0x1D);
         out.extend_from_slice(&r.legacy_telemetry);
     }
     if let Some(t) = r.type_code {
         if !matches!(t, '`' | '\'' | '>' | ']' | ' ') {
-            return Err(EncodeError::new("a Mic-E type code is `, ', >, ] or a space"));
+            pend.note(EncodeError::new(RefusalCode::InvalidCode, "a Mic-E type code is `, ', >, ] or a space"));
         }
         out.push(t as u8);
     }
@@ -478,16 +520,30 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         } else {
             let datum = metres + 10_000.0;
             if !(0.0..91.0 * 91.0 * 91.0).contains(&datum) {
-                return Err(EncodeError::new("the Mic-E altitude is out of range"));
+                pend.note(EncodeError::new(RefusalCode::for_value(feet), "the Mic-E altitude is out of range"));
+            } else {
+                let at = out.len();
+                base91::encode(datum as u32, 3, &mut out);
+                out.push(b'}');
+                // With no type code before it (legacy telemetry is taken off first), a first byte that is one reads back as the type code,
+                // and beyond six digits no `/A=` can say the altitude instead.
+                if r.type_code.is_none()
+                    && at == status_start + if r.legacy_telemetry.is_empty() { 0 } else { 6 }
+                    && matches!(out[at], b'`' | b'\'' | b'>' | b']' | b' ')
+                    && !(-99_999.0..=999_999.0).contains(&crate::steps::round(feet))
+                {
+                    pend.note(EncodeError::new(
+                        RefusalCode::ValueHasNoForm,
+                        "this Mic-E altitude has no form: its first byte would read as a type code and no /A= holds it",
+                    ));
+                }
             }
-            base91::encode(datum as u32, 3, &mut out);
-            out.push(b'}');
         }
     }
     if let Some(loc) = &r.locator {
         let b = loc.as_bytes();
         if locator_len(&[b, b"/G"].concat()) != Some(b.len()) {
-            return Err(EncodeError::new("a grid locator is 4 or 6 characters, e.g. IO91 or IO91SX"));
+            pend.note(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 characters, e.g. IO91 or IO91SX"));
         }
         out.extend_from_slice(b);
         out.extend_from_slice(b"/G");
@@ -506,27 +562,32 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     }
     let before_extension = out.len();
     if let Some(ph) = f.phg {
-        encode::phg_codes(&mut out, ph)?;
+        pend.run(encode::phg_codes(&mut out, ph));
         if let Some(rate) = ph.beacons_per_hour {
-            out.push(comment::beacon_rate_char(rate).ok_or_else(|| EncodeError::new("PHGR beacons per hour is 1-35"))?);
-            out.push(b'/');
+            match comment::beacon_rate_char(rate) {
+                Some(c) => {
+                    out.push(c);
+                    out.push(b'/');
+                }
+                None => pend.note(EncodeError::new(RefusalCode::ValueOutOfRange, "PHGR beacons per hour is 1-35")),
+            }
         }
     } else if let Some(range) = f.range_miles {
         let n = crate::steps::round(range);
         if !(0.0..=9999.0).contains(&n) {
-            return Err(EncodeError::new("RNG range is 0-9999 miles"));
+            pend.note(EncodeError::new(RefusalCode::for_value(range), "RNG range is 0-9999 miles"));
+        } else {
+            out.extend_from_slice(format!("RNG{:04}", n as u32).as_bytes());
         }
-        out.extend_from_slice(format!("RNG{:04}", n as u32).as_bytes());
     } else if let Some(dfs) = f.dfs {
-        encode::dfs_codes(&mut out, dfs)?;
+        pend.run(encode::dfs_codes(&mut out, dfs));
     }
     let after_extension = (out.len() > before_extension).then_some(out.len());
     if let Some(feet) = altitude_in_text {
         let n = crate::steps::round(feet);
         if !(-99_999.0..=999_999.0).contains(&n) {
-            return Err(EncodeError::new("/A= altitude must fit in 6 digits (or - and 5 digits)"));
-        }
-        if n < 0.0 {
+            pend.note(EncodeError::new(RefusalCode::for_value(feet), "/A= altitude must fit in 6 digits (or - and 5 digits)"));
+        } else if n < 0.0 {
             out.extend_from_slice(format!("/A=-{:05}", (-n) as u32).as_bytes());
         } else {
             out.extend_from_slice(format!("/A={:06}", n as u32).as_bytes());
@@ -539,19 +600,20 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         if after_extension == Some(out.len()) && out.last() != Some(&b'/') {
             out.push(b'/');
         }
-        encode::frequency(&mut out, fr)?;
+        encode::frequency(&mut out, fr, &mut pend);
     }
 
     let text = f.comment.as_bytes();
-    if crate::text::has_line_break(text) {
-        return Err(EncodeError::new("comment text cannot contain a line break"));
+    // A weather report has no comment: that is the fault, and the characters are not looked at.
+    if f.weather.is_none() && crate::text::has_line_break(text) {
+        pend.note(EncodeError::new(RefusalCode::InvalidCharacter, "comment text cannot contain a line break"));
     }
     let mut trailer = Vec::new();
     if let Some(t) = &f.telemetry {
-        encode::telemetry_into(&mut trailer, t)?;
+        encode::telemetry_into(&mut trailer, t, &mut pend);
     }
     if let Some(d) = f.dao {
-        encode::check_dao_datum(d)?;
+        pend.run(encode::check_dao_datum(d));
         trailer.push(b'!');
         match d.precision {
             DaoPrecision::Thousandths => trailer.extend_from_slice(&[d.datum as u8, b'0' + lat_extra, b'0' + lon_extra]),
@@ -561,6 +623,17 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         trailer.push(b'!');
     }
     let suffix = r.device_suffix.as_bytes();
+    // A device suffix belongs to a type code and must be one the database knows for it.
+    if !suffix.is_empty() {
+        match r.type_code {
+            None => pend.note(EncodeError::new(RefusalCode::MissingField, "a Mic-E device suffix goes with a type code")),
+            Some(t) if deviceid::mic_e_suffix_len(Some(t as u8), suffix) != suffix.len() => {
+                pend.note(EncodeError::new(RefusalCode::InvalidCode, "the device suffix is not one the database knows for this type code"))
+            }
+            Some(_) => {}
+        }
+    }
+    pend.finish()?;
 
     let text_at = out.len();
     let needs_space = !text.is_empty() && f.frequency.is_some();
@@ -586,14 +659,19 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         // A CR or LF at the end (the last byte of Rev 0 telemetry, say) reads back as a
         // trailing line break, a warning.
         if matches!(out.last(), Some(b'\r' | b'\n')) {
-            return Err(EncodeError::new("the information field would end in a CR or LF, which reads back as a trailing line break"));
+            return Err(EncodeError::new(
+                RefusalCode::InvalidCharacter,
+                "the information field would end in a CR or LF, which reads back as a trailing line break",
+            ));
         }
         if reads_back(r, &out[status_start..]) {
-            let destination = Address::new(&dest).map_err(|_| EncodeError::new("the Mic-E destination is not an address"))?;
+            let destination = Address::new(&dest)
+                .map_err(|_| EncodeError::new(RefusalCode::InvalidAddress, "the Mic-E destination is not an address"))?;
             return Ok((destination, out));
         }
     }
     Err(EncodeError::new(
+        RefusalCode::TextReadsAsField,
         "the status text does not read back as given: a device suffix the database does not know, or text that decodes as a structured element; set the property instead",
     ))
 }
