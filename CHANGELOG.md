@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.0.1 (2026-11-12)
 
-### 1.0.1: refusals carry a reason code
+Refusals carry a reason code.
 
 - New `RefusalCode` (non-exhaustive, with `id()`, `from_id()` and `ALL`) and `EncodeError::code()`. Every refusal from `Data::encode`, `Packet::create`, `Packet::to_ax25` and the builders says which of the 26 shared reasons it is, with the same ids as the `refusals` list in the conformance vectors. The message text and every existing signature are unchanged.
 - `diff_dump` writes the code as `refusal` on refused encode and build records, `reencode_refusal` on decode records whose re-encode is refused, and `ax25_refusal` in the API view.
