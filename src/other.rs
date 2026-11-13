@@ -554,6 +554,19 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             out.extend_from_slice(items.join(",").as_bytes());
         }
         Data::ThirdParty(p) => {
+            // Counted by walking the chain, not by recursing: a caller can build one thousands deep.
+            let mut depth = 1;
+            let mut inner = &p.data;
+            while let Data::ThirdParty(next) = inner {
+                depth += 1;
+                inner = &next.data;
+            }
+            if depth > MAX_THIRD_PARTY_DEPTH {
+                return Err(EncodeError::new(
+                    RefusalCode::InvalidThirdPartyHeader,
+                    "third-party packets nest at most four deep, and a decoder reads no more",
+                ));
+            }
             third_party_header(p)?;
             out.push(b'}');
             out.extend_from_slice(&p.to_tnc2());

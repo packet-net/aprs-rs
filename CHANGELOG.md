@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Round 3 of the conformance vectors (pinned at cb5dcc0). Two encode cases (no symbol, an undecoded inner packet) are records this crate's data cannot hold; they are listed in `tests/known-differences.txt`.
+Round 3 of the conformance vectors (pinned at f2f6ab5). Two encode cases (no symbol, an undecoded inner packet) are records this crate's data cannot hold; they are listed in `tests/known-differences.txt`.
 
 - A decoder reads at most four levels of third-party header; a fifth `}` makes the packet holding it `unrecognized` with `error:invalid-third-party`. Decoding a line of thousands of nested `}` no longer overflows the stack.
 - An AX.25 address holding anything but upper-case letters and digits (a lower-case letter is still tolerated) is `invalid-address`, and a call of spaces only is an empty source (`invalid-address`), destination (`empty-destination`) or digipeater (`empty-path-entry`).
@@ -15,6 +15,7 @@ Round 3 of the conformance vectors (pinned at cb5dcc0). Two encode cases (no sym
 - Base-91 telemetry on a weather report has no place, so it is `field-not-allowed` and its own checks (too many values, a value out of range) do not run.
 - A course or speed beside a compressed weather report's wind is judged in the cs-byte checks before `extension-conflict`, so a course of 0 is `value-has-no-form`.
 - The telemetry builder names a fault ranked before too-long (a line break in the comment) ahead of too many analog values; builders in general refuse in the encoder's order: a value out of range (a course of 360.5, a latitude past 90, a Mic-E speed of 999.5) is `value-out-of-range` before an ambiguous position at 90 or 180 degrees is `value-has-no-form`.
+- The encoder refuses third-party data nested more than four deep (`invalid-third-party-header`), counting the levels in a loop, so a chain a caller built thousands deep is refused without recursion. Dropping, cloning, comparing or printing such a chain still recurses (plain boxed data); the limit is documented on `Data::ThirdParty`.
 - The vectors runner compares the refusal code a case names, not only that there was a refusal.
 
 ### Behaviour changes
@@ -25,6 +26,7 @@ For callers of 1.x, in a minor release:
 - An AX.25 address with punctuation or a space inside is now a hard `invalid-address`, even with `ParseOptions::LENIENT`.
 - More than five telemetry analog values are now `too-long` (they were `malformed`).
 - A path entry of spaces only is dropped on decode (with `empty-path-entry`) rather than refused.
+- Third-party packets nest at most four deep on decode, and the encoder refuses deeper data.
 
 ## 1.0.1 (2026-11-12)
 

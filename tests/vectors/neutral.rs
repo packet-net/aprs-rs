@@ -832,6 +832,20 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             // source (APRS12c ch. 17), and its diagnostics are part of the data. This crate keeps
             // the inner information field as received, which the neutral form does not carry, so
             // it is the inner data encoded.
+            // Nesting is counted by walking the value, before anything recurses into it: more than
+            // four deep is refused first, as the encoder does.
+            let mut depth = 1;
+            let mut inner = v;
+            while let Some(next) = inner.get("packet").and_then(|p| p.get("data")).filter(|d| d["type"] == "third-party") {
+                depth += 1;
+                inner = next;
+            }
+            if depth > 4 {
+                return Err(Unreadable::Refused(
+                    pdn_aprs::RefusalCode::InvalidThirdPartyHeader,
+                    "third-party packets nest at most four deep".into(),
+                ));
+            }
             let p = o.required("packet", o.object("packet", &["source", "destination", "path", "data", "diagnostics"])?)?;
             let source = p.text("source")?;
             let source = Address::third_party_source(&source).or_else(|_| unsupported("packet.source: not a third-party source".into()))?;
