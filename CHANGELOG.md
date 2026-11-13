@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+Round 3 of the conformance vectors (pinned at e0e8e39).
+
+- A decoder reads at most four levels of third-party header; a fifth `}` makes the packet holding it `unrecognized` with `error:invalid-third-party`. Decoding a line of thousands of nested `}` no longer overflows the stack.
+- An AX.25 address holding anything but upper-case letters and digits (a lower-case letter is still tolerated) is `invalid-address`, and a call of spaces only is an empty source (`invalid-address`), destination (`empty-destination`) or digipeater (`empty-path-entry`).
+- A `!DAO!` on an ambiguous position reads with `dao-with-ambiguity` whatever its precision, `!W  !` included.
+- An ambiguous position is cut to its box, not rounded and then cut again, so a latitude or longitude just under the edge is written in the box below it, in an uncompressed report and in Mic-E.
+- A wind direction in a compressed weather report is judged in whole degrees before it is rounded to the 4-degree step: 360.5 and -0.5 are `value-out-of-range`.
+- Refusal order follows the vectors: more than five analog values in a telemetry report or comment telemetry are `too-long`; a status grid locator that is not upper case is `malformed`; a field that is wanted twice (a PHG, RNG or DFS that loses the one data extension, or a course, speed or wind beside a range or a GGA altitude in the cs bytes) keeps its own range checks, so its refusal can outrank `extension-conflict`; a reply-ack that is wrong on its own is `invalid-message-id` even with no message ID.
+- `StatusBuilder::locator` writes a lower-case locator in upper case; the encoder, given a lower-case locator in data, refuses it.
+- The vectors runner compares the refusal code a case names, not only that there was a refusal.
+
 ## 1.0.1 (2026-11-12)
 
 Refusals carry a reason code.

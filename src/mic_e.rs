@@ -569,26 +569,40 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         }
     }
     let before_extension = out.len();
-    if let Some(ph) = f.phg {
-        pend.run(encode::phg_codes(&mut out, ph));
-        if let Some(rate) = ph.beacons_per_hour {
-            match comment::beacon_rate_char(rate) {
-                Some(c) => {
-                    out.push(c);
-                    out.push(b'/');
+    // One of PHG, RNG and DFS is written; any other keeps its own checks.
+    let mut written = false;
+    for kind in 0..3 {
+        let mut scratch = Vec::new();
+        let target = if written { &mut scratch } else { &mut out };
+        match kind {
+            0 => {
+                let Some(ph) = f.phg else { continue };
+                pend.run(encode::phg_codes(target, ph));
+                if let Some(rate) = ph.beacons_per_hour {
+                    match comment::beacon_rate_char(rate) {
+                        Some(c) => {
+                            target.push(c);
+                            target.push(b'/');
+                        }
+                        None => pend.note(EncodeError::new(RefusalCode::ValueOutOfRange, "PHGR beacons per hour is 1-35")),
+                    }
                 }
-                None => pend.note(EncodeError::new(RefusalCode::ValueOutOfRange, "PHGR beacons per hour is 1-35")),
+            }
+            1 => {
+                let Some(range) = f.range_miles else { continue };
+                let n = crate::steps::round(range);
+                if !(0.0..=9999.0).contains(&n) {
+                    pend.note(EncodeError::new(RefusalCode::for_value(range), "RNG range is 0-9999 miles"));
+                } else {
+                    target.extend_from_slice(format!("RNG{:04}", n as u32).as_bytes());
+                }
+            }
+            _ => {
+                let Some(dfs) = f.dfs else { continue };
+                pend.run(encode::dfs_codes(target, dfs));
             }
         }
-    } else if let Some(range) = f.range_miles {
-        let n = crate::steps::round(range);
-        if !(0.0..=9999.0).contains(&n) {
-            pend.note(EncodeError::new(RefusalCode::for_value(range), "RNG range is 0-9999 miles"));
-        } else {
-            out.extend_from_slice(format!("RNG{:04}", n as u32).as_bytes());
-        }
-    } else if let Some(dfs) = f.dfs {
-        pend.run(encode::dfs_codes(&mut out, dfs));
+        written = true;
     }
     let after_extension = (out.len() > before_extension).then_some(out.len());
     if let Some(feet) = altitude_in_text {
