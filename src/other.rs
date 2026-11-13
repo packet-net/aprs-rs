@@ -484,13 +484,13 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
         Data::Nmea(n) => return encode_nmea(n),
         Data::MaidenheadBeacon(m) => {
             let mut p = Pending::default();
-            if !status::is_locator(m.locator.as_bytes()) {
-                p.note(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 characters, e.g. IO91 or IO91SX"));
+            if !status::is_locator(m.locator.as_bytes()) || m.locator != m.locator.to_ascii_uppercase() {
+                p.note(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 upper-case characters, e.g. IO91 or IO91SX"));
             }
             p.run(printable(&m.comment, "a beacon comment"));
             p.finish()?;
             out.push(b'[');
-            out.extend_from_slice(m.locator.to_ascii_uppercase().as_bytes());
+            out.extend_from_slice(m.locator.as_bytes());
             out.push(b']');
             out.extend_from_slice(m.comment.as_bytes());
         }

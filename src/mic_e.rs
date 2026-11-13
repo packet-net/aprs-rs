@@ -550,8 +550,8 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     }
     if let Some(loc) = &r.locator {
         let b = loc.as_bytes();
-        if locator_len(&[b, b"/G"].concat()) != Some(b.len()) {
-            pend.note(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 characters, e.g. IO91 or IO91SX"));
+        if locator_len(&[b, b"/G"].concat()) != Some(b.len()) || *loc != loc.to_ascii_uppercase() {
+            pend.note(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 upper-case characters, e.g. IO91 or IO91SX"));
         }
         out.extend_from_slice(b);
         out.extend_from_slice(b"/G");

@@ -283,7 +283,9 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned, mut p: Pending) -> R
     }
     let text_at = out.len();
     let mut trailer = Vec::new();
-    if let Some(t) = &f.telemetry {
+    // A weather report has no comment, so base-91 telemetry has no place in it and its own checks
+    // do not run.
+    if let Some(t) = f.telemetry.as_ref().filter(|_| f.weather.is_none()) {
         telemetry_into(&mut trailer, t, &mut p);
     }
     if let Some(d) = f.dao {
@@ -415,7 +417,11 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned, p: &mut Pending) -> bool {
             }
         }
     } else if let Some(w) = wind {
-        // A weather station's cs course and speed are its wind.
+        // A weather station's cs course and speed are its wind. A course or speed has no place
+        // there, but is judged in the checks of the form the place has before the conflict.
+        if course_speed {
+            course_speed_code(f, p);
+        }
         if let Some(range) = f.range_miles {
             range_step(range, p);
             p.note(EncodeError::new(RefusalCode::ExtensionConflict, "the cs bytes carry the wind or a range, not both"));

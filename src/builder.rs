@@ -337,17 +337,30 @@ impl Common {
 impl Common {
     /// A position inside the range whose ambiguity box is centred beyond it has no form. A form that
     /// writes ambiguity (uncompressed and Mic-E) refuses it; a compressed report refuses ambiguity itself.
-    fn box_fault(&self, fields: &Positioned) -> Result<(), EncodeError> {
+    ///
+    /// A builder names its refusal in the encoder's order, so a fault ranked before this one (a value
+    /// out of range, say) is named first: the report is tried with the position as given, whose
+    /// ambiguity the encoder judges itself.
+    fn box_fault(&self, fields: &Positioned, wrap: impl Fn(Positioned) -> Data) -> Result<(), EncodeError> {
         let Some(position) = self.position else { return Ok(()) };
         if fields.compressed || !(1..=4).contains(&self.ambiguity) {
             return Ok(());
         }
         let (latitude, longitude) = (box_centre(position.latitude, self.ambiguity), box_centre(position.longitude, self.ambiguity));
         if (position.latitude.abs() <= 90.0 && latitude.abs() > 90.0) || (position.longitude.abs() <= 180.0 && longitude.abs() > 180.0) {
-            return Err(EncodeError::new(
-                RefusalCode::ValueHasNoForm,
-                "an ambiguous position at 90 degrees latitude or 180 degrees longitude has a box centred past it",
-            ));
+            let mut raw = fields.clone();
+            raw.position = Position { ambiguity: self.ambiguity, ..position };
+            let data = wrap(raw);
+            let tried = match &data {
+                Data::MicE(r) => crate::mic_e::encode(r).map(|_| ()),
+                other => other.encode().map(|_| ()),
+            };
+            return Err(tried.err().unwrap_or_else(|| {
+                EncodeError::new(
+                    RefusalCode::ValueHasNoForm,
+                    "an ambiguous position at 90 degrees latitude or 180 degrees longitude has a box centred past it",
+                )
+            }));
         }
         Ok(())
     }
@@ -525,7 +538,9 @@ impl PositionBuilder {
             messaging: self.messaging,
             fields: {
                 let fields = self.common.positioned("a position report", false)?;
-                self.common.box_fault(&fields)?;
+                self.common.box_fault(&fields, |fields| {
+                    Data::Position(PositionReport { timestamp: self.timestamp, messaging: self.messaging, fields })
+                })?;
                 fields
             },
         }))
@@ -572,11 +587,9 @@ impl ObjectBuilder {
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
         let fields = self.common.positioned("an object", false)?;
-        // A name the encoder refuses is named first.
-        let name = self.name.as_bytes();
-        if (1..=9).contains(&name.len()) && crate::text::is_printable_ascii(name) {
-            self.common.box_fault(&fields)?;
-        }
+        self.common.box_fault(&fields, |fields| {
+            Data::Object(ObjectReport { name: self.name.clone(), killed: self.killed, timestamp: self.timestamp, fields })
+        })?;
         let timestamp = self.timestamp.ok_or_else(|| {
             EncodeError::new(RefusalCode::MissingField, "an object needs a timestamp: call timestamp(...) or permanent()")
         })?;
@@ -610,11 +623,7 @@ impl ItemBuilder {
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
         let fields = self.common.positioned("an item", false)?;
-        // A name the encoder refuses is named first.
-        let name = self.name.as_bytes();
-        if (3..=9).contains(&name.len()) && crate::text::is_printable_ascii(name) && !name.contains(&b'!') && !name.contains(&b'_') {
-            self.common.box_fault(&fields)?;
-        }
+        self.common.box_fault(&fields, |fields| Data::Item(ItemReport { name: self.name.clone(), killed: self.killed, fields }))?;
         Ok(Data::Item(ItemReport { name: self.name.clone(), killed: self.killed, fields }))
     }
 
@@ -660,7 +669,15 @@ impl MicEBuilder {
             altitude_in_comment: self.common.altitude_m.is_none() && self.common.fields.altitude_feet.is_some(),
             fields: {
                 let fields = self.common.positioned("a Mic-E report", true)?;
-                self.common.box_fault(&fields)?;
+                self.common.box_fault(&fields, |fields| {
+                    Data::MicE(MicEReport {
+                        mic_e_message: self.mic_e_message,
+                        type_code: Some(if self.messaging { '`' } else { '\'' }),
+                        altitude_in_comment: self.common.altitude_m.is_none() && self.common.fields.altitude_feet.is_some(),
+                        fields,
+                        ..MicEReport::default()
+                    })
+                })?;
                 fields
             },
             ..MicEReport::default()
