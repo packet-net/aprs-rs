@@ -95,13 +95,17 @@ pub(crate) fn encode(s: &Status) -> Result<Vec<u8>, EncodeError> {
             ));
         }
     }
+    if let Some(loc) = &s.locator {
+        // Fixed-form text is malformed whatever else is wrong; an encoder writes a locator in upper
+        // case as given and does not fix its case.
+        if !is_locator(loc.as_bytes()) || *loc != loc.to_ascii_uppercase() {
+            p.note(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 upper-case characters, e.g. IO91 or IO91SX"));
+        }
+    }
     match (&s.locator, s.symbol) {
         (Some(loc), Some(symbol)) => {
-            if !is_locator(loc.as_bytes()) {
-                p.note(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 characters, e.g. IO91 or IO91SX"));
-            }
             p.run(position::check_symbol(symbol));
-            out.extend_from_slice(loc.to_ascii_uppercase().as_bytes());
+            out.extend_from_slice(loc.as_bytes());
             out.push(symbol.table as u8);
             out.push(symbol.code as u8);
             if !s.text.is_empty() || s.beam.is_some() {

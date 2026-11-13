@@ -83,7 +83,9 @@ pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
     if t.sequence.is_empty() || !t.sequence.bytes().all(|b| b.is_ascii_alphanumeric()) {
         p.note(EncodeError::new(RefusalCode::Malformed, "a telemetry sequence is letters and digits"));
     }
-    if t.analog.len() != 5 {
+    if t.analog.len() > 5 {
+        p.note(EncodeError::new(RefusalCode::TooLong, "a telemetry report carries 5 analog values (APRS12c ch. 13)"));
+    } else if t.analog.len() != 5 {
         p.note(EncodeError::new(RefusalCode::Malformed, "a telemetry report carries 5 analog values (APRS12c ch. 13)"));
     }
     match t.bits.as_deref() {

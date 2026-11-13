@@ -941,10 +941,11 @@ impl StatusBuilder {
         self
     }
 
-    /// A 4- or 6-character Maidenhead locator at the start, e.g. `IO91SX`. It goes with a
+    /// A 4- or 6-character Maidenhead locator at the start, e.g. `IO91SX`; lower case is written in
+    /// upper case, as a decoder reads it. It goes with a
     /// [`symbol`](Self::symbol): one without the other is refused when built.
     pub fn locator(mut self, maidenhead_locator: &str) -> Self {
-        self.status.locator = Some(maidenhead_locator.to_string());
+        self.status.locator = Some(maidenhead_locator.to_ascii_uppercase());
         self
     }
 

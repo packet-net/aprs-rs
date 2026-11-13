@@ -217,17 +217,19 @@ pub struct Packet {
 impl Packet {
     /// Decodes a TNC2 / APRS-IS text line, `SOURCE>DEST,PATH:information`.
     pub fn decode_tnc2(line: &[u8], options: ParseOptions) -> Result<Packet, HeaderError> {
-        Packet::decode_tnc2_line(line, options, false)
+        Packet::decode_tnc2_line(line, options, 0)
     }
 
     /// Decodes the TNC2 packet inside a third-party packet, whose source need not be an APRS-IS
     /// address (APRS12c ch. 17; [`Address::third_party_source`]).
-    pub(crate) fn decode_third_party(line: &[u8], options: ParseOptions) -> Result<Packet, HeaderError> {
-        Packet::decode_tnc2_line(line, options, true)
+    pub(crate) fn decode_third_party(line: &[u8], options: ParseOptions, depth: usize) -> Result<Packet, HeaderError> {
+        Packet::decode_tnc2_line(line, options, depth)
     }
 
-    fn decode_tnc2_line(line: &[u8], options: ParseOptions, third_party: bool) -> Result<Packet, HeaderError> {
+    fn decode_tnc2_line(line: &[u8], options: ParseOptions, depth: usize) -> Result<Packet, HeaderError> {
+        let third_party = depth > 0;
         let mut ctx = Context::new(options);
+        ctx.depth = depth;
         let Some(colon) = line.iter().position(|&b| b == b':') else {
             ctx.error(Code::InvalidHeader, "no ':' ends the header (SOURCE>DEST[,PATH]:)", None);
             return Err(ctx.header_error());
@@ -328,12 +330,23 @@ impl Packet {
 
         let mut decoded = Vec::with_capacity(addresses.len());
         for (i, bytes) in addresses.iter().enumerate() {
-            decoded.push(ax25_address(&mut ctx, bytes, i * 7)?);
+            let role = match i {
+                0 => AddressRole::Destination,
+                1 => AddressRole::Source,
+                _ => AddressRole::Path,
+            };
+            decoded.push(ax25_address(&mut ctx, bytes, i * 7, role)?);
         }
 
-        let destination = decoded.remove(0);
-        let source = decoded.remove(0);
-        let path = addresses[2..].iter().zip(decoded).map(|(bytes, address)| PathEntry { address, used: bytes[6] & 0x80 != 0 }).collect();
+        let mut decoded = decoded.into_iter();
+        let destination = decoded.next().flatten().unwrap_or_else(|| Address::unchecked(String::new()));
+        let source = decoded.next().flatten().unwrap_or_else(|| Address::unchecked(String::new()));
+        // A digipeater of spaces only is an empty path entry, tolerated and left out.
+        let path = addresses[2..]
+            .iter()
+            .zip(decoded)
+            .filter_map(|(bytes, address)| address.map(|address| PathEntry { address, used: bytes[6] & 0x80 != 0 }))
+            .collect();
         Ok(Packet::decode_with_context(ctx, source, destination, path, &frame[at + 2..]))
     }
 
@@ -437,7 +450,16 @@ fn header_address(ctx: &mut Context, text: &str) -> Result<Address, HeaderError>
     }
 }
 
-fn ax25_address(ctx: &mut Context, bytes: &[u8], offset: usize) -> Result<Address, HeaderError> {
+#[derive(Clone, Copy, PartialEq)]
+enum AddressRole {
+    Source,
+    Destination,
+    Path,
+}
+
+/// An AX.25 address: upper-case letters and digits, then spaces (or NULs). `None` is an address of
+/// spaces only, which is empty as an empty TNC2 address is.
+fn ax25_address(ctx: &mut Context, bytes: &[u8], offset: usize, role: AddressRole) -> Result<Option<Address>, HeaderError> {
     let chars: Vec<u8> = bytes[..6].iter().map(|b| b >> 1).collect();
     let mut end = 6;
     while end > 0 && chars[end - 1] == b' ' {
@@ -457,21 +479,42 @@ fn ax25_address(ctx: &mut Context, bytes: &[u8], offset: usize) -> Result<Addres
         call = &call[..nul_start];
     }
     if call.is_empty() {
-        ctx.error(Code::InvalidAddress, "an AX.25 address is empty", Some(offset));
+        // A call of spaces only is empty, as an empty TNC2 address is: an empty source is
+        // unusable, an empty destination or digipeater is tolerated.
+        match role {
+            AddressRole::Destination => {
+                if !ctx.tolerate(Code::EmptyDestination, "the destination address is empty (UAP 5.2)", Some(offset)) {
+                    return Err(ctx.header_error());
+                }
+            }
+            AddressRole::Path => {
+                if !ctx.tolerate(Code::EmptyPathEntry, "the path has an empty entry (UAP 5.6)", Some(offset)) {
+                    return Err(ctx.header_error());
+                }
+            }
+            AddressRole::Source => {
+                ctx.error(Code::InvalidAddress, "an AX.25 address is empty", Some(offset));
+                return Err(ctx.header_error());
+            }
+        }
+        return Ok(None);
+    }
+    let mut lower = false;
+    for &c in call {
+        if c.is_ascii_uppercase() || c.is_ascii_digit() {
+            continue;
+        }
+        if c.is_ascii_lowercase() {
+            lower = true;
+            continue;
+        }
+        // Anything else (punctuation, a space inside, a control character) would write a TNC2
+        // header that reads back as a different one.
+        ctx.error(Code::InvalidAddress, "an AX.25 address is upper-case letters and digits (AX.25 2.2 section 3.12)", Some(offset));
         return Err(ctx.header_error());
     }
-    if !call.iter().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()) {
-        if !call.iter().all(|c| c.is_ascii_graphic()) {
-            ctx.error(Code::InvalidAddress, "an AX.25 address has characters that cannot be shown", Some(offset));
-            return Err(ctx.header_error());
-        }
-        if !ctx.tolerate(
-            Code::InvalidAx25AddressCharacters,
-            "an AX.25 address has characters other than upper-case letters and digits",
-            Some(offset),
-        ) {
-            return Err(ctx.header_error());
-        }
+    if lower && !ctx.tolerate(Code::InvalidAx25AddressCharacters, "an AX.25 address has lower-case letters", Some(offset)) {
+        return Err(ctx.header_error());
     }
 
     let mut text: String = call.iter().map(|&c| c as char).collect();
@@ -479,7 +522,7 @@ fn ax25_address(ctx: &mut Context, bytes: &[u8], offset: usize) -> Result<Addres
     if ssid != 0 {
         text.push_str(&format!("-{ssid}"));
     }
-    Ok(Address::unchecked(text))
+    Ok(Some(Address::unchecked(text)))
 }
 
 fn write_ax25_address(out: &mut Vec<u8>, address: &Address, flags: u8) -> Result<(), EncodeError> {

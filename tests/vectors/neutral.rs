@@ -845,8 +845,19 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             let destination = read_destination(&destination_text)?;
             let path = p.strings("path")?.iter().map(|e| read_path_entry_checked(e)).collect::<Read<Vec<PathEntry>>>()?;
             let diagnostics = p.strings("diagnostics")?.iter().map(|d| read_diagnostic(d)).collect::<Read<Vec<Diagnostic>>>()?;
-            // The header is written before the data, so a header the encoder cannot write back is
-            // refused before the inner data is looked at.
+            // Undecoded data has no neutral form of its bytes: not-encodable, the first of the
+            // refusal reasons, which no header fault outranks.
+            let data = try_read_data(p.required("data", p.get("data"))?);
+            if let Err(e @ Unreadable::Unsupported(_)) = data {
+                return Err(e);
+            }
+            if let Ok(Data::Unrecognized(u)) = &data {
+                if *u != Unrecognized::Empty {
+                    return unsupported("packet.data: undecoded, and its bytes are not in the neutral form".into());
+                }
+            }
+            // A header the encoder cannot write back is refused before the inner data's own
+            // faults are named (invalid-third-party-header comes before them in the refusal order).
             let header_defect = diagnostics.iter().any(|d| {
                 matches!(
                     d.code,
@@ -864,10 +875,9 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
                     "the third-party packet's header cannot be written back".into(),
                 ));
             }
-            let data = try_read_data(p.required("data", p.get("data"))?)?;
+            let data = data?;
             let information = match &data {
-                Data::Unrecognized(Unrecognized::Empty) => Vec::new(),
-                Data::Unrecognized(_) => return unsupported("packet.data: undecoded, and its bytes are not in the neutral form".into()),
+                Data::Unrecognized(_) => Vec::new(),
                 data => data.encode().map_err(|e| Unreadable::Refused(e.code(), format!("the inner packet's data: {e}")))?,
             };
             // Packet is non-exhaustive: start from decoding the information field, then say what the

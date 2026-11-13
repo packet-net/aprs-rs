@@ -9,11 +9,13 @@ use crate::{Code, Diagnostic, HeaderError, ParseOptions, Severity};
 pub(crate) struct Context {
     pub(crate) options: ParseOptions,
     pub(crate) diagnostics: Vec<Diagnostic>,
+    /// How many third-party headers enclose the packet being read.
+    pub(crate) depth: usize,
 }
 
 impl Context {
     pub(crate) fn new(options: ParseOptions) -> Context {
-        Context { options, diagnostics: Vec::new() }
+        Context { options, diagnostics: Vec::new(), depth: 0 }
     }
 
     fn push(&mut self, severity: Severity, code: Code, message: &str, offset: Option<usize>) {

@@ -302,6 +302,19 @@ pub(crate) fn encode_uncompressed(
     if position.ambiguity > 0 && dao.is_some() {
         p.note(EncodeError::new(RefusalCode::FieldNotAllowed, "a !DAO! adds precision to an ambiguous position, which contradicts it"));
     }
+    if (1..=4).contains(&position.ambiguity) {
+        // A position at 90 degrees latitude or 180 degrees longitude has a box centred past it,
+        // which no form holds: a decoder reports the centre.
+        let half = [1u64, 10, 100, 1000, 6000][usize::from(position.ambiguity)] / 2;
+        if cut_to_box(position.latitude, position.ambiguity) + half > 90 * 6000
+            || cut_to_box(position.longitude, position.ambiguity) + half > 180 * 6000
+        {
+            p.note(EncodeError::new(
+                RefusalCode::ValueHasNoForm,
+                "an ambiguous position at 90 degrees latitude or 180 degrees longitude has a box centred past it",
+            ));
+        }
+    }
     let (lat_text, lat_extra) = coordinate(position.latitude, 2, position.ambiguity, dao);
     let (lon_text, lon_extra) = coordinate(position.longitude, 3, position.ambiguity, dao);
     out.extend_from_slice(&lat_text);
@@ -340,6 +353,14 @@ pub(crate) fn dao_digits(position: &Position, base91: bool) -> (u8, u8) {
     (coordinate(position.latitude, 2, 0, Some(base91)).1, coordinate(position.longitude, 3, 0, Some(base91)).1)
 }
 
+/// A position's hundredths of a minute cut to the start of its ambiguity box (1-4 digits
+/// blanked). A value within 1e-6 of a box's edge below it, in boxes, is on the edge.
+pub(crate) fn cut_to_box(degrees: f64, ambiguity: u8) -> u64 {
+    let size = [1.0, 10.0, 100.0, 1000.0, 6000.0][usize::from(ambiguity)];
+    let boxes = degrees.abs() * 6000.0 / size;
+    (libm::floor(boxes + 1e-6) * size) as u64
+}
+
 /// Degrees and minutes to hundredths (`DDMM.hh` or `DDDMM.hh`), with ambiguity blanks, plus the
 /// `!DAO!` digit for the next place when asked for (`Some(base91)`).
 fn coordinate(value: f64, degree_digits: usize, ambiguity: u8, dao: Option<bool>) -> (Vec<u8>, u8) {
@@ -352,9 +373,15 @@ fn coordinate(value: f64, degree_digits: usize, ambiguity: u8, dao: Option<bool>
     };
     // Rounding then blanking keeps the box the position is in, and a decoded position (the centre of
     // its box) writes back the same digits.
-    let mut units = crate::steps::round(value * 60.0 * per_minute) as u64;
-    let extra = (units % extra_base) as u8;
-    units /= extra_base;
+    let (units, extra) = if ambiguity > 0 && dao.is_none() {
+        // An ambiguous position is cut to its box, not rounded and then cut again: a value within a
+        // rounding step of 90 or 180 degrees is in the box below the edge (vectors
+        // interpretations.md, the ambiguity box).
+        (cut_to_box(value, ambiguity), 0)
+    } else {
+        let units = crate::steps::round(value * 60.0 * per_minute) as u64;
+        (units / extra_base, (units % extra_base) as u8)
+    };
     // units is now hundredths of a minute.
     let degrees = units / 6000;
     let hundredths = units % 6000;

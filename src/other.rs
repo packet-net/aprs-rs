@@ -375,11 +375,18 @@ pub(crate) fn capabilities(ctx: &mut Context, info: &[u8]) -> Option<Data> {
     Some(Data::Capabilities(Capabilities { capabilities: items }))
 }
 
+/// How many third-party headers a decoder reads, one inside another.
+const MAX_THIRD_PARTY_DEPTH: usize = 4;
+
 /// `}` and a whole TNC2 packet, decoded with the same options. Its source may be any 1-9
 /// printable ASCII characters other than `>` and `:` (APRS12c ch. 17); a defect its header may
 /// tolerate is a warning on the inner packet, and rejects it when not tolerated.
 pub(crate) fn third_party(ctx: &mut Context, info: &[u8]) -> Option<Data> {
-    match Packet::decode_third_party(&info[1..], ctx.options) {
+    if ctx.depth >= MAX_THIRD_PARTY_DEPTH {
+        ctx.error(Code::InvalidThirdParty, "third-party packets nest at most four deep", Some(1));
+        return None;
+    }
+    match Packet::decode_third_party(&info[1..], ctx.options, ctx.depth + 1) {
         Ok(inner) => Some(Data::ThirdParty(Box::new(inner))),
         Err(_) => {
             ctx.error(Code::InvalidThirdParty, "the third-party header is not SOURCE>DEST,PATH: (APRS12c ch. 17)", Some(1));

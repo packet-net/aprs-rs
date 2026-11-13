@@ -398,9 +398,14 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     // Latitude digits into the destination, blanked for ambiguity: rounding then blanking keeps the
     // box the position is in, and a decoded position (the centre of its box) writes back the same
     // digits.
-    let mut lat_units = crate::steps::round(p.latitude.abs() * 60.0 * per_minute) as u64;
-    let lat_extra = (lat_units % extra_base) as u8;
-    lat_units /= extra_base;
+    // An ambiguous position is cut to its box, not rounded and then cut again (interpretations.md).
+    let cut = p.ambiguity > 0 && dao.is_none();
+    let (lat_units, lat_extra) = if cut {
+        (crate::position::cut_to_box(p.latitude, p.ambiguity), 0)
+    } else {
+        let units = crate::steps::round(p.latitude.abs() * 60.0 * per_minute) as u64;
+        (units / extra_base, (units % extra_base) as u8)
+    };
     // The box, in hundredths of a minute, that each level of ambiguity blanks.
     let box_size = [1u64, 10, 100, 1000, 6000][p.ambiguity as usize];
     if p.ambiguity > 0 && lat_units / box_size * box_size + box_size / 2 > 90 * 6000 {
@@ -410,9 +415,12 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         ));
     }
     let lat_text = format!("{:02}{:02}{:02}", lat_units / 6000, lat_units % 6000 / 100, lat_units % 100);
-    let mut lon_units = crate::steps::round(p.longitude.abs() * 60.0 * per_minute) as u64;
-    let lon_extra = (lon_units % extra_base) as u8;
-    lon_units /= extra_base;
+    let (mut lon_units, lon_extra) = if cut {
+        (crate::position::cut_to_box(p.longitude, p.ambiguity), 0)
+    } else {
+        let units = crate::steps::round(p.longitude.abs() * 60.0 * per_minute) as u64;
+        (units / extra_base, (units % extra_base) as u8)
+    };
     // The longitude digits the ambiguity makes a decoder ignore hold the centre it reports (vectors
     // README, Mic-E).
     if p.ambiguity > 0 {

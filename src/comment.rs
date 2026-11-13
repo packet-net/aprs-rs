@@ -646,12 +646,16 @@ fn find_dao(c: &[u8], telemetry: Option<core::ops::Range<usize>>, joined: Option
 
 fn apply_dao(ctx: &mut Context, fields: &mut Positioned, found: FoundDao, offset: usize) -> bool {
     fields.dao = Some(found.dao);
-    if found.dao.precision == DaoPrecision::None || fields.compressed {
+    if fields.compressed {
         return true;
     }
     if fields.position.ambiguity > 0 {
-        // Extra precision on an ambiguous position contradicts it; the position stays as it was.
-        return ctx.tolerate(Code::DaoWithAmbiguity, "a !DAO! adds precision to an ambiguous position", Some(offset));
+        // A datum on an ambiguous position contradicts it, whatever its precision (`!W  !` too);
+        // the position stays as it was.
+        return ctx.tolerate(Code::DaoWithAmbiguity, "a !DAO! on an ambiguous position", Some(offset));
+    }
+    if found.dao.precision == DaoPrecision::None {
+        return true;
     }
     let p = &mut fields.position;
     p.latitude += if p.latitude.is_sign_negative() { -found.lat / 60.0 } else { found.lat / 60.0 };
