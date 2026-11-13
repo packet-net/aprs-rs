@@ -507,3 +507,12 @@ fn a_builder_names_a_value_out_of_range_before_the_ambiguity_edge() {
     assert_eq!(code(mic().build()), RefusalCode::ValueHasNoForm);
     assert_eq!(code(mic().speed_knots(999.5).build()), RefusalCode::ValueOutOfRange);
 }
+
+#[test]
+fn a_telemetry_builder_names_a_line_break_before_too_many_values() {
+    use pdn_aprs::RefusalCode;
+    let six = [Some(1.0); 6];
+    let code = |b: pdn_aprs::TelemetryBuilder| b.build().unwrap_err().code();
+    assert_eq!(code(me().telemetry(1).analog(&six)), RefusalCode::TooLong);
+    assert_eq!(code(me().telemetry(1).analog(&six).comment("a\rb")), RefusalCode::InvalidCharacter);
+}

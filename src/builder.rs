@@ -1026,18 +1026,28 @@ impl TelemetryBuilder {
         if self.sequence > 999 {
             return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "a telemetry sequence is 0-999, three digits (APRS12c ch. 13)"));
         }
-        if self.analog.len() > 5 {
-            return Err(EncodeError::new(RefusalCode::TooLong, "a telemetry report carries at most 5 analog values (APRS12c ch. 13)"));
-        }
         let mut analog = self.analog.clone();
         analog.resize(5, None);
-        Ok(Data::Telemetry(Telemetry {
+        analog.truncate(5);
+        let data = Data::Telemetry(Telemetry {
             sequence: format!("{:03}", self.sequence),
             analog,
             analog_text: Vec::new(),
             bits: Some(self.bits.clone()),
             comment: self.comment.clone(),
-        }))
+        });
+        if self.analog.len() > 5 {
+            // Too many values is one fault among others, named in the encoder's order: the values
+            // beyond the fifth are left out and the rest is tried, so a fault ranked before
+            // too-long (a line break in the comment) wins.
+            let mut pending = crate::refusal::Pending::default();
+            pending.note(EncodeError::new(RefusalCode::TooLong, "a telemetry report carries at most 5 analog values (APRS12c ch. 13)"));
+            if let Err(e) = data.encode() {
+                pending.note(e);
+            }
+            pending.finish()?;
+        }
+        Ok(data)
     }
 
     /// The packet: the station's header and this report, encoded.

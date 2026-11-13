@@ -14,7 +14,7 @@ Round 3 of the conformance vectors (pinned at cb5dcc0). A record this crate's da
 - A lower-case grid locator in Mic-E or Maidenhead beacon data is `malformed`, as in a status; the builders still write one in upper case.
 - Base-91 telemetry on a weather report has no place, so it is `field-not-allowed` and its own checks (too many values, a value out of range) do not run.
 - A course or speed beside a compressed weather report's wind is judged in the cs-byte checks before `extension-conflict`, so a course of 0 is `value-has-no-form`.
-- Builders refuse in the encoder's order: a value out of range (a course of 360.5, a latitude past 90, a Mic-E speed of 999.5) is `value-out-of-range` before an ambiguous position at 90 or 180 degrees is `value-has-no-form`.
+- The telemetry builder names a fault ranked before too-long (a line break in the comment) ahead of too many analog values; builders in general refuse in the encoder's order: a value out of range (a course of 360.5, a latitude past 90, a Mic-E speed of 999.5) is `value-out-of-range` before an ambiguous position at 90 or 180 degrees is `value-has-no-form`.
 - The vectors runner compares the refusal code a case names, not only that there was a refusal.
 
 ## 1.0.1 (2026-11-12)
