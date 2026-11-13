@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Round 3 of the conformance vectors (pinned at cb5dcc0). A record this crate's data cannot hold (no symbol, an undecoded inner packet) is skipped by the runner, as the dump tool writes it `unsupported`.
+Round 3 of the conformance vectors (pinned at cb5dcc0). Two encode cases (no symbol, an undecoded inner packet) are records this crate's data cannot hold; they are listed in `tests/known-differences.txt`.
 
 - A decoder reads at most four levels of third-party header; a fifth `}` makes the packet holding it `unrecognized` with `error:invalid-third-party`. Decoding a line of thousands of nested `}` no longer overflows the stack.
 - An AX.25 address holding anything but upper-case letters and digits (a lower-case letter is still tolerated) is `invalid-address`, and a call of spaces only is an empty source (`invalid-address`), destination (`empty-destination`) or digipeater (`empty-path-entry`).
@@ -11,11 +11,20 @@ Round 3 of the conformance vectors (pinned at cb5dcc0). A record this crate's da
 - A wind direction in a compressed weather report is judged in whole degrees before it is rounded to the 4-degree step: 360.5 and -0.5 are `value-out-of-range`.
 - Refusal order follows the vectors: more than five analog values in a telemetry report or comment telemetry are `too-long`; a status grid locator that is not upper case is `malformed`; a field that is wanted twice (a PHG, RNG or DFS that loses the one data extension, or a course, speed or wind beside a range or a GGA altitude in the cs bytes) keeps its own range checks, so its refusal can outrank `extension-conflict`; a reply-ack that is wrong on its own is `invalid-message-id` even with no message ID.
 - `StatusBuilder::locator` writes a lower-case locator in upper case; the encoder, given a lower-case locator in data, refuses it.
-- A lower-case grid locator in Mic-E or Maidenhead beacon data is `malformed`, as in a status; the builders still write one in upper case.
+- A lower-case grid locator in Mic-E or Maidenhead beacon data is `malformed`, as in a status.
 - Base-91 telemetry on a weather report has no place, so it is `field-not-allowed` and its own checks (too many values, a value out of range) do not run.
 - A course or speed beside a compressed weather report's wind is judged in the cs-byte checks before `extension-conflict`, so a course of 0 is `value-has-no-form`.
 - The telemetry builder names a fault ranked before too-long (a line break in the comment) ahead of too many analog values; builders in general refuse in the encoder's order: a value out of range (a course of 360.5, a latitude past 90, a Mic-E speed of 999.5) is `value-out-of-range` before an ambiguous position at 90 or 180 degrees is `value-has-no-form`.
 - The vectors runner compares the refusal code a case names, not only that there was a refusal.
+
+### Behaviour changes
+
+For callers of 1.x, in a minor release:
+
+- A lower-case locator in `Status`, `MicE` or `MaidenheadBeacon` data is now refused as `malformed` (a status used to write it in upper case). Only `StatusBuilder::locator` still upper-cases it.
+- An AX.25 address with punctuation or a space inside is now a hard `invalid-address`, even with `ParseOptions::LENIENT`.
+- More than five telemetry analog values are now `too-long` (they were `malformed`).
+- A path entry of spaces only is dropped on decode (with `empty-path-entry`) rather than refused.
 
 ## 1.0.1 (2026-11-12)
 
