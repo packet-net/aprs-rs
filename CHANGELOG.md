@@ -3,9 +3,10 @@
 ## Unreleased
 
 - `Packet::create` (and so every builder's `build`) refuses with `invalid-address` a header that a TNC2 line cannot carry: an address that is not 1-9 letters, digits or `-` (a third-party source such as `PY2SP_R-R` used as an outer source, or an empty address). Before, it built the packet and `to_tnc2()` wrote a line that `decode_tnc2` rejected. This matches the C library, which refuses the same header with the same code. A Mic-E destination is worked out from the report, so it is not checked.
+- A Mic-E builder or encoder writes free text after a voice frequency as a space then the text, and where that would end the status text on a device suffix (` X`) it writes ` /X` instead of joining the text straight on (`144.390MHzX`).
 - README: the conformance statement no longer quotes case counts or "five implementations".
 
-Round 4 of the conformance vectors (pinned at 11e59dfcb730e5e5846629459b081bc26d2395cd). `tests/known-differences.txt` is empty: no case is skipped.
+Round 4 of the conformance vectors (pinned at a405bac71a35a134a955c556d40c3ea23d497ef5). `tests/known-differences.txt` is empty: no case is skipped.
 
 A Mic-E locator followed by base-91 telemetry or a `!DAO!` and then a spaced comment (`` `IO91/G|!:&0'p| DG2MM ``) no longer gives `missing-space-after-locator`: the telemetry is lifted before the locator's space is looked for, so strict accepts it and the comment is `DG2MM`.
 

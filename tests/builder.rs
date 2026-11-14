@@ -553,3 +553,24 @@ fn an_information_field_is_at_most_256_bytes_and_text_has_no_control_characters(
         assert_eq!(me().status(text).build().unwrap_err().code(), RefusalCode::InvalidCharacter, "{text:?}");
     }
 }
+
+/// Free text after a voice frequency follows a space; where that would end the status text on a
+/// device suffix, a `/` goes before it so the text reads back as itself.
+#[test]
+fn a_mic_e_comment_after_a_frequency_that_would_read_as_a_suffix_takes_a_slash() {
+    for (comment, tail) in [("X", " /X"), ("x", " x"), ("ok", " ok"), ("A (8x", " A (8x")] {
+        let line = sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).frequency(144.39).comment(comment).build().unwrap());
+        assert!(line.ends_with(&format!("144.390MHz{tail}")), "{line}");
+        let Data::MicE(m) = heard(&line) else { panic!("{line}") };
+        assert_eq!(m.fields.comment, comment, "{line}");
+        assert_eq!(m.device_suffix, "", "{line}");
+    }
+}
+
+/// A comment such as `X` that something follows (a DAO or telemetry) reads back as itself after a
+/// space, with no `/`.
+#[test]
+fn a_mic_e_comment_that_something_follows_needs_no_slash() {
+    let line = sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).frequency(144.39).comment("X").dao().build().unwrap());
+    assert!(line.contains("144.390MHz X!"), "{line}");
+}

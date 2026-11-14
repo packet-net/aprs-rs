@@ -674,7 +674,18 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     // start of the status text counts: after a type code or telemetry, it is written straight on.
     let status_starts_with_code = text_at == status_start && matches!(text.first(), Some(b'`' | b'\'' | b'>' | b']' | b' ' | 0x1D));
     let separators: &[&[u8]] = if needs_space {
-        &[b" ", b"", b" /"]
+        // After a frequency, free text follows a space. Where that space and the text's end would
+        // read as a device suffix (` X` at the end), the text takes a `/` rather than joining the
+        // frequency: ` /X`.
+        let mut probe = alloc::vec![b' '];
+        probe.extend_from_slice(text);
+        probe.extend_from_slice(&trailer);
+        probe.extend_from_slice(suffix);
+        if deviceid::mic_e_suffix_len(r.type_code.map(|c| c as u8), &probe) > suffix.len() {
+            &[b" ", b" /", b""]
+        } else {
+            &[b" ", b"", b" /"]
+        }
     } else if status_starts_with_code {
         &[b"/"]
     } else {
