@@ -357,6 +357,10 @@ pub struct DfBearing {
 }
 
 /// A storm or hurricane report in an object (APRS12c ch. 12).
+///
+/// The first five fields are required and are digits: a decoder reads storm data only when all of them
+/// are, so it always gives `Some` there, and an encoder refuses a `None` as `missing-field`. The whole
+/// gale radius is optional.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Storm {
     /// What it is.

@@ -129,8 +129,7 @@ pub(crate) fn encode(s: &Status) -> Result<Vec<u8>, EncodeError> {
         }
         out.extend_from_slice(&[b'^', h, pw]);
     }
-    p.size(out.len());
-    p.finish()?;
+    p.finish_faults()?;
     // The text must read back as itself: status text that looks like a timestamp or a grid
     // locator would not.
     let mut ctx = Context::new(ParseOptions::LENIENT);
@@ -142,6 +141,7 @@ pub(crate) fn encode(s: &Status) -> Result<Vec<u8>, EncodeError> {
                     && back.beam == s.beam
                     && back.timestamp == s.timestamp) =>
         {
+            crate::refusal::check_size(out.len())?;
             Ok(out)
         }
         _ => Err(EncodeError::new(

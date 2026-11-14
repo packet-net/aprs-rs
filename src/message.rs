@@ -437,7 +437,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             if labels.iter().any(|l| l.contains(',') || l.contains('{') || crate::text::has_control_character(l.as_bytes())) {
                 p.note(EncodeError::new(
                     RefusalCode::InvalidCharacter,
-                    "telemetry metadata names are without commas, braces or line breaks (APRS12c ch. 13)",
+                    "telemetry metadata names are without commas, braces or control characters (APRS12c ch. 13)",
                 ));
             }
             if labels.len() > 13 {
@@ -469,7 +469,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             if t.project.contains('{') || crate::text::has_control_character(t.project.as_bytes()) {
                 p.note(EncodeError::new(
                     RefusalCode::InvalidCharacter,
-                    "a telemetry project title has no { or line break (APRS12c ch. 13)",
+                    "a telemetry project title has no { or control character (APRS12c ch. 13)",
                 ));
             }
             if t.project.chars().count() > 23 {

@@ -372,7 +372,7 @@ fn build(input: &Value) -> Built<Packet> {
                     return Err(e.into());
                 }
                 (None, _) => {
-                    return Err(NotBuilt::Refused(RefusalCode::MissingField, "a telemetry report needs a sequence number".into()));
+                    return Err(NotBuilt::Tool(RefusalCode::MissingField, "a telemetry report needs a sequence number".into()));
                 }
             }
         }
@@ -419,6 +419,11 @@ fn build(input: &Value) -> Built<Packet> {
 
 fn station(v: &Value) -> Built<Station> {
     let text = |k: &str| v.get(k).and_then(Value::as_str);
+    // A recipe with no `station` is from N0CALL (vectors README, Build records); the destination and path are
+    // the builder's own defaults.
+    if v.is_null() {
+        return Station::new("N0CALL").map_err(|e| NotBuilt::Refused(RefusalCode::InvalidAddress, e.to_string()));
+    }
     let refused = |e: pdn_aprs::InvalidAddress| NotBuilt::Refused(RefusalCode::InvalidAddress, e.to_string());
     let mut station = Station::new(text("source").unwrap_or("")).map_err(refused)?;
     if let Some(d) = text("destination") {
@@ -649,9 +654,16 @@ fn weather(station: &Station, args: &Args) -> Built<Packet> {
 fn settled(input: &Value) -> Built<Packet> {
     neutral::clear_deferred();
     let result = build(input);
+    // A refusal the tool made itself (a sequence left out, which the builder takes as an argument) stays the
+    // tool's when it is the one that settles.
+    let mut own_tool = false;
     let (code, why) = match &result {
         Ok(_) => (None, String::new()),
         Err(NotBuilt::Refused(code, why)) => (Some(*code), why.clone()),
+        Err(NotBuilt::Tool(code, why)) => {
+            own_tool = true;
+            (Some(*code), why.clone())
+        }
         // A record the builder cannot say stays unsupported whatever else the reader noted.
         Err(_) => {
             neutral::clear_deferred();
@@ -664,6 +676,7 @@ fn settled(input: &Value) -> Built<Packet> {
     }) {
         Ok(result) => result,
         Err((code, why, true)) => Err(NotBuilt::Tool(code, why)),
+        Err((c, w, false)) if own_tool && Some(c) == code => Err(NotBuilt::Tool(c, w)),
         Err((code, why, false)) => Err(NotBuilt::Refused(code, why)),
     }
 }

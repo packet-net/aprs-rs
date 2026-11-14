@@ -96,8 +96,14 @@ pub(crate) fn decode(ctx: &mut Context, fields: &mut Positioned, cs: Option<Cs>,
             // The wind is decided here, where the extension belongs, before any field is read
             // (vectors README, "The order of checks"): sent as c and s fields in its place, or
             // missing. After a compressed position the cs bytes say it is unknown, not missing.
-            let probe =
-                weather::fields(&mut Context::new(ParseOptions::LENIENT), bytes, offset, &mut Weather::default(), weather::Wind::AsFields);
+            let probe = weather::fields(
+                &mut Context::new(ParseOptions::LENIENT),
+                bytes,
+                offset,
+                &mut Weather::default(),
+                weather::Wind::AsFields,
+                weather_end(&bytes[at..]) + at,
+            );
             // The wind comes as fields once a c field is read (an s is only the speed after one).
             let (direction, speed) = probe.map_or((false, false), |r| (r.direction, r.speed));
             if direction
@@ -125,7 +131,7 @@ pub(crate) fn decode(ctx: &mut Context, fields: &mut Positioned, cs: Option<Cs>,
             }
             weather::Wind::AsFields
         };
-        let Some(run) = weather::fields(ctx, &bytes[at..], offset + at, &mut weather, wind) else {
+        let Some(run) = weather::fields(ctx, &bytes[at..], offset + at, &mut weather, wind, weather_end(&bytes[at..])) else {
             return false;
         };
         at += run.len;
@@ -154,6 +160,12 @@ pub(crate) fn decode(ctx: &mut Context, fields: &mut Positioned, cs: Option<Cs>,
         }
     }
     tail(ctx, fields, &bytes[at..], offset + at, None)
+}
+
+/// Where the weather text of a positioned report ends in `bytes`: the start of the trailing base-91
+/// telemetry or `!DAO!` that is lifted out first, or the end of the bytes.
+fn weather_end(bytes: &[u8]) -> usize {
+    telemetry_and_dao_spans(bytes).last().map_or(bytes.len(), |r| r.start)
 }
 
 /// After a position's weather data: base-91 telemetry and a `!DAO!` are lifted out first, and
@@ -492,13 +504,8 @@ fn storm(bytes: &[u8]) -> Option<(Storm, usize)> {
             return None;
         }
         let v = &b[1..];
-        if text::all_digits(v) {
-            Some(Some(text::digits(v) as u16))
-        } else if v.iter().all(|&x| x == b'.' || x == b' ') {
-            Some(None)
-        } else {
-            None
-        }
+        // Storm fields are digits: not dots or spaces, unlike a weather value.
+        if text::all_digits(v) { Some(Some(text::digits(v) as u16)) } else { None }
     };
     let sustained = field(3, b'/', 3)?;
     let gust = field(7, b'^', 3)?;

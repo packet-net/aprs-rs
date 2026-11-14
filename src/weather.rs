@@ -40,8 +40,10 @@ pub(crate) struct Run {
 /// speed until the speed is known (see [`Wind`]), and snowfall otherwise; `L` and `l` are one
 /// field, luminosity. The run stops at the first thing that is not a field, at a defined field
 /// already read, and at `c` once the wind direction is known. Extra fields are kept as a list, so
-/// a repeated extra letter does not stop it.
-pub(crate) fn fields(ctx: &mut Context, bytes: &[u8], offset: usize, weather: &mut Weather, wind: Wind) -> Option<Run> {
+/// a repeated extra letter does not stop it. `end` is where the weather text ends: the length of
+/// `bytes`, or in a positioned report the start of the trailing base-91 telemetry or `!DAO!` that is
+/// lifted first (the end a run-on value is judged against).
+pub(crate) fn fields(ctx: &mut Context, bytes: &[u8], offset: usize, weather: &mut Weather, wind: Wind, end: usize) -> Option<Run> {
     let mut at = 0;
     // Fields read so far, by the field rather than the letter: snowfall is `S`, to keep it apart
     // from the wind speed `s`, and both luminosity letters are `L`.
@@ -80,7 +82,7 @@ pub(crate) fn fields(ctx: &mut Context, bytes: &[u8], offset: usize, weather: &m
                 let mut read = seen.clone();
                 read.push(key);
                 let state = (direction_known || letter == b'c', speed_known || letter == b's');
-                let goes_on = next == bytes.len() || reads_next(bytes, next, &read, state, wind, run.direction || letter == b'c');
+                let goes_on = next >= end.min(bytes.len()) || reads_next(bytes, next, &read, state, wind, run.direction || letter == b'c');
                 if goes_on {
                     if !ctx.tolerate(
                         Code::OutOfRangeValue,

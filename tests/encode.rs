@@ -83,3 +83,27 @@ fn a_value_that_is_not_a_number_is_named_before_the_faults_after_it() {
     let nmea = Nmea { sentence: "GPVTG,318.7,T".into(), course_degrees: Some(f64::NAN), comment: "a\rb".into(), ..Nmea::default() };
     assert_eq!(code(Data::Nmea(nmea)), RefusalCode::NotANumber);
 }
+
+/// Writing out a packet the program already holds is not encoding: the field passes through as it
+/// stands, over 256 bytes included, while the encoder refuses it with its own code.
+#[test]
+fn writing_out_a_held_packet_does_not_check_the_size() {
+    let mut line = b"N0CALL>APZ001:>".to_vec();
+    line.extend(core::iter::repeat_n(b'x', 300));
+    let packet = Packet::decode_tnc2(&line, ParseOptions::LENIENT).unwrap();
+    assert_eq!(packet.to_tnc2(), line);
+    assert!(packet.to_ax25().is_ok());
+    let refused = packet.data.encode().unwrap_err();
+    assert_eq!(refused.code(), pdn_aprs::RefusalCode::InformationFieldTooLong);
+}
+
+/// Storm fields are digits: an absent required one is refused, and none is written as dots.
+#[test]
+fn storm_data_missing_a_field_is_missing_field() {
+    let line = b"N0CALL>APZ001:;BRENDA   *100045z4905.50NA07201.75W@101/047/HC/104^123/0980>065&022";
+    let packet = Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+    let Data::Object(mut object) = packet.data.clone() else { panic!("an object") };
+    object.fields.storm.as_mut().expect("storm data").gust_knots = None;
+    let refused = Data::Object(object).encode().unwrap_err();
+    assert_eq!(refused.code(), pdn_aprs::RefusalCode::MissingField);
+}

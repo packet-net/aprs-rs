@@ -380,7 +380,7 @@ impl std::fmt::Display for Unreadable {
 type Read<T> = Result<T, Unreadable>;
 
 /// The Refusal reasons order (vectors README): the first code that applies is the one named.
-pub const ORDER: [&str; 26] = [
+pub const ORDER: [&str; 27] = [
     "not-encodable",
     "invalid-address",
     "ax25-cannot-carry",
@@ -407,6 +407,7 @@ pub const ORDER: [&str; 26] = [
     "value-given-twice",
     "text-reads-as-field",
     "does-not-read-back",
+    "information-field-too-long",
 ];
 
 /// Where a refusal code comes in the order.
@@ -415,9 +416,9 @@ pub fn rank(code: pdn_aprs::RefusalCode) -> usize {
 }
 
 /// Whether a refusal is only the information field's 256 bytes, the last check of all: a field over its own
-/// limit is `too-long` at its place in the order, but this one comes after every other code.
-pub fn is_size(code: pdn_aprs::RefusalCode, message: &str) -> bool {
-    code == pdn_aprs::RefusalCode::TooLong && message.starts_with("the information field is at most")
+/// limit is `too-long` at its place in the order, but this one has its own code and comes after every other.
+pub fn is_size(code: pdn_aprs::RefusalCode, _message: &str) -> bool {
+    code == pdn_aprs::RefusalCode::InformationFieldTooLong
 }
 
 thread_local! {

@@ -351,7 +351,7 @@ fn settle(station: &Station, data: Data, missing: Vec<EncodeError>) -> Result<Da
         return Ok(data);
     };
     match station.packet(data) {
-        Err(e) if !e.is_size() && e.code().precedes(first.code()) => Err(e),
+        Err(e) if e.code().precedes(first.code()) => Err(e),
         _ => Err(first),
     }
 }
@@ -1077,7 +1077,7 @@ impl TelemetryBuilder {
         if self.analog.len() > 5 {
             // Too many values is one fault among others, named in the encoder's order: the values
             // beyond the fifth are left out and the rest is tried, so a fault ranked before
-            // too-long (a line break in the comment) wins.
+            // too-long (a control character in the comment) wins.
             let mut pending = crate::refusal::Pending::default();
             pending.note(EncodeError::new(RefusalCode::TooLong, "a telemetry report carries at most 5 analog values (APRS12c ch. 13)"));
             if let Err(e) = data.encode() {

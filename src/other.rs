@@ -38,7 +38,7 @@ pub(crate) fn positionless_weather(ctx: &mut Context, info: &[u8]) -> Option<Dat
         return None;
     }
     let mut weather = Weather::default();
-    let at = 9 + weather::fields(ctx, &info[9..], 9, &mut weather, weather::Wind::Positionless)?.len;
+    let at = 9 + weather::fields(ctx, &info[9..], 9, &mut weather, weather::Wind::Positionless, usize::MAX)?.len;
     let rest = &info[at..];
     let mut comment = String::new();
     if !weather::software_and_unit(rest, &mut weather) && !rest.is_empty() {

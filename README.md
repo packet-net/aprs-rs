@@ -2,11 +2,11 @@
 
 An APRS (Automatic Packet Reporting System) encoder and decoder in Rust. It covers every APRS 1.2 data type in [APRS12c](https://github.com/wb2osz/aprsspec), from TNC2 / APRS-IS text lines or AX.25 UI frames. It is `no_std` with `alloc`, and has no `unsafe`.
 
-Conforms to [aprs-vectors](https://github.com/packet-net/aprs-vectors) 1.2: every case passes, apart from two encode cases (below) that this crate's data cannot hold.
+Conforms to [aprs-vectors](https://github.com/packet-net/aprs-vectors) 1.2: every case passes.
 
 - **Decoding never fails because of the information field.** Every deviation from the spec becomes a [`Diagnostic`] with a stable [`Code`], and the rest of the packet is still read where it can be.
 - **Strict or lenient, one defect at a time.** [`ParseOptions`] says which of the 33 tolerable defects to accept: lower-case hemispheres, unpadded object names, text after weather data, and so on. [`ParseOptions::LENIENT`] (the default) accepts them all, each with a warning. [`ParseOptions::STRICT`] accepts none. Any single one can be switched off.
-- **The encoder writes only what the spec allows.** It checks free text by decoding what it wrote: a comment that would read back as something else, such as an altitude, a data extension or a `!DAO!`, is escaped or refused rather than silently changed. It refuses an information field over 256 bytes (`too-long`, counted in bytes, whatever the output) and text that holds a control character (`invalid-character`). Decoding has no size limit, and a control character in text decodes with a `control-character-in-text` warning.
+- **The encoder writes only what the spec allows.** It checks free text by decoding what it wrote: a comment that would read back as something else, such as an altitude, a data extension or a `!DAO!`, is escaped or refused rather than silently changed. It refuses an information field over 256 bytes (`information-field-too-long`, counted in bytes; `Packet::to_tnc2` and `Packet::to_ax25` only write out a packet you already hold and do not check the size) and text that holds a control character (`invalid-character`). Decoding has no size limit, and a control character in text decodes with a `control-character-in-text` warning.
 
 It is built and tested against the language-neutral conformance vectors in [packet-net/aprs-vectors](https://github.com/packet-net/aprs-vectors), the same cases the C# implementation, [Packet.Aprs](https://www.nuget.org/packages/Packet.Aprs), runs.
 

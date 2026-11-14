@@ -801,7 +801,7 @@ fn whole(v: Option<f64>, what: &str) -> Result<Option<u32>, EncodeError> {
 
 fn storm_value(out: &mut Vec<u8>, v: Option<u16>, width: usize) -> Result<(), EncodeError> {
     match v {
-        None => out.extend(core::iter::repeat_n(b'.', width)),
+        None => return Err(EncodeError::new(RefusalCode::MissingField, "storm data needs all of its required fields (APRS12c ch. 12)")),
         Some(v) if u32::from(v) < 10u32.pow(width as u32) => push_digits(out, u32::from(v), width),
         Some(_) => return Err(EncodeError::new(RefusalCode::ValueOutOfRange, "a storm value does not fit its field")),
     }

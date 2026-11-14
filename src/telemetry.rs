@@ -84,6 +84,11 @@ pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
         p.note(EncodeError::new(RefusalCode::MissingField, "a telemetry report carries a sequence (APRS12c ch. 13)"));
     } else if !t.sequence.bytes().all(|b| b.is_ascii_alphanumeric()) {
         p.note(EncodeError::new(RefusalCode::Malformed, "a telemetry sequence is letters and digits"));
+    } else if t.sequence != "MIC" && t.sequence.starts_with("MIC") {
+        p.note(EncodeError::new(
+            RefusalCode::Malformed,
+            "a telemetry sequence that starts MIC is MIC itself, which would read back as MIC and a value",
+        ));
     }
     if t.analog.len() > 5 {
         p.note(EncodeError::new(RefusalCode::TooLong, "a telemetry report carries 5 analog values (APRS12c ch. 13)"));
@@ -124,8 +129,7 @@ pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
     }
     out.extend_from_slice(t.bits.as_deref().unwrap_or_default().as_bytes());
     out.extend_from_slice(t.comment.as_bytes());
-    p.size(out.len());
-    p.finish()?;
+    p.finish_faults()?;
     // A sequence that starts MIC but is not MIC would not read back, for one.
     let mut ctx = Context::new(ParseOptions::LENIENT);
     match report(&mut ctx, &out) {
@@ -140,11 +144,9 @@ pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
                     _ => false,
                 }) =>
         {
+            crate::refusal::check_size(out.len())?;
             Ok(out)
         }
-        _ => Err(EncodeError::new(
-            RefusalCode::TextReadsAsField,
-            "the telemetry report would not read back as given (a sequence starting MIC is MIC itself)",
-        )),
+        _ => Err(EncodeError::new(RefusalCode::TextReadsAsField, "the telemetry report would not read back as given")),
     }
 }

@@ -547,8 +547,8 @@ fn an_information_field_is_at_most_256_bytes_and_text_has_no_control_characters(
     use pdn_aprs::RefusalCode;
     // `>` and 255 bytes of status text is 256; one more is refused, as UTF-8 bytes.
     assert!(me().status(&"x".repeat(255)).build().is_ok());
-    assert_eq!(me().status(&"x".repeat(256)).build().unwrap_err().code(), RefusalCode::TooLong);
-    assert_eq!(me().status(&"\u{e9}".repeat(128)).build().unwrap_err().code(), RefusalCode::TooLong);
+    assert_eq!(me().status(&"x".repeat(256)).build().unwrap_err().code(), RefusalCode::InformationFieldTooLong);
+    assert_eq!(me().status(&"\u{e9}".repeat(128)).build().unwrap_err().code(), RefusalCode::InformationFieldTooLong);
     for text in ["a\tb", "a\u{7f}b", "a\u{1}b"] {
         assert_eq!(me().status(text).build().unwrap_err().code(), RefusalCode::InvalidCharacter, "{text:?}");
     }
