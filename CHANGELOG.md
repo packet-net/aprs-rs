@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 (2026-11-14)
 
 Round 3 of the conformance vectors (pinned at 10d4e25). Two encode cases (no symbol, an undecoded inner packet) are records this crate's data cannot hold; they are listed in `tests/known-differences.txt`.
 

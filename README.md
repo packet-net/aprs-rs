@@ -2,7 +2,7 @@
 
 An APRS (Automatic Packet Reporting System) encoder and decoder in Rust. It covers every APRS 1.2 data type in [APRS12c](https://github.com/wb2osz/aprsspec), from TNC2 / APRS-IS text lines or AX.25 UI frames. It is `no_std` with `alloc`, and has no `unsafe`.
 
-Conforms to [aprs-vectors](https://github.com/packet-net/aprs-vectors) 1.0: every case passes.
+Conforms to [aprs-vectors](https://github.com/packet-net/aprs-vectors) 1.1: every case passes.
 
 - **Decoding never fails because of the information field.** Every deviation from the spec becomes a [`Diagnostic`] with a stable [`Code`], and the rest of the packet is still read where it can be.
 - **Strict or lenient, one defect at a time.** [`ParseOptions`] says which of the 32 tolerable defects to accept: lower-case hemispheres, unpadded object names, text after weather data, and so on. [`ParseOptions::LENIENT`] (the default) accepts them all, each with a warning. [`ParseOptions::STRICT`] accepts none. Any single one can be switched off.
