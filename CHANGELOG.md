@@ -28,7 +28,7 @@ A Mic-E locator followed by base-91 telemetry or a `!DAO!` and then a spaced com
 
 ### Breaking changes for callers
 
-- An encoder or builder refuses an information field over 256 bytes (`too-long`); text with a control character is refused (`invalid-character`); a decoder gives `warning:control-character-in-text`, so a strict decoder now rejects such packets; a run-on weather value before a defined field is dropped with `out-of-range-value`.
+- An encoder or builder refuses an information field over 256 bytes (`information-field-too-long`); text with a control character is refused (`invalid-character`); a decoder gives `warning:control-character-in-text`, so a strict decoder now rejects such packets; a run-on weather value before a defined field is dropped with `out-of-range-value`.
 - A position, object, item or Mic-E report built with no symbol is refused as `invalid-symbol` instead of `missing-field`.
 - A Mic-E report built with an altitude in feet puts it in the Mic-E altitude bytes, rounded to the metre, instead of a `/A=` in the status text; an altitude outside the Mic-E range is refused instead of moved to a `/A=`.
 - Neutral Mic-E data of -50000 ft is written as `/A=-50000` instead of refused; neutral Mic-E altitudes that are neither whole feet nor whole metres (100.5 ft) go in the Mic-E bytes instead of a rounded `/A=`.
