@@ -428,13 +428,13 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                 }
             }
             addressee(&mut out, &b.addressee, &mut p);
-            // NWS bulletin text has no length limit; the 67 characters are for messages and other bulletins.
+            // NWS bulletin text has no length limit of its own (only the information field's 256 bytes); the 67 characters are for messages and other bulletins.
             message_text(&mut out, &b.text, !nws, &mut p);
             id_and_reply(&mut out, &b.message_id, &None, &mut p);
         }
         Data::TelemetryNames(TelemetryNames { addressee: to, names: labels, message_id })
         | Data::TelemetryUnits(TelemetryUnits { addressee: to, units: labels, message_id }) => {
-            if labels.iter().any(|l| l.contains(',') || l.contains('{') || crate::text::has_line_break(l.as_bytes())) {
+            if labels.iter().any(|l| l.contains(',') || l.contains('{') || crate::text::has_control_character(l.as_bytes())) {
                 p.note(EncodeError::new(
                     RefusalCode::InvalidCharacter,
                     "telemetry metadata names are without commas, braces or line breaks (APRS12c ch. 13)",
@@ -466,7 +466,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             id_and_reply(&mut out, &t.message_id, &None, &mut p);
         }
         Data::TelemetryBits(t) => {
-            if t.project.contains('{') || crate::text::has_line_break(t.project.as_bytes()) {
+            if t.project.contains('{') || crate::text::has_control_character(t.project.as_bytes()) {
                 p.note(EncodeError::new(
                     RefusalCode::InvalidCharacter,
                     "a telemetry project title has no { or line break (APRS12c ch. 13)",
@@ -518,6 +518,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
         }
         _ => return Err(EncodeError::new(RefusalCode::NotEncodable, "not a message")),
     }
+    p.size(out.len());
     p.finish()?;
     // What was written must read back as what was given: a message whose text looks like an ack,
     // telemetry metadata or a query, or whose addressee makes it a bulletin, would not.
@@ -566,8 +567,8 @@ fn message_text(out: &mut Vec<u8>, t: &str, limited: bool, p: &mut Pending) {
             "message text must not contain '{', which starts the message ID (APRS12c ch. 14)",
         ));
     }
-    if crate::text::has_line_break(t.as_bytes()) {
-        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "message text cannot contain a line break"));
+    if crate::text::has_control_character(t.as_bytes()) {
+        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "message text cannot contain a control character"));
     }
     if limited && t.chars().count() > MAX_TEXT {
         p.note(EncodeError::new(RefusalCode::TooLong, "message text is limited to 67 characters (APRS12c ch. 14)"));

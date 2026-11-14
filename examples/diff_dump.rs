@@ -611,7 +611,12 @@ fn build(input: &Value) -> Built<Packet> {
             b.build()?
         }
         "telemetry" => {
-            let mut b = station.telemetry(args.whole::<u16>("sequence", "a number 0-65535")?.unwrap_or(0));
+            // The builder takes the sequence as an argument, so one left out cannot be built: it is the
+            // refusal the rules give, not a default of 0.
+            let Some(sequence) = args.whole::<u16>("sequence", "a number 0-65535")? else {
+                return Err(NotBuilt::Refused(RefusalCode::MissingField, "a telemetry report needs a sequence number".into()));
+            };
+            let mut b = station.telemetry(sequence);
             if let Some(a) = args.get("analog") {
                 let Some(a) = a.as_array() else { return unsupported("analog: not a list") };
                 // A channel may be empty on its own, and the ones not given are sent empty.

@@ -27,7 +27,7 @@ fn a_mic_e_comment_after_a_space_where_only_that_reads_back() {
         fields: pdn_aprs::Positioned {
             position: pdn_aprs::Position { latitude: 33.46, longitude: -2.69, ambiguity: 0 },
             symbol: pdn_aprs::Symbol::CAR,
-            altitude_feet: Some(100.5),
+            altitude_feet: Some(101.0),
             comment: "{5}".into(),
             ..Default::default()
         },

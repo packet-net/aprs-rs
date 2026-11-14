@@ -1,5 +1,6 @@
 //! Refusal reason codes: why an encoder or builder would not write the data as given.
 
+use alloc::format;
 use core::fmt;
 
 /// Why data was refused. The ids match the `refusals` list in the conformance vectors' `codes.json`.
@@ -24,11 +25,11 @@ pub enum RefusalCode {
     InvalidMessageId,
     /// Text starts or ends with a space that would be read back as padding.
     PaddingSpace,
-    /// Free text or a list is longer than its field allows.
+    /// Free text or a list is longer than its field allows, or the information field is over 256 bytes.
     TooLong,
     /// Text in a fixed-form field is not that form (a locator, a bit sense, a capability token).
     Malformed,
-    /// Free text holds a character its field cannot carry, such as a line break.
+    /// Free text holds a character its field cannot carry, such as a control character (a byte below 0x20 or 0x7F).
     InvalidCharacter,
     /// Free text would read back as a structured element and no clean form avoids it.
     TextReadsAsField,
@@ -142,6 +143,9 @@ impl fmt::Display for RefusalCode {
     }
 }
 
+/// The longest information field an encoder writes, in bytes.
+pub(crate) const MAX_INFORMATION_FIELD: usize = 256;
+
 /// The order in which a refusal with several faults names its code (vectors DESIGN.md, ruling 1):
 /// the first code that applies.
 const ORDER: [RefusalCode; 26] = [
@@ -174,6 +178,11 @@ const ORDER: [RefusalCode; 26] = [
 ];
 
 impl RefusalCode {
+    /// Whether this code comes before `other` in the order a refusal with several faults names its code.
+    pub(crate) fn precedes(self, other: RefusalCode) -> bool {
+        self.rank() < other.rank()
+    }
+
     fn rank(self) -> usize {
         ORDER.iter().position(|c| *c == self).unwrap_or(ORDER.len())
     }
@@ -200,6 +209,16 @@ impl Pending {
                 self.note(e);
                 None
             }
+        }
+    }
+
+    /// Notes `too-long` when the information field, `bytes` long, is over 256 bytes.
+    pub(crate) fn size(&mut self, bytes: usize) {
+        if bytes > MAX_INFORMATION_FIELD {
+            self.note(crate::EncodeError::new(
+                RefusalCode::TooLong,
+                format!("the information field is at most {MAX_INFORMATION_FIELD} bytes, and this one is {bytes}"),
+            ));
         }
     }
 

@@ -341,7 +341,8 @@ fn footprint_text(value: f64, text: &str, limit: f64, what: &str) -> Result<Stri
 
 /// `TOKEN,TOKEN=VALUE,...`.
 pub(crate) fn capabilities(ctx: &mut Context, info: &[u8]) -> Option<Data> {
-    let body = text::decode(ctx, &info[1..], 1)?;
+    // A control character in a token makes the report free text; one in a value is text, judged after.
+    let body = text::decode_unjudged(ctx, &info[1..], 1)?;
     // TOKEN or TOKEN=VALUE items, separated by commas and split at the first '='. The spaces
     // (U+0020 only) around an item, a token or a value are padding, not part of them.
     let pad = |t: &str| t.trim_matches(' ').to_string();
@@ -369,6 +370,11 @@ pub(crate) fn capabilities(ctx: &mut Context, info: &[u8]) -> Option<Data> {
             "a capabilities packet holds free text rather than TOKEN / TOKEN=VALUE items (APRS12c ch. 15)",
             Some(1),
         )
+    {
+        return None;
+    }
+    if items.iter().any(|(_, v)| v.as_ref().is_some_and(|v| text::has_control_character(v.as_bytes())))
+        && !ctx.tolerate(Code::ControlCharacterInText, "text holds a control character (a byte below 0x20 or 0x7F)", Some(1))
     {
         return None;
     }
@@ -404,7 +410,7 @@ pub(crate) fn user_defined(ctx: &mut Context, info: &[u8]) -> Option<Data> {
 }
 
 pub(crate) fn test_data(ctx: &mut Context, info: &[u8]) -> Option<Data> {
-    Some(Data::Test(TestData { data: text::decode(ctx, &info[1..], 1)? }))
+    Some(Data::Test(TestData { data: text::decode_unjudged(ctx, &info[1..], 1)? }))
 }
 
 /// `%bbb/q`, exactly: a bearing of 000 to 360 and a quality digit (APRS12c Appendix 1).
@@ -421,8 +427,15 @@ pub(crate) fn agrelo(ctx: &mut Context, info: &[u8]) -> Option<Data> {
 
 pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
     let printable = |t: &str, what: &str| -> Result<(), EncodeError> {
+        if crate::text::has_control_character(t.as_bytes()) {
+            return Err(EncodeError::new(RefusalCode::InvalidCharacter, format!("{what} cannot contain a control character")));
+        }
+        Ok(())
+    };
+    // Test data is data, not text: only a line break would not read back.
+    let test_data = |t: &str| -> Result<(), EncodeError> {
         if crate::text::has_line_break(t.as_bytes()) {
-            return Err(EncodeError::new(RefusalCode::InvalidCharacter, format!("{what} cannot contain a line break")));
+            return Err(EncodeError::new(RefusalCode::InvalidCharacter, "test data cannot contain a line break"));
         }
         Ok(())
     };
@@ -457,6 +470,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             p.run(weather::field(&mut out, b'c', direction, 3, false));
             p.run(weather::field(&mut out, b's', w.weather.wind_speed_mph, 3, false));
             weather::write_fields(&mut out, &w.weather, &mut p);
+            p.size(out.len());
             p.finish()?;
             // The software type and unit, and the extra fields, must not read back as fields.
             match positionless_weather(&mut Context::new(ParseOptions::LENIENT), &out) {
@@ -488,11 +502,12 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                 p.note(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 upper-case characters, e.g. IO91 or IO91SX"));
             }
             p.run(printable(&m.comment, "a beacon comment"));
-            p.finish()?;
             out.push(b'[');
             out.extend_from_slice(m.locator.as_bytes());
             out.push(b']');
             out.extend_from_slice(m.comment.as_bytes());
+            p.size(out.len());
+            p.finish()?;
         }
         Data::Query(q) => {
             let mut p = Pending::default();
@@ -516,6 +531,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                 let longitude = p.run(footprint_text(f.longitude, &f.longitude_text, 180.0, "longitude")).unwrap_or_default();
                 out.extend_from_slice(format!("{latitude},{longitude},{:04}", radius as u32).as_bytes());
             }
+            p.size(out.len());
             p.finish()?;
         }
         Data::Capabilities(c) => {
@@ -541,7 +557,6 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                     }
                 }
             }
-            p.finish()?;
             out.push(b'<');
             let items: Vec<String> = c
                 .capabilities
@@ -552,6 +567,8 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                 })
                 .collect();
             out.extend_from_slice(items.join(",").as_bytes());
+            p.size(out.len());
+            p.finish()?;
         }
         Data::ThirdParty(p) => {
             // Counted by walking the chain, not by recursing: a caller can build one thousands deep.
@@ -578,6 +595,10 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                     "a third-party packet's information field cannot end with a line break",
                 ));
             }
+            // The limit is on the outermost field: the `}`, the inner header and the inner field.
+            let mut size = Pending::default();
+            size.size(out.len());
+            size.finish()?;
         }
         Data::UserDefined(u) => {
             // APRS12c ch. 19 puts no restriction on user-defined data, these two characters
@@ -601,7 +622,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             }
         }
         Data::Test(t) => {
-            printable(&t.data, "test data")?;
+            test_data(&t.data)?;
             out.push(b',');
             out.extend_from_slice(t.data.as_bytes());
         }
@@ -614,6 +635,10 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
         Data::Unrecognized(_) => return Err(EncodeError::new(RefusalCode::NotEncodable, "undecoded data has nothing to encode")),
         _ => return Err(EncodeError::new(RefusalCode::NotEncodable, "not one of the other data types")),
     }
+    // Whatever the data, the information field is at most 256 bytes.
+    let mut size = Pending::default();
+    size.size(out.len());
+    size.finish()?;
     Ok(out)
 }
 
@@ -628,8 +653,8 @@ fn encode_nmea(n: &Nmea) -> Result<Vec<u8>, EncodeError> {
             p.note(EncodeError::new(RefusalCode::NotANumber, "an NMEA field is not a number"));
         }
     }
-    if text::has_line_break(n.comment.as_bytes()) {
-        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "an NMEA comment cannot contain a line break"));
+    if text::has_control_character(n.comment.as_bytes()) {
+        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "an NMEA comment cannot contain a control character"));
     }
     // $ULTW is raw weather, not NMEA, so such a sentence would not read back.
     match nmea_sentence(sentence).filter(|s| s.len == sentence.len() && !n.sentence.starts_with("ULTW")) {
@@ -682,6 +707,7 @@ fn encode_nmea(n: &Nmea) -> Result<Vec<u8>, EncodeError> {
             }
         }
     }
+    p.size(1 + sentence.len() + n.comment.len());
     p.finish()?;
     let mut out = Vec::with_capacity(1 + sentence.len() + n.comment.len());
     out.push(b'$');

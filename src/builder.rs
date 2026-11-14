@@ -292,7 +292,7 @@ impl Common {
             .position
             .ok_or_else(|| EncodeError::new(RefusalCode::MissingField, format!("{what} needs a position: call at(latitude, longitude)")))?;
         let symbol = self.symbol.ok_or_else(|| {
-            EncodeError::new(RefusalCode::MissingField, format!("{what} needs a symbol: call symbol(...), e.g. symbol(Symbol::CAR)"))
+            EncodeError::new(RefusalCode::InvalidSymbol, format!("{what} needs a symbol: call symbol(...), e.g. symbol(Symbol::CAR)"))
         })?;
         let mut fields = self.fields.clone();
         // An ambiguous position reports the box that holds it: its digits cut, not rounded, then
@@ -312,6 +312,11 @@ impl Common {
             } else {
                 metres * crate::comment::METRES_TO_FEET
             });
+        } else if mic_e {
+            // An altitude in feet goes in the Mic-E altitude bytes too, rounded once to the nearest metre.
+            if let Some(feet) = fields.altitude_feet {
+                fields.altitude_feet = Some(crate::steps::round(feet / crate::comment::METRES_TO_FEET) * crate::comment::METRES_TO_FEET);
+            }
         }
         // A course that rounds to 0 is the spec's unknown course, which Mic-E sends as 0 (APRS12c ch. 10).
         if mic_e && fields.course_degrees.is_some_and(|c| crate::steps::round(c) == 0.0) {
@@ -414,7 +419,8 @@ macro_rules! positioned_methods {
             self.speed_knots(kilometres_per_hour / 1.852)
         }
 
-        /// Altitude above mean sea level in feet (`/A=`), sent to the nearest foot.
+        /// Altitude above mean sea level in feet (`/A=`), sent to the nearest foot. A Mic-E report
+        /// carries it in its altitude bytes, rounded once to the nearest metre.
         pub fn altitude_feet(mut self, feet: f64) -> Self {
             self.common.fields.altitude_feet = Some(feet);
             self.common.altitude_m = None;
@@ -661,31 +667,36 @@ impl MicEBuilder {
 
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
-        Ok(Data::MicE(MicEReport {
+        let fields = self.common.positioned("a Mic-E report", true)?;
+        let report = |fields: Positioned| MicEReport {
             mic_e_message: self.mic_e_message,
             // The type code says whether the station can message (APRS 1.2 Mic-E type codes).
             type_code: Some(if self.messaging { '`' } else { '\'' }),
-            // An altitude given in feet goes in a `/A=`, one in metres in the Mic-E altitude bytes.
-            altitude_in_comment: self.common.altitude_m.is_none() && self.common.fields.altitude_feet.is_some(),
-            fields: {
-                let fields = self.common.positioned("a Mic-E report", true)?;
-                self.common.box_fault(&fields, |fields| {
-                    Data::MicE(MicEReport {
-                        mic_e_message: self.mic_e_message,
-                        type_code: Some(if self.messaging { '`' } else { '\'' }),
-                        altitude_in_comment: self.common.altitude_m.is_none() && self.common.fields.altitude_feet.is_some(),
-                        fields,
-                        ..MicEReport::default()
-                    })
-                })?;
-                fields
-            },
+            fields,
             ..MicEReport::default()
-        }))
+        };
+        self.common.box_fault(&fields, |fields| Data::MicE(report(fields)))?;
+        // The altitude goes in the Mic-E altitude bytes, so it must fit them. A fault ranked before
+        // this one is named first: the report is tried without the altitude.
+        if let Some(feet) = fields.altitude_feet {
+            if !(-10_000.0..=743_570.0).contains(&crate::steps::round(feet / crate::comment::METRES_TO_FEET)) {
+                let without = Positioned { altitude_feet: None, ..fields.clone() };
+                if let Err(e) = self.station.packet(Data::MicE(report(without))) {
+                    if e.code().precedes(RefusalCode::ValueOutOfRange) {
+                        return Err(e);
+                    }
+                }
+                return Err(EncodeError::new(
+                    RefusalCode::for_value(feet),
+                    "a Mic-E altitude is -10000 to 743570 metres, once rounded to the metre",
+                ));
+            }
+        }
+        Ok(Data::MicE(report(fields)))
     }
 
     /// The packet: the station's source and path, the destination this report computes, and the report.
-    /// An altitude given in feet goes in a `/A=`, one in metres in the Mic-E altitude bytes.
+    /// An altitude, in feet or metres, goes in the Mic-E altitude bytes, rounded once to the nearest metre.
     pub fn build(&self) -> Result<Packet, EncodeError> {
         self.station.packet(self.to_data()?)
     }

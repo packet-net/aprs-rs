@@ -344,16 +344,18 @@ fn the_mic_e_type_code_says_whether_the_station_can_message() {
     assert_eq!(m.type_code, Some('`'));
 }
 
-/// A Mic-E altitude in metres goes in its altitude bytes, rounded to the metre; one in feet in a
-/// `/A=`, rounded to the foot.
+/// A Mic-E altitude, in metres or feet, goes in its altitude bytes, rounded once to the metre.
 #[test]
 fn a_mic_e_altitude_in_metres_stays_in_metres() {
     let line = sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).altitude_m(100.5).build().unwrap());
     let Data::MicE(m) = heard(&line) else { panic!("a Mic-E report") };
     assert!(!line.contains("/A="), "{line}");
     assert!((m.fields.altitude_feet.unwrap() - 101.0 / 0.3048).abs() < 1e-6, "{line}");
-    let line = sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).altitude_feet(-12.5).build().unwrap());
-    assert!(line.ends_with("/A=-00013"), "{line}");
+    // 1000 feet is 304.8 metres, which is 305.
+    let line = sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).altitude_feet(1000.0).build().unwrap());
+    let Data::MicE(m) = heard(&line) else { panic!("a Mic-E report") };
+    assert!(!line.contains("/A="), "{line}");
+    assert!((m.fields.altitude_feet.unwrap() - 305.0 / 0.3048).abs() < 1e-6, "{line}");
     let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).altitude_m(30.48).build().unwrap());
     assert!(line.ends_with("/A=000100"), "{line}");
 }
@@ -515,4 +517,39 @@ fn a_telemetry_builder_names_a_line_break_before_too_many_values() {
     let code = |b: pdn_aprs::TelemetryBuilder| b.build().unwrap_err().code();
     assert_eq!(code(me().telemetry(1).analog(&six)), RefusalCode::TooLong);
     assert_eq!(code(me().telemetry(1).analog(&six).comment("a\rb")), RefusalCode::InvalidCharacter);
+}
+
+/// Round 4: what a builder writes, or refuses, when an input is left unset.
+#[test]
+fn builder_defaults_are_written_down() {
+    use pdn_aprs::RefusalCode;
+    // No symbol on a position, object, item or Mic-E report is `invalid-symbol`.
+    let when = Timestamp::dhm(1, 2, 3);
+    assert_eq!(me().position(51.4543, -0.9781).build().unwrap_err().code(), RefusalCode::InvalidSymbol);
+    assert_eq!(me().object("MYRPTR").at(51.45, -0.98).timestamp(when).build().unwrap_err().code(), RefusalCode::InvalidSymbol);
+    assert_eq!(me().item("MYITEM").at(51.45, -0.98).build().unwrap_err().code(), RefusalCode::InvalidSymbol);
+    assert_eq!(me().mic_e(42.179, -71.1985).build().unwrap_err().code(), RefusalCode::InvalidSymbol);
+    // No timestamp on an object or a positionless weather report is `missing-field`: a builder never reads the clock.
+    assert_eq!(me().object("MYRPTR").at(51.45, -0.98).symbol(Symbol::REPEATER).build().unwrap_err().code(), RefusalCode::MissingField);
+    assert_eq!(me().weather().temperature_f(50.0).build().unwrap_err().code(), RefusalCode::MissingField);
+    // A weather report's symbol is `/_`; messaging is off; a Mic-E message is off duty; no bits is eight zeros.
+    let weather = sent(me().weather().timestamp(Timestamp::mdhm(1, 2, 3, 4)).temperature_f(50.0).build().unwrap());
+    assert!(weather.starts_with("M0LTE>APZ001:_01020304"), "{weather}");
+    assert!(sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).build().unwrap()).contains(":!"));
+    let Data::MicE(m) = heard(&sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).build().unwrap())) else { panic!("a Mic-E report") };
+    assert_eq!((m.mic_e_message, m.type_code), (pdn_aprs::MicEMessage::OffDuty, Some('\'')));
+    assert!(sent(me().telemetry(7).analog(&[Some(1.0)]).build().unwrap()).ends_with(",00000000"));
+}
+
+/// Round 4: an information field is at most 256 bytes, and text with a control character is refused.
+#[test]
+fn an_information_field_is_at_most_256_bytes_and_text_has_no_control_characters() {
+    use pdn_aprs::RefusalCode;
+    // `>` and 255 bytes of status text is 256; one more is refused, as UTF-8 bytes.
+    assert!(me().status(&"x".repeat(255)).build().is_ok());
+    assert_eq!(me().status(&"x".repeat(256)).build().unwrap_err().code(), RefusalCode::TooLong);
+    assert_eq!(me().status(&"\u{e9}".repeat(128)).build().unwrap_err().code(), RefusalCode::TooLong);
+    for text in ["a\tb", "a\u{7f}b", "a\u{1}b"] {
+        assert_eq!(me().status(text).build().unwrap_err().code(), RefusalCode::InvalidCharacter, "{text:?}");
+    }
 }

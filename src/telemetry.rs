@@ -102,8 +102,8 @@ pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
             "T#MIC with an empty first channel does not read back as given, so it cannot be sent",
         ));
     }
-    if crate::text::has_line_break(t.comment.as_bytes()) {
-        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "telemetry comment text cannot contain a line break"));
+    if crate::text::has_control_character(t.comment.as_bytes()) {
+        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "telemetry comment text cannot contain a control character"));
     }
     let mut out = Vec::from(&b"T#"[..]);
     out.extend_from_slice(t.sequence.as_bytes());
@@ -122,6 +122,7 @@ pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
     }
     out.extend_from_slice(t.bits.as_deref().unwrap_or_default().as_bytes());
     out.extend_from_slice(t.comment.as_bytes());
+    p.size(out.len());
     p.finish()?;
     // A sequence that starts MIC but is not MIC would not read back, for one.
     let mut ctx = Context::new(ParseOptions::LENIENT);
