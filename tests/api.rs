@@ -1,8 +1,8 @@
 //! The 1.0 API: what each decision about names, numbers and refusals promises.
 
 use pdn_aprs::{
-    Address, Code, CommentTelemetry, Data, Device, Footprint, MicEReport, Packet, ParseOptions, Phg, Position, PositionReport, Positioned,
-    Query, Severity, Station, Symbol, Telemetry, TelemetryCoefficients, Timestamp, Tone, Weather, WeatherReport,
+    Address, Code, CommentTelemetry, Data, Device, Footprint, MicEReport, Packet, ParseOptions, PathEntry, Phg, Position, PositionReport,
+    Positioned, Query, RefusalCode, Severity, Station, Symbol, Telemetry, TelemetryCoefficients, Timestamp, Tone, Weather, WeatherReport,
 };
 
 fn me() -> Station {
@@ -235,4 +235,53 @@ fn comment_telemetry_is_one_value() {
     )
     .unwrap();
     assert!(line.contains('|'), "{line}");
+}
+
+/// A header TNC2 cannot carry is refused at `create` with `invalid-address`, as the C library
+/// refuses it when writing.
+#[test]
+fn create_refuses_a_header_tnc2_cannot_carry() {
+    let line = b"N0CALL>APZ001:}PY2SP_R-R>APRS,TCPIP,G9RXG*:>test";
+    let outer = Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+    let Data::ThirdParty(inner) = &outer.data else { panic!("third-party") };
+    let refusal = Packet::create(inner.source.clone(), inner.destination.clone(), inner.path.clone(), inner.data.clone()).unwrap_err();
+    assert_eq!(refusal.code(), RefusalCode::InvalidAddress);
+
+    // An empty destination (tolerated on reading, UAP 5.2) cannot be written either.
+    let empty = Packet::decode_tnc2(b"N0CALL>:>test", ParseOptions::LENIENT).unwrap();
+    let refusal = Packet::create(empty.source.clone(), empty.destination.clone(), Vec::new(), empty.data.clone()).unwrap_err();
+    assert_eq!(refusal.code(), RefusalCode::InvalidAddress);
+
+    // A bad path entry, likewise.
+    let bad = Address::third_party_source("A_B").unwrap();
+    let ok = Address::new("N0CALL").unwrap();
+    let refusal = Packet::create(ok.clone(), ok.clone(), vec![PathEntry::new(bad)], outer.data.clone()).unwrap_err();
+    assert_eq!(refusal.code(), RefusalCode::InvalidAddress);
+}
+
+/// Whatever `create` accepts, `to_tnc2` writes a line that reads back with no header error.
+#[test]
+fn what_create_accepts_reads_back() {
+    let texts = ["N0CALL", "N0CALL-15", "A", "PY2SP_R-R", "A B", "", "ABCDEFGHI", "ABCDEFGHIJ", "a-b", "X>Y", "X:Y", "WIDE2-1", "T2SPAIN"];
+    let addresses: Vec<Address> =
+        texts.iter().flat_map(|t| [Address::new(t), Address::third_party_source(t)]).filter_map(Result::ok).collect();
+    let empty = Packet::decode_tnc2(b"N0CALL>:>test", ParseOptions::LENIENT).unwrap().destination;
+    let mut all = addresses.clone();
+    all.push(empty);
+    let data = Packet::decode_tnc2(b"N0CALL>APZ001:>test", ParseOptions::LENIENT).unwrap().data;
+    let mut accepted = 0;
+    for source in &all {
+        for destination in &all {
+            for entry in all.iter().map(|a| Some(a.clone())).chain([None]) {
+                let path: Vec<PathEntry> = entry.into_iter().map(|a| PathEntry { address: a, used: true }).collect();
+                if let Ok(packet) = Packet::create(source.clone(), destination.clone(), path, data.clone()) {
+                    accepted += 1;
+                    let line = packet.to_tnc2();
+                    assert!(Packet::decode_tnc2(&line, ParseOptions::LENIENT).is_ok(), "{}", String::from_utf8_lossy(&line));
+                    assert!(Packet::decode_tnc2(&line, ParseOptions::STRICT).is_ok(), "{}", String::from_utf8_lossy(&line));
+                }
+            }
+        }
+    }
+    assert!(accepted > 100);
 }

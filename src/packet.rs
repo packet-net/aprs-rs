@@ -363,7 +363,19 @@ impl Packet {
     /// Builds a packet from data, encoding its information field. For Mic-E data the destination
     /// address is worked out from the report (it carries the latitude, message code and digipeat
     /// path, APRS12c ch. 10), and `destination` is not used.
+    ///
+    /// Refuses with `invalid-address` a header that a TNC2 line cannot carry: every address must be
+    /// 1-9 letters, digits or `-`, so a third-party source such as `PY2SP_R-R` cannot head a packet
+    /// of its own, and no address may be empty. The header is checked before the data, and the
+    /// destination of Mic-E data is not checked because it is worked out from the report.
     pub fn create(source: Address, destination: Address, path: Vec<PathEntry>, data: Data) -> Result<Packet, EncodeError> {
+        let mic_e = matches!(data, Data::MicE(_));
+        if !Address::is_valid(source.as_str())
+            || (!mic_e && !Address::is_valid(destination.as_str()))
+            || path.iter().any(|e| !Address::is_valid(e.address.as_str()))
+        {
+            return Err(EncodeError::new(RefusalCode::InvalidAddress, "a header address is not 1-9 letters, digits or -"));
+        }
         let (destination, information) = match &data {
             Data::MicE(report) => crate::mic_e::encode(report)?,
             data => (destination, data.encode()?),
