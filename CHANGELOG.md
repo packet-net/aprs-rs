@@ -5,6 +5,25 @@
 - `Packet::create` (and so every builder's `build`) refuses with `invalid-address` a header that a TNC2 line cannot carry: an address that is not 1-9 letters, digits or `-` (a third-party source such as `PY2SP_R-R` used as an outer source, or an empty address). Before, it built the packet and `to_tnc2()` wrote a line that `decode_tnc2` rejected. This matches the C library, which refuses the same header with the same code. A Mic-E destination is worked out from the report, so it is not checked.
 - README: the conformance statement names the two encode cases this crate skips, and no longer quotes case counts or "five implementations".
 
+Round 4 of the conformance vectors (pinned at 9f3e07d). The two encode cases listed in `tests/known-differences.txt` are still the only exceptions.
+
+- An encoder or builder refuses an information field over 256 bytes as `too-long`, whatever the output (TNC2, AX.25, KISS). Bytes are counted (UTF-8), number text included; a third-party packet counts its outermost field. `too-long` keeps its place in the refusal order, and the size is measured on the fields as given (a field with no place in the report, or one left out, makes no bytes). A decoder sets no limit: a decoded packet over 256 bytes re-encodes `refused`, `too-long`.
+- New diagnostic `Code::ControlCharacterInText` (`control-character-in-text`, tolerable): text with a byte below 0x20 or 0x7F (a TAB, or a CR or LF inside the text, included) decodes with one warning per text, and the text is kept as sent. A strict decoder rejects it. It is judged last for its text, after the text's structure and `non-utf8-text`, and not for user-defined, raw weather, test or undecoded data, object and item names, capability tokens, addressees, headers or NMEA sentences. A capabilities report checks `free-text-capabilities` first.
+- Encoders and builders refuse text with a control character (not only CR and LF) as `invalid-character`, and a Mic-E status text starting with 0x1D is now refused instead of being written after a `/`.
+- A fixed-width weather field whose digits run on by two or more, followed by the end of the information field or by a defined field the run goes on to read, is `out-of-range-value`: the value is dropped and the fields carry on after the run (`t2147483647r000` has a rain of 0 and no temperature). Anything else after the run keeps the 1.1.0 reading.
+- Builder defaults are written down and changed where they differed: a position, object, item or Mic-E report built with no symbol is refused as `invalid-symbol` (it was `missing-field`); a builder never reads the clock (an object or positionless weather report with no timestamp was already `missing-field` here). The telemetry builder takes its sequence as an argument, so a missing sequence cannot be built; the dump tool reports it `refused`, `missing-field`.
+- A Mic-E altitude goes in the Mic-E altitude bytes, rounded once to the nearest metre from the value given (1000 feet is 305 m), whether the builder was given feet or metres; outside -10000 to 743570 m is `value-out-of-range`, and no `/A=` is written. For neutral data, `MicEReport::altitude_in_comment` false means the value decides: a `/A=` only when the value is a whole number of feet within six digits that the Mic-E bytes do not hold exactly (not a whole number of metres, or outside their range), otherwise the Mic-E bytes, rounded to the metre (100.5 ft is 31 m, -50000 ft is `/A=-50000`). An altitude read from a `/A=` is still written back as one.
+- The dump tool passes only the keys a recipe gives and no longer fills in a missing telemetry sequence with 0.
+- The licence is MIT.
+
+### Breaking changes for callers
+
+- An encoder or builder refuses an information field over 256 bytes (`too-long`); text with a control character is refused (`invalid-character`); a decoder gives `warning:control-character-in-text`, so a strict decoder now rejects such packets; a run-on weather value before a defined field is dropped with `out-of-range-value`.
+- A position, object, item or Mic-E report built with no symbol is refused as `invalid-symbol` instead of `missing-field`.
+- A Mic-E report built with an altitude in feet puts it in the Mic-E altitude bytes, rounded to the metre, instead of a `/A=` in the status text; an altitude outside the Mic-E range is refused instead of moved to a `/A=`.
+- Neutral Mic-E data of -50000 ft is written as `/A=-50000` instead of refused; neutral Mic-E altitudes that are neither whole feet nor whole metres (100.5 ft) go in the Mic-E bytes instead of a rounded `/A=`.
+- This crate never read the clock and has no "now" helper: the builders already take an explicit time.
+
 ## 1.1.0 (2026-11-14)
 
 Round 3 of the conformance vectors (pinned at 10d4e25). Two encode cases (no symbol, an undecoded inner packet) are records this crate's data cannot hold; they are listed in `tests/known-differences.txt`.
