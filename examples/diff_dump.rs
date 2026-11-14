@@ -225,7 +225,9 @@ fn encode_record(input: &Value) -> Value {
     let data = match neutral::try_read_data(&input["data"]) {
         Ok(data) => data,
         Err(neutral::Unreadable::Unsupported(why)) => return json!({"n": n, "result": "unsupported", "reason": why}),
-        Err(neutral::Unreadable::Refused(code, why)) => return json!({"n": n, "result": "refused", "reason": why, "refusal": code.id()}),
+        Err(neutral::Unreadable::Refused(code, why)) => {
+            return json!({"n": n, "result": "refused", "reason": why, "refusal": code.id(), "via": "tool"});
+        }
     };
     let written = match data {
         Data::MicE(m) => {
@@ -233,8 +235,12 @@ fn encode_record(input: &Value) -> Value {
         }
         data => data.encode().map(|info| (info, address("APZ001"))),
     };
+    // Inputs the reader replaced with stand-ins have their own refusals, settled against the encoder's.
+    let written = neutral::settle(written.map_err(|e| (e.code(), e.message().to_string())));
     match written {
-        Err(e) => json!({"n": n, "result": "refused", "reason": e.message(), "refusal": e.code().id()}),
+        Err((code, why, by_tool)) => {
+            json!({"n": n, "result": "refused", "reason": why, "refusal": code.id(), "via": if by_tool { "tool" } else { "library" }})
+        }
         Ok((info, destination)) => {
             // The bytes decoded leniently under N0CALL> and the destination.
             let p = Packet::decode(address("N0CALL"), destination.clone(), Vec::new(), &info, ParseOptions::LENIENT);
@@ -253,6 +259,8 @@ fn build_record(input: &Value) -> Value {
             json!({"n": n, "result": "built", "tnc2": hex(&line), "again": decoded})
         }
         build::Outcome::Unsupported(why) => json!({"n": n, "result": "unsupported", "reason": why}),
-        build::Outcome::Refused(code, why) => json!({"n": n, "result": "refused", "reason": why, "refusal": code}),
+        build::Outcome::Refused(code, why, by_tool) => {
+            json!({"n": n, "result": "refused", "reason": why, "refusal": code, "via": if by_tool { "tool" } else { "library" }})
+        }
     }
 }

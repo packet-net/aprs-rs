@@ -379,6 +379,98 @@ impl std::fmt::Display for Unreadable {
 
 type Read<T> = Result<T, Unreadable>;
 
+/// The Refusal reasons order (vectors README): the first code that applies is the one named.
+pub const ORDER: [&str; 26] = [
+    "not-encodable",
+    "invalid-address",
+    "ax25-cannot-carry",
+    "tnc2-cannot-carry",
+    "invalid-third-party-header",
+    "invalid-addressee",
+    "invalid-name",
+    "invalid-timestamp",
+    "not-a-number",
+    "value-out-of-range",
+    "value-has-no-form",
+    "invalid-code",
+    "invalid-symbol",
+    "invalid-character",
+    "too-long",
+    "padding-space",
+    "malformed",
+    "invalid-message-id",
+    "invalid-nmea",
+    "extension-conflict",
+    "field-not-allowed",
+    "symbol-mismatch",
+    "missing-field",
+    "value-given-twice",
+    "text-reads-as-field",
+    "does-not-read-back",
+];
+
+/// Where a refusal code comes in the order.
+pub fn rank(code: pdn_aprs::RefusalCode) -> usize {
+    ORDER.iter().position(|x| *x == code.id()).unwrap_or(ORDER.len())
+}
+
+/// Whether a refusal is only the information field's 256 bytes, the last check of all: a field over its own
+/// limit is `too-long` at its place in the order, but this one comes after every other code.
+pub fn is_size(code: pdn_aprs::RefusalCode, message: &str) -> bool {
+    code == pdn_aprs::RefusalCode::TooLong && message.starts_with("the information field is at most")
+}
+
+thread_local! {
+    /// Refusals the reader found in inputs this crate's data cannot hold (a symbol that is not a table and a
+    /// code, a sequence of -1, an infinity), each with a valid stand-in put in its place. Vectors README,
+    /// "Encode records": the record is then encoded with the stand-ins, and the refusal named is the first in
+    /// the order among that result and these, a size refusal losing to every one of them.
+    static DEFERRED: std::cell::RefCell<Vec<(pdn_aprs::RefusalCode, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Notes a refusal the reader made on an input it replaced with a stand-in.
+pub fn defer(code: pdn_aprs::RefusalCode, why: String) {
+    DEFERRED.with(|d| d.borrow_mut().push((code, why)));
+}
+
+/// Forgets the refusals noted so far.
+pub fn clear_deferred() {
+    DEFERRED.with(|d| d.borrow_mut().clear());
+}
+
+/// The first in the order of the refusals noted since the last `clear_deferred` or `settle`, taking them all.
+fn take_first() -> Option<(pdn_aprs::RefusalCode, String)> {
+    let all = DEFERRED.with(|d| std::mem::take(&mut *d.borrow_mut()));
+    all.into_iter().min_by_key(|(code, _)| rank(*code))
+}
+
+/// What encoding data read with stand-ins came to, settled against the reader's own refusals: the
+/// refusal of the encoder when it is earlier in the order than every one of them (a size refusal never
+/// is), and otherwise the first of them. An `Err` is `(code, why, by_tool)`, `by_tool` being true for a
+/// reader's refusal, which the dump tool marks `"via": "tool"`.
+pub fn settle<T>(result: Result<T, (pdn_aprs::RefusalCode, String)>) -> Result<T, (pdn_aprs::RefusalCode, String, bool)> {
+    match (take_first(), result) {
+        (None, Ok(t)) => Ok(t),
+        (None, Err((code, why))) => Err((code, why, false)),
+        (Some((code, why)), Err((c, w))) if rank(c) < rank(code) && !is_size(c, &w) => {
+            let _ = (code, why);
+            Err((c, w, false))
+        }
+        (Some((code, why)), _) => Err((code, why, true)),
+    }
+}
+
+/// A whole number or a number in the neutral form that does not fit `T`, as the refusal its value alone
+/// decides: `not-a-number` for NaN or an infinity, `value-out-of-range` for a value outside `T`. `None`
+/// when it is neither (text, a fraction: the caller decides).
+fn out_of_type(v: &Value, name: &str) -> Option<(pdn_aprs::RefusalCode, String)> {
+    let x = num(v)?;
+    if !x.is_finite() {
+        return Some((pdn_aprs::RefusalCode::NotANumber, format!("{name}: not a number")));
+    }
+    Some((pdn_aprs::RefusalCode::ValueOutOfRange, format!("{name}: outside what this crate's data holds")))
+}
+
 fn unsupported<T>(why: String) -> Read<T> {
     Err(Unreadable::Unsupported(why))
 }
@@ -460,23 +552,53 @@ impl<'a> Keys<'a> {
 
     /// A number this crate holds in whole steps (a course, a humidity), rounded to the nearest as
     /// the encoder rounds any value between its field's steps (vectors README, Encoding). One that
-    /// rounds outside what `T` holds is outside the field, so the data is refused.
+    /// rounds outside what `T` holds is outside the field, or not a number: that refusal is noted and 0
+    /// stands in, for the encoder to find any earlier code.
     fn stepped<T: TryFrom<i128>>(&self, k: &str) -> Read<Option<T>> {
         let Some(v) = self.get(k) else { return Ok(None) };
+        let name = self.name(k);
+        let stand_in = || T::try_from(0).ok();
         if let Some(n) = whole(v) {
-            return T::try_from(n)
-                .map(Some)
-                .map_err(|_| Unreadable::Refused(pdn_aprs::RefusalCode::ValueOutOfRange, format!("{}: outside its field", self.name(k))));
+            return Ok(Some(match T::try_from(n) {
+                Ok(t) => t,
+                Err(_) => {
+                    defer(pdn_aprs::RefusalCode::ValueOutOfRange, format!("{name}: outside its field"));
+                    return Ok(stand_in());
+                }
+            }));
         }
         let Some(x) = num(v) else {
-            return unsupported(format!("{}: not a number", self.name(k)));
+            return unsupported(format!("{name}: not a number"));
         };
         if !x.is_finite() {
-            return Err(Unreadable::Refused(pdn_aprs::RefusalCode::NotANumber, format!("{}: not a number", self.name(k))));
+            defer(pdn_aprs::RefusalCode::NotANumber, format!("{name}: not a number"));
+            return Ok(stand_in());
         }
-        T::try_from(round_steps(x) as i128).map(Some).map_err(|_| {
-            Unreadable::Refused(pdn_aprs::RefusalCode::ValueOutOfRange, format!("{}: outside its field once rounded", self.name(k)))
-        })
+        Ok(Some(match T::try_from(round_steps(x) as i128) {
+            Ok(t) => t,
+            Err(_) => {
+                defer(pdn_aprs::RefusalCode::ValueOutOfRange, format!("{name}: outside its field once rounded"));
+                return Ok(stand_in());
+            }
+        }))
+    }
+
+    /// A whole number that fits `T`; a number that does not (a negative count, an infinity) is noted as the
+    /// refusal its value decides, and 0 stands in. A fraction or text is not read.
+    fn int_or_defer<T: TryFrom<i128>>(&self, k: &str) -> Read<Option<T>> {
+        let Some(v) = self.get(k) else { return Ok(None) };
+        if let Some(t) = whole(v).and_then(|n| T::try_from(n).ok()) {
+            return Ok(Some(t));
+        }
+        let name = self.name(k);
+        let fraction = num(v).is_some_and(|x| x.is_finite() && x.fract() != 0.0 && x.abs() < 1e30);
+        match out_of_type(v, &name).filter(|_| !fraction) {
+            Some((code, why)) => {
+                defer(code, why);
+                Ok(Some(T::try_from(0).ok().expect("0 fits")))
+            }
+            None => unsupported(format!("{name}: not a whole number in the range this crate holds")),
+        }
     }
 
     fn required_int<T: TryFrom<i128>>(&self, k: &str) -> Read<T> {
@@ -602,8 +724,21 @@ fn with_positioned(extra: &[&'static str]) -> Vec<&'static str> {
     POSITIONED.iter().copied().chain(extra.iter().copied()).collect()
 }
 
-/// Neutral data as this crate's data, or why it cannot be.
+/// Neutral data as this crate's data, or why it cannot be. Inputs the crate cannot hold but whose
+/// refusal their value decides are replaced by stand-ins and noted: pass the encoder's result to
+/// [`settle`] to name the refusal. A refusal the reader makes outright is settled against them here.
 pub fn try_read_data(v: &Value) -> Read<Data> {
+    clear_deferred();
+    match read_data(v) {
+        Err(Unreadable::Refused(code, why)) => match settle::<()>(Err((code, why))) {
+            Err((code, why, _)) => Err(Unreadable::Refused(code, why)),
+            Ok(()) => unreachable!("an Err stays an Err"),
+        },
+        other => other,
+    }
+}
+
+fn read_data(v: &Value) -> Read<Data> {
     let kind = v.get("type").and_then(Value::as_str).unwrap_or("");
     let keys: Vec<&str> = match kind {
         "position" => with_positioned(&[]),
@@ -849,7 +984,10 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             }
             let p = o.required("packet", o.object("packet", &["source", "destination", "path", "data", "diagnostics"])?)?;
             let source = p.text("source")?;
-            let source = Address::third_party_source(&source).or_else(|_| unsupported("packet.source: not a third-party source".into()))?;
+            let source = Address::third_party_source(&source).unwrap_or_else(|_| {
+                defer(pdn_aprs::RefusalCode::InvalidThirdPartyHeader, "packet.source: not a third-party source".into());
+                Address::third_party_source("N0CALL").expect("a well-formed address")
+            });
             let destination_text = p.text("destination")?;
             if destination_text.is_empty() {
                 return Err(Unreadable::Refused(
@@ -862,13 +1000,18 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             let diagnostics = p.strings("diagnostics")?.iter().map(|d| read_diagnostic(d)).collect::<Read<Vec<Diagnostic>>>()?;
             // Undecoded data has no neutral form of its bytes: not-encodable, the first of the
             // refusal reasons, which no header fault outranks.
-            let data = try_read_data(p.required("data", p.get("data"))?);
-            if let Err(e @ Unreadable::Unsupported(_)) = data {
+            let data = read_data(p.required("data", p.get("data"))?);
+            if let Err(e @ (Unreadable::Unsupported(_) | Unreadable::Refused(pdn_aprs::RefusalCode::NotEncodable, _))) = data {
                 return Err(e);
             }
             if let Ok(Data::Unrecognized(u)) = &data {
                 if *u != Unrecognized::Empty {
-                    return unsupported("packet.data: undecoded, and its bytes are not in the neutral form".into());
+                    // Its bytes are not in the neutral form, so it cannot be written: `not-encodable`, the first
+                    // code in the order, which no other fault outranks.
+                    return Err(Unreadable::Refused(
+                        pdn_aprs::RefusalCode::NotEncodable,
+                        "the inner packet's data is undecoded, and its bytes are not in the neutral form".into(),
+                    ));
                 }
             }
             // A header the encoder cannot write back is refused before the inner data's own
@@ -919,7 +1062,9 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
         }
         "test" => Data::Test(TestData { data: o.text("data")? }),
         "agrelo-df" => {
-            Data::AgreloDf(AgreloDf { bearing_degrees: o.required_int("bearing_degrees")?, quality: o.required_int("quality")? })
+            let bearing = o.stepped("bearing_degrees")?;
+            let quality = o.int_or_defer("quality")?;
+            Data::AgreloDf(AgreloDf { bearing_degrees: o.required("bearing_degrees", bearing)?, quality: o.required("quality", quality)? })
         }
         _ => Data::Unrecognized(
             o.choice(
@@ -942,7 +1087,10 @@ fn read_destination(text: &str) -> Read<Address> {
     if text.is_empty() {
         return Ok(Packet::decode_tnc2(b"N0CALL>:", ParseOptions::LENIENT).expect("an empty destination is tolerated").destination);
     }
-    Address::new(text).or_else(|_| unsupported("packet.destination: not an address".into()))
+    Ok(Address::new(text).unwrap_or_else(|_| {
+        defer(pdn_aprs::RefusalCode::InvalidThirdPartyHeader, "packet.destination: not an address".into());
+        Address::new("APZ001").expect("a well-formed address")
+    }))
 }
 
 /// A diagnostic from its neutral form, `severity:code`; the message and offset are not part of it.
@@ -978,8 +1126,11 @@ fn read_path_entry_checked(text: &str) -> Read<PathEntry> {
         Some(t) => (t, true),
         None => (text, false),
     };
-    let address = Address::new(address).or_else(|_| unsupported("path: not an address".into()))?;
-    Ok(PathEntry { address, used })
+    let address = Address::new(address).or_else(|_| {
+        defer(pdn_aprs::RefusalCode::InvalidThirdPartyHeader, "path: not an address".into());
+        Address::new("N0CALL")
+    });
+    Ok(PathEntry { address: address.expect("a well-formed address"), used })
 }
 
 fn read_timestamp(o: &Keys) -> Read<Option<Timestamp>> {
@@ -996,9 +1147,15 @@ fn read_symbol(o: &Keys) -> Read<Option<Symbol>> {
     let mut c = t.chars();
     match (c.next(), c.next(), c.next()) {
         (Some(table), Some(code), None) => Ok(Some(Symbol { table, code })),
-        _ => unsupported("symbol: not a table and a code".into()),
+        _ => {
+            defer(pdn_aprs::RefusalCode::InvalidSymbol, "symbol: not a table and a code".into());
+            Ok(Some(STAND_IN_SYMBOL))
+        }
     }
 }
+
+/// What stands in for a symbol that is missing or not a table and a code, once its refusal is noted.
+const STAND_IN_SYMBOL: Symbol = Symbol { table: '/', code: '>' };
 
 fn read_mic_e_message(o: &Keys) -> Read<Option<MicEMessage>> {
     let Some(t) = o.string("mic_e_message")? else { return Ok(None) };
@@ -1056,9 +1213,16 @@ fn read_positioned(o: &Keys) -> Read<Positioned> {
         position: Position {
             latitude: o.required_float("latitude")?,
             longitude: o.required_float("longitude")?,
-            ambiguity: o.int("ambiguity")?.unwrap_or(0),
+            ambiguity: o.int_or_defer("ambiguity")?.unwrap_or(0),
         },
-        symbol: o.required("symbol", read_symbol(o)?)?,
+        symbol: match read_symbol(o)? {
+            Some(symbol) => symbol,
+            // Neutral data with no symbol is `invalid-symbol` (absent text is empty text).
+            None => {
+                defer(pdn_aprs::RefusalCode::InvalidSymbol, "symbol: missing".into());
+                STAND_IN_SYMBOL
+            }
+        },
         compressed: o.flag("compressed")?,
         compression: match o.object("compression", &["fix", "source", "origin"])? {
             None => None,

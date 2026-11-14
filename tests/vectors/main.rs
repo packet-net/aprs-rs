@@ -326,7 +326,11 @@ fn encode(case: &Value) -> Result<(), String> {
     let written = match neutral::try_read_data(&input["encode"]) {
         Err(neutral::Unreadable::Unsupported(why)) => return Err(format!("encode: this crate's data cannot hold it: {why}")),
         Err(neutral::Unreadable::Refused(code, why)) => Err((code, why)),
-        Ok(data) => Packet::create(source(input), destination(input), Vec::new(), data).map_err(|e| (e.code(), e.to_string())),
+        // Inputs the reader replaced with stand-ins have their own refusals, settled against the encoder's.
+        Ok(data) => neutral::settle(
+            Packet::create(source(input), destination(input), Vec::new(), data).map_err(|e| (e.code(), e.message().to_string())),
+        )
+        .map_err(|(code, why, _)| (code, why)),
     };
     let packet = match written {
         Err((code, e)) => {
@@ -361,7 +365,7 @@ fn build_case(case: &Value) -> Result<(), String> {
     let expect = &case["expect"];
     match build::outcome(&case["input"]["build"]) {
         build::Outcome::Unsupported(why) => Err(format!("build: this crate's builder cannot say it: {why}")),
-        build::Outcome::Refused(code, why) => {
+        build::Outcome::Refused(code, why, _) => {
             if expect.get("refused").and_then(Value::as_bool) != Some(true) {
                 return Err(format!("build: expected {}, but the builder refused: {code}: {why}", expect["tnc2"]));
             }

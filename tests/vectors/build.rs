@@ -16,8 +16,10 @@ use crate::neutral;
 pub enum Outcome {
     /// The TNC2 line built.
     Built(Vec<u8>),
-    /// The builder declined: the reason code's id, and the message.
-    Refused(String, String),
+    /// The builder declined: the reason code's id, the message, and whether it was this reader that
+    /// declined an input the builder cannot take (a bulletin id of two characters) rather than the builder.
+    #[allow(dead_code)] // the flag is read by the dump tool, which shares this file
+    Refused(String, String, bool),
     /// The builder has no way to say something in the recipe.
     Unsupported(String),
 }
@@ -27,6 +29,8 @@ pub enum Outcome {
 enum NotBuilt {
     Unsupported(String),
     Refused(RefusalCode, String),
+    /// The reader declined an input the builder has no way to take, and its value alone decides the code.
+    Tool(RefusalCode, String),
 }
 
 impl From<EncodeError> for NotBuilt {
@@ -41,46 +45,7 @@ fn unsupported<T>(why: impl Into<String>) -> Built<T> {
     Err(NotBuilt::Unsupported(why.into()))
 }
 
-/// The Refusal reasons order (vectors README): the first code that applies is the one named.
-const ORDER: [&str; 26] = [
-    "not-encodable",
-    "invalid-address",
-    "ax25-cannot-carry",
-    "tnc2-cannot-carry",
-    "invalid-third-party-header",
-    "invalid-addressee",
-    "invalid-name",
-    "invalid-timestamp",
-    "not-a-number",
-    "value-out-of-range",
-    "value-has-no-form",
-    "invalid-code",
-    "invalid-symbol",
-    "invalid-character",
-    "too-long",
-    "padding-space",
-    "malformed",
-    "invalid-message-id",
-    "invalid-nmea",
-    "extension-conflict",
-    "field-not-allowed",
-    "symbol-mismatch",
-    "missing-field",
-    "value-given-twice",
-    "text-reads-as-field",
-    "does-not-read-back",
-];
-
-/// Whether a refusal is only the information field's 256 bytes, the last check of all: a field over its own
-/// limit is `too-long` at its place in the order, but this one comes after every other code.
-fn is_size(code: RefusalCode, message: &str) -> bool {
-    code == RefusalCode::TooLong && message.starts_with("the information field is at most")
-}
-
-/// Where a refusal code comes in the order.
-fn rank(code: &str) -> usize {
-    ORDER.iter().position(|x| *x == code).unwrap_or(ORDER.len())
-}
+use crate::neutral::{is_size, rank};
 
 /// The pairs of keys that give one quantity in two units. A recipe holding both is one input with
 /// the quantity given twice.
@@ -141,10 +106,26 @@ impl<'a> Args<'a> {
         self.float(k)?.ok_or_else(|| NotBuilt::Unsupported(format!("{k}: missing")))
     }
 
-    /// A whole number of the type the builder's method takes.
-    fn whole<T: TryFrom<i64>>(&self, k: &str, what: &str) -> Built<Option<T>> {
+    /// A whole number of the type the builder's method takes, except that a number the builder's type cannot take but whose value alone decides
+    /// a refusal (NaN or an infinity: `not-a-number`; a whole number outside the type: `value-out-of-range`)
+    /// is noted as that refusal and left out, for the builder to find any earlier code.
+    fn whole_or_defer<T: TryFrom<i64>>(&self, k: &str, what: &str) -> Built<Option<T>> {
         let Some(v) = self.get(k) else { return Ok(None) };
-        whole(v).and_then(|x| T::try_from(x).ok()).map(Some).ok_or_else(|| NotBuilt::Unsupported(format!("{k}: the builder takes {what}")))
+        if let Some(t) = whole(v).and_then(|x| T::try_from(x).ok()) {
+            return Ok(Some(t));
+        }
+        let fraction = neutral::num(v).is_some_and(|f| f.is_finite() && f.fract() != 0.0);
+        match neutral::num(v) {
+            Some(f) if !f.is_finite() => {
+                neutral::defer(RefusalCode::NotANumber, format!("{k}: not a number"));
+                Ok(None)
+            }
+            Some(_) if !fraction => {
+                neutral::defer(RefusalCode::ValueOutOfRange, format!("{k}: outside what the builder takes ({what})"));
+                Ok(None)
+            }
+            _ => unsupported(format!("{k}: the builder takes {what}")),
+        }
     }
 
     fn text(&self, k: &str) -> Built<Option<&'a str>> {
@@ -234,7 +215,7 @@ macro_rules! positioned {
         if args.flag("compressed")? {
             b = b.compressed();
         }
-        if let Some(a) = args.whole::<u8>("ambiguity", "0-255 digits")? {
+        if let Some(a) = args.whole_or_defer::<u8>("ambiguity", "0-255 digits")? {
             b = b.ambiguity(a);
         }
         if args.flag("dao")? {
@@ -321,8 +302,14 @@ fn build(input: &Value) -> Built<Packet> {
             b.build()?
         }
         "bulletin" => {
-            let Some(id) = one_char(args.text("id")?.unwrap_or_default()) else {
-                return unsupported("id: the builder takes one character");
+            // An id of the wrong length is `invalid-addressee`, noted and stood in for by `0`; one left out
+            // is a record the builder has no answer for.
+            let id = match args.text("id")? {
+                None => return unsupported("id: missing"),
+                Some(t) => one_char(t).unwrap_or_else(|| {
+                    neutral::defer(RefusalCode::InvalidAddressee, "id: a bulletin id is one character".into());
+                    '0'
+                }),
             };
             let text = args.text("text")?.unwrap_or_default();
             let b = match args.text("group")? {
@@ -359,7 +346,7 @@ fn build(input: &Value) -> Built<Packet> {
             // The builder takes the sequence as an argument, so one left out is built with a placeholder, to
             // find any fault ranked before `missing-field`; failing that it is the refusal the rules give,
             // never a default of 0.
-            let sequence = args.whole::<u16>("sequence", "a number 0-65535")?;
+            let sequence = args.whole_or_defer::<u16>("sequence", "a number 0-65535")?;
             let mut b = station.telemetry(sequence.unwrap_or(0));
             if let Some(a) = args.get("analog") {
                 let Some(a) = a.as_array() else { return unsupported("analog: not a list") };
@@ -381,7 +368,7 @@ fn build(input: &Value) -> Built<Packet> {
             args.all_taken()?;
             match (sequence, b.build()) {
                 (Some(_), built) => built?,
-                (None, Err(e)) if rank(e.code().id()) < rank(RefusalCode::MissingField.id()) && !is_size(e.code(), e.message()) => {
+                (None, Err(e)) if rank(e.code()) < rank(RefusalCode::MissingField) && !is_size(e.code(), e.message()) => {
                     return Err(e.into());
                 }
                 (None, _) => {
@@ -467,7 +454,12 @@ fn symbol(text: Option<&str>) -> Built<Option<Symbol>> {
     let mut c = t.chars();
     match (c.next(), c.next(), c.next()) {
         (Some(table), Some(code), None) => Ok(Some(Symbol::new(table, code))),
-        _ => unsupported("symbol: the builder takes a table and a code"),
+        // Not a table and a code: `invalid-symbol`, noted; the symbol is left out for the builder to find any
+        // earlier code (it would refuse a missing one as `invalid-symbol` too).
+        _ => {
+            neutral::defer(RefusalCode::InvalidSymbol, "symbol: not a table and a code".into());
+            Ok(None)
+        }
     }
 }
 
@@ -651,6 +643,31 @@ fn weather(station: &Station, args: &Args) -> Built<Packet> {
     Ok(b.build()?)
 }
 
+/// Builds a recipe once, settling what the reader noted about inputs the builder cannot take against what the
+/// builder says: the builder's refusal when it is earlier in the order than every noted one, else the first
+/// noted one, which is the reader's.
+fn settled(input: &Value) -> Built<Packet> {
+    neutral::clear_deferred();
+    let result = build(input);
+    let (code, why) = match &result {
+        Ok(_) => (None, String::new()),
+        Err(NotBuilt::Refused(code, why)) => (Some(*code), why.clone()),
+        // A record the builder cannot say stays unsupported whatever else the reader noted.
+        Err(_) => {
+            neutral::clear_deferred();
+            return result;
+        }
+    };
+    match neutral::settle(match code {
+        None => Ok(result),
+        Some(code) => Err((code, why)),
+    }) {
+        Ok(result) => result,
+        Err((code, why, true)) => Err(NotBuilt::Tool(code, why)),
+        Err((code, why, false)) => Err(NotBuilt::Refused(code, why)),
+    }
+}
+
 /// Builds a recipe. A quantity given in two units is built once with each, and refused with the first code
 /// in the order among those results and `value-given-twice`: never a line from one unit.
 pub fn outcome(input: &Value) -> Outcome {
@@ -662,26 +679,25 @@ pub fn outcome(input: &Value) -> Outcome {
         })
         .collect();
     if !both.is_empty() {
-        let mut best = "value-given-twice".to_string();
+        let mut best = RefusalCode::ValueGivenTwice;
         let mut why = "a quantity is given in two units".to_string();
+        let mut by_tool = false;
         for choice in 0..1usize << both.len() {
-            match build(&with_units(input, &both, choice)) {
+            match settled(&with_units(input, &both, choice)) {
                 Ok(_) => {}
                 Err(NotBuilt::Unsupported(why)) => return Outcome::Unsupported(why),
-                Err(NotBuilt::Refused(code, text)) => {
-                    // A record over 256 bytes with no other fault is `value-given-twice`: the size is judged last.
-                    if rank(code.id()) < rank(&best) && !is_size(code, &text) {
-                        best = code.id().to_string();
-                        why = text;
-                    }
-                }
+                Err(NotBuilt::Refused(code, text)) | Err(NotBuilt::Tool(code, text))
+                    if rank(code) >= rank(best) || is_size(code, &text) => {}
+                Err(NotBuilt::Refused(code, text)) => (best, why, by_tool) = (code, text, false),
+                Err(NotBuilt::Tool(code, text)) => (best, why, by_tool) = (code, text, true),
             }
         }
-        return Outcome::Refused(best, why);
+        return Outcome::Refused(best.id().to_string(), why, by_tool);
     }
-    match build(input) {
+    match settled(input) {
         Ok(p) => Outcome::Built(p.to_tnc2()),
         Err(NotBuilt::Unsupported(why)) => Outcome::Unsupported(why),
-        Err(NotBuilt::Refused(code, why)) => Outcome::Refused(code.id().to_string(), why),
+        Err(NotBuilt::Refused(code, why)) => Outcome::Refused(code.id().to_string(), why, false),
+        Err(NotBuilt::Tool(code, why)) => Outcome::Refused(code.id().to_string(), why, true),
     }
 }
