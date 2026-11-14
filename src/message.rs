@@ -518,8 +518,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
         }
         _ => return Err(EncodeError::new(RefusalCode::NotEncodable, "not a message")),
     }
-    p.size(out.len());
-    p.finish()?;
+    p.finish_faults()?;
     // What was written must read back as what was given: a message whose text looks like an ack,
     // telemetry metadata or a query, or whose addressee makes it a bulletin, would not.
     let mut ctx = Context::new(ParseOptions::LENIENT);
@@ -542,6 +541,8 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             "it would read back as something else: text that reads as an ack, telemetry metadata or a query, or an addressee that makes it a bulletin",
         ));
     }
+    // The size is the last check, on the bytes written.
+    crate::refusal::check_size(out.len())?;
     Ok(out)
 }
 

@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use crate::RefusalCode;
 use crate::context::Context;
 use crate::refusal::Pending;
-use crate::{Code, EncodeError, Weather, WeatherField};
+use crate::{Code, EncodeError, ParseOptions, Weather, WeatherField};
 
 /// How the wind is read from the weather fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -80,7 +80,7 @@ pub(crate) fn fields(ctx: &mut Context, bytes: &[u8], offset: usize, weather: &m
                 let mut read = seen.clone();
                 read.push(key);
                 let state = (direction_known || letter == b'c', speed_known || letter == b's');
-                let goes_on = next == bytes.len() || reads_next(ctx, bytes, next, &read, state, wind, run.direction || letter == b'c');
+                let goes_on = next == bytes.len() || reads_next(bytes, next, &read, state, wind, run.direction || letter == b'c');
                 if goes_on {
                     if !ctx.tolerate(
                         Code::OutOfRangeValue,
@@ -164,7 +164,6 @@ fn run_on(bytes: &[u8], at: usize, width: usize, letter: u8) -> Option<usize> {
 /// Whether a field the run goes on to read starts at `at`: a letter APRS12c defines, not already
 /// read (`seen`), with a value.
 fn reads_next(
-    ctx: &Context,
     bytes: &[u8],
     at: usize,
     seen: &[u8],
@@ -191,7 +190,9 @@ fn reads_next(
     if seen.contains(&key) {
         return false;
     }
-    let mut probe = Context::new(ctx.options);
+    // Whether a field follows does not depend on what a strict reading makes of it: a later defect never
+    // changes the diagnosis of an earlier one.
+    let mut probe = Context::new(ParseOptions::LENIENT);
     matches!(value(&mut probe, bytes, at, 0, width, letter, snow), Some(Some(_)))
 }
 

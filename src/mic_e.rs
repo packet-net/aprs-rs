@@ -709,10 +709,7 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         out.extend_from_slice(&trailer);
         out.extend_from_slice(suffix);
     }
-    if late.is_none() {
-        pend.size(out.len());
-    }
-    pend.finish()?;
+    pend.finish_faults()?;
     if let Some(e) = late {
         return Err(e);
     }
@@ -724,6 +721,7 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     }
     let destination =
         Address::new(&dest).map_err(|_| EncodeError::new(RefusalCode::InvalidAddress, "the Mic-E destination is not an address"))?;
+    crate::refusal::check_size(out.len())?;
     Ok((destination, out))
 }
 

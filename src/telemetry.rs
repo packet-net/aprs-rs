@@ -80,7 +80,9 @@ pub(crate) fn report(ctx: &mut Context, info: &[u8]) -> Option<Data> {
 pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
     let mut p = Pending::default();
     // The sequence is fixed-form text: letters and digits, or MIC.
-    if t.sequence.is_empty() || !t.sequence.bytes().all(|b| b.is_ascii_alphanumeric()) {
+    if t.sequence.is_empty() {
+        p.note(EncodeError::new(RefusalCode::MissingField, "a telemetry report carries a sequence (APRS12c ch. 13)"));
+    } else if !t.sequence.bytes().all(|b| b.is_ascii_alphanumeric()) {
         p.note(EncodeError::new(RefusalCode::Malformed, "a telemetry sequence is letters and digits"));
     }
     if t.analog.len() > 5 {

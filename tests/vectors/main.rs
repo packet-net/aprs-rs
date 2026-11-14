@@ -7,10 +7,13 @@
 //! - `reencode`: encoding the decoded data again gives what `reencode` says, and writes exactly the
 //!   case's `canonical_info` when it has one;
 //! - `encode`: an encode case writes the expected information field, or refuses;
+//! - `build`: a build case, a builder recipe, is built through the builder API (the same code as the dump
+//!   tool's build mode) and gives the expected TNC2 line, or refuses;
 //! - `readback`: the neutral form of decoded data reads back into this crate's types unchanged.
 //!
 //! Cases listed in `tests/known-differences.txt` run as ignored tests, each with its reason.
 
+mod build;
 mod compare;
 mod neutral;
 
@@ -72,6 +75,10 @@ fn add_trials(trials: &mut Vec<Trial>, case: Value, known: &BTreeMap<String, Str
     };
     if case["input"].get("encode").is_some() {
         add("encode", encode);
+        return;
+    }
+    if case["input"].get("build").is_some() {
+        add("build", build_case);
         return;
     }
     add("lenient", lenient);
@@ -348,6 +355,31 @@ fn encode(case: &Value) -> Result<(), String> {
         }
     }
     result(out)
+}
+
+fn build_case(case: &Value) -> Result<(), String> {
+    let expect = &case["expect"];
+    match build::outcome(&case["input"]["build"]) {
+        build::Outcome::Unsupported(why) => Err(format!("build: this crate's builder cannot say it: {why}")),
+        build::Outcome::Refused(code, why) => {
+            if expect.get("refused").and_then(Value::as_bool) != Some(true) {
+                return Err(format!("build: expected {}, but the builder refused: {code}: {why}", expect["tnc2"]));
+            }
+            match expect.get("refusal").and_then(Value::as_str) {
+                Some(want) if want != code => Err(format!("build: expected the refusal {want}, got {code}: {why}")),
+                _ => Ok(()),
+            }
+        }
+        build::Outcome::Built(line) => {
+            if expect.get("refused").and_then(Value::as_bool) == Some(true) {
+                return Err(format!("build: expected a refusal, built {}", show(&line)));
+            }
+            if String::from_utf8_lossy(&line) != expect["tnc2"].as_str().unwrap() {
+                return Err(format!("build: expected {}, built {}", expect["tnc2"], show(&line)));
+            }
+            Ok(())
+        }
+    }
 }
 
 fn readback(case: &Value) -> Result<(), String> {

@@ -287,13 +287,17 @@ impl Common {
     }
 
     /// The shared fields, checked for what the builder itself needs; the encoder checks the rest.
-    fn positioned(&self, what: &str, mic_e: bool) -> Result<Positioned, EncodeError> {
+    ///
+    /// A symbol left out is not refused here: the report is tried with a placeholder, so that a fault
+    /// ranked before `invalid-symbol` is named first, and the fault comes back with the fields.
+    fn positioned(&self, what: &str, mic_e: bool) -> Result<(Positioned, Option<EncodeError>), EncodeError> {
         let position = self
             .position
             .ok_or_else(|| EncodeError::new(RefusalCode::MissingField, format!("{what} needs a position: call at(latitude, longitude)")))?;
-        let symbol = self.symbol.ok_or_else(|| {
+        let no_symbol = self.symbol.is_none().then(|| {
             EncodeError::new(RefusalCode::InvalidSymbol, format!("{what} needs a symbol: call symbol(...), e.g. symbol(Symbol::CAR)"))
-        })?;
+        });
+        let symbol = self.symbol.unwrap_or(Symbol::CAR);
         let mut fields = self.fields.clone();
         // An ambiguous position reports the box that holds it: its digits cut, not rounded, then
         // blanked, and the box's centre is what a decoder reads (vectors README, Builder rules).
@@ -335,7 +339,20 @@ impl Common {
                 frequency.offset_khz = Some(khz);
             }
         }
-        Ok(fields)
+        Ok((fields, no_symbol))
+    }
+}
+
+/// What a builder was not given that its report needs is the refusal only when nothing ranked before it
+/// is wrong: the data, made with placeholders for what is missing, is tried first, and a fault of an
+/// earlier code is named instead (vectors README, Refusal reasons).
+fn settle(station: &Station, data: Data, missing: Vec<EncodeError>) -> Result<Data, EncodeError> {
+    let Some(first) = missing.into_iter().reduce(|a, b| if b.code().precedes(a.code()) { b } else { a }) else {
+        return Ok(data);
+    };
+    match station.packet(data) {
+        Err(e) if !e.is_size() && e.code().precedes(first.code()) => Err(e),
+        _ => Err(first),
     }
 }
 
@@ -539,17 +556,14 @@ impl PositionBuilder {
 
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
-        Ok(Data::Position(PositionReport {
-            timestamp: self.timestamp,
-            messaging: self.messaging,
-            fields: {
-                let fields = self.common.positioned("a position report", false)?;
-                self.common.box_fault(&fields, |fields| {
-                    Data::Position(PositionReport { timestamp: self.timestamp, messaging: self.messaging, fields })
-                })?;
-                fields
-            },
-        }))
+        let (fields, no_symbol) = self.common.positioned("a position report", false)?;
+        self.common
+            .box_fault(&fields, |fields| Data::Position(PositionReport { timestamp: self.timestamp, messaging: self.messaging, fields }))?;
+        settle(
+            &self.station,
+            Data::Position(PositionReport { timestamp: self.timestamp, messaging: self.messaging, fields }),
+            no_symbol.into_iter().collect(),
+        )
     }
 
     /// The packet: the station's header and this report, encoded.
@@ -592,14 +606,20 @@ impl ObjectBuilder {
 
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
-        let fields = self.common.positioned("an object", false)?;
-        self.common.box_fault(&fields, |fields| {
-            Data::Object(ObjectReport { name: self.name.clone(), killed: self.killed, timestamp: self.timestamp, fields })
-        })?;
-        let timestamp = self.timestamp.ok_or_else(|| {
-            EncodeError::new(RefusalCode::MissingField, "an object needs a timestamp: call timestamp(...) or permanent()")
-        })?;
-        Ok(Data::Object(ObjectReport { name: self.name.clone(), killed: self.killed, timestamp: Some(timestamp), fields }))
+        let (fields, no_symbol) = self.common.positioned("an object", false)?;
+        // A timestamp left out is tried as a placeholder, as a symbol is.
+        let no_timestamp = self
+            .timestamp
+            .is_none()
+            .then(|| EncodeError::new(RefusalCode::MissingField, "an object needs a timestamp: call timestamp(...) or permanent()"));
+        let timestamp = Some(self.timestamp.unwrap_or(Timestamp::dhm(1, 0, 0)));
+        self.common
+            .box_fault(&fields, |fields| Data::Object(ObjectReport { name: self.name.clone(), killed: self.killed, timestamp, fields }))?;
+        settle(
+            &self.station,
+            Data::Object(ObjectReport { name: self.name.clone(), killed: self.killed, timestamp, fields }),
+            no_symbol.into_iter().chain(no_timestamp).collect(),
+        )
     }
 
     /// The packet: the station's header and this object, encoded.
@@ -628,9 +648,13 @@ impl ItemBuilder {
 
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
-        let fields = self.common.positioned("an item", false)?;
+        let (fields, no_symbol) = self.common.positioned("an item", false)?;
         self.common.box_fault(&fields, |fields| Data::Item(ItemReport { name: self.name.clone(), killed: self.killed, fields }))?;
-        Ok(Data::Item(ItemReport { name: self.name.clone(), killed: self.killed, fields }))
+        settle(
+            &self.station,
+            Data::Item(ItemReport { name: self.name.clone(), killed: self.killed, fields }),
+            no_symbol.into_iter().collect(),
+        )
     }
 
     /// The packet: the station's header and this item, encoded.
@@ -667,7 +691,7 @@ impl MicEBuilder {
 
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
-        let fields = self.common.positioned("a Mic-E report", true)?;
+        let (fields, no_symbol) = self.common.positioned("a Mic-E report", true)?;
         let report = |fields: Positioned| MicEReport {
             mic_e_message: self.mic_e_message,
             // The type code says whether the station can message (APRS 1.2 Mic-E type codes).
@@ -692,7 +716,7 @@ impl MicEBuilder {
                 ));
             }
         }
-        Ok(Data::MicE(report(fields)))
+        settle(&self.station, Data::MicE(report(fields)), no_symbol.into_iter().collect())
     }
 
     /// The packet: the station's source and path, the destination this report computes, and the report.
@@ -856,6 +880,7 @@ impl WeatherBuilder {
     /// The data, without a header: a position report with a position, otherwise a positionless report.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
         let weather = self.weather.clone();
+        // What a positionless report needs and was not given is tried with placeholders, as a symbol is.
         if let Some(position) = self.position {
             let fields = Positioned {
                 position,
@@ -867,19 +892,21 @@ impl WeatherBuilder {
             };
             return Ok(Data::Position(PositionReport { timestamp: self.timestamp, messaging: self.messaging, fields }));
         }
+        let mut missing = Vec::new();
         if self.messaging || self.compressed || self.dao.is_some() || self.symbol != Symbol::WEATHER_STATION {
-            return Err(EncodeError::new(
+            missing.push(EncodeError::new(
                 RefusalCode::MissingField,
                 "a symbol, messaging, compression and DAO need a position: call at(latitude, longitude)",
             ));
         }
-        let timestamp = self.timestamp.ok_or_else(|| {
-            EncodeError::new(
+        if self.timestamp.is_none() {
+            missing.push(EncodeError::new(
                 RefusalCode::MissingField,
                 "a positionless weather report needs a timestamp: call timestamp(Timestamp::mdhm(...))",
-            )
-        })?;
-        Ok(Data::Weather(WeatherReport { timestamp: Some(timestamp), weather, comment: String::new() }))
+            ));
+        }
+        let timestamp = Some(self.timestamp.unwrap_or(Timestamp::mdhm(1, 1, 0, 0)));
+        settle(&self.station, Data::Weather(WeatherReport { timestamp, weather, comment: String::new() }), missing)
     }
 
     /// The packet: the station's header and this report, encoded.

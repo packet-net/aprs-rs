@@ -470,8 +470,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             p.run(weather::field(&mut out, b'c', direction, 3, false));
             p.run(weather::field(&mut out, b's', w.weather.wind_speed_mph, 3, false));
             weather::write_fields(&mut out, &w.weather, &mut p);
-            p.size(out.len());
-            p.finish()?;
+            p.finish_faults()?;
             // The software type and unit, and the extra fields, must not read back as fields.
             match positionless_weather(&mut Context::new(ParseOptions::LENIENT), &out) {
                 Some(Data::Weather(back)) if weather::text_parts(&back.weather) == weather::text_parts(&w.weather) => {}
@@ -482,6 +481,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                     ));
                 }
             }
+            crate::refusal::check_size(out.len())?;
         }
         Data::RawWeather(r) => {
             if !text::is_printable_ascii(r.data.as_bytes()) {

@@ -351,12 +351,11 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned, mut p: Pending) -> R
         }
         out.extend_from_slice(&trailer);
     }
-    // The information field is at most 256 bytes, judged on the bytes the fields make as given.
-    p.size(out.len());
-    // What is wrong on its own, or between fields, is named before the read-back result is.
-    p.finish()?;
+    // What is wrong on its own, or between fields, is named before the read-back result is, and
+    // the size, which only the bytes finally written have, comes last.
+    p.finish_faults()?;
     if read_back {
-        return Ok(());
+        return crate::refusal::check_size(out.len());
     }
     if f.weather.is_some() {
         return Err(EncodeError::new(
