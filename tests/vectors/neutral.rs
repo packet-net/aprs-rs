@@ -440,7 +440,7 @@ impl<'a> Keys<'a> {
     fn float(&self, k: &str) -> Read<Option<f64>> {
         match self.get(k) {
             None => Ok(None),
-            Some(v) => v.as_f64().map(Some).ok_or_else(|| Unreadable::Unsupported(format!("{}: not a number", self.name(k)))),
+            Some(v) => num(v).map(Some).ok_or_else(|| Unreadable::Unsupported(format!("{}: not a number", self.name(k)))),
         }
     }
 
@@ -468,9 +468,12 @@ impl<'a> Keys<'a> {
                 .map(Some)
                 .map_err(|_| Unreadable::Refused(pdn_aprs::RefusalCode::ValueOutOfRange, format!("{}: outside its field", self.name(k))));
         }
-        let Some(x) = v.as_f64().filter(|x| x.is_finite()) else {
+        let Some(x) = num(v) else {
             return unsupported(format!("{}: not a number", self.name(k)));
         };
+        if !x.is_finite() {
+            return Err(Unreadable::Refused(pdn_aprs::RefusalCode::NotANumber, format!("{}: not a number", self.name(k))));
+        }
         T::try_from(round_steps(x) as i128).map(Some).map_err(|_| {
             Unreadable::Refused(pdn_aprs::RefusalCode::ValueOutOfRange, format!("{}: outside its field once rounded", self.name(k)))
         })
@@ -538,7 +541,7 @@ fn whole(v: &Value) -> Option<i128> {
     if let Some(n) = v.as_u64() {
         return Some(i128::from(n));
     }
-    let f = v.as_f64()?;
+    let f = num(v)?;
     (f.fract() == 0.0 && f.abs() < 1e30).then_some(f as i128)
 }
 
@@ -721,7 +724,7 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             addressee: o.text("addressee")?,
             coefficients: o
                 .array("coefficients")?
-                .map(|a| a.iter().map(Value::as_f64).collect::<Option<Vec<f64>>>())
+                .map(|a| a.iter().map(num).collect::<Option<Vec<f64>>>())
                 .unwrap_or(Some(Vec::new()))
                 .ok_or_else(|| Unreadable::Unsupported("coefficients: each is a number".into()))?,
             coefficients_text: Vec::new(),
@@ -758,9 +761,7 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             },
             analog: o
                 .array("analog")?
-                .map(|a| {
-                    a.iter().map(|x| if x.is_null() { Some(None) } else { x.as_f64().map(Some) }).collect::<Option<Vec<Option<f64>>>>()
-                })
+                .map(|a| a.iter().map(|x| if x.is_null() { Some(None) } else { num(x).map(Some) }).collect::<Option<Vec<Option<f64>>>>())
                 .unwrap_or(Some(Vec::new()))
                 .ok_or_else(|| Unreadable::Unsupported("analog: each is a number or null".into()))?,
             analog_text: Vec::new(),
@@ -832,6 +833,20 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             // source (APRS12c ch. 17), and its diagnostics are part of the data. This crate keeps
             // the inner information field as received, which the neutral form does not carry, so
             // it is the inner data encoded.
+            // Nesting is counted by walking the value, before anything recurses into it: more than
+            // four deep is refused first, as the encoder does.
+            let mut depth = 1;
+            let mut inner = v;
+            while let Some(next) = inner.get("packet").and_then(|p| p.get("data")).filter(|d| d["type"] == "third-party") {
+                depth += 1;
+                inner = next;
+            }
+            if depth > 4 {
+                return Err(Unreadable::Refused(
+                    pdn_aprs::RefusalCode::InvalidThirdPartyHeader,
+                    "third-party packets nest at most four deep".into(),
+                ));
+            }
             let p = o.required("packet", o.object("packet", &["source", "destination", "path", "data", "diagnostics"])?)?;
             let source = p.text("source")?;
             let source = Address::third_party_source(&source).or_else(|_| unsupported("packet.source: not a third-party source".into()))?;
@@ -845,8 +860,19 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             let destination = read_destination(&destination_text)?;
             let path = p.strings("path")?.iter().map(|e| read_path_entry_checked(e)).collect::<Read<Vec<PathEntry>>>()?;
             let diagnostics = p.strings("diagnostics")?.iter().map(|d| read_diagnostic(d)).collect::<Read<Vec<Diagnostic>>>()?;
-            // The header is written before the data, so a header the encoder cannot write back is
-            // refused before the inner data is looked at.
+            // Undecoded data has no neutral form of its bytes: not-encodable, the first of the
+            // refusal reasons, which no header fault outranks.
+            let data = try_read_data(p.required("data", p.get("data"))?);
+            if let Err(e @ Unreadable::Unsupported(_)) = data {
+                return Err(e);
+            }
+            if let Ok(Data::Unrecognized(u)) = &data {
+                if *u != Unrecognized::Empty {
+                    return unsupported("packet.data: undecoded, and its bytes are not in the neutral form".into());
+                }
+            }
+            // A header the encoder cannot write back is refused before the inner data's own
+            // faults are named (invalid-third-party-header comes before them in the refusal order).
             let header_defect = diagnostics.iter().any(|d| {
                 matches!(
                     d.code,
@@ -864,10 +890,9 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
                     "the third-party packet's header cannot be written back".into(),
                 ));
             }
-            let data = try_read_data(p.required("data", p.get("data"))?)?;
+            let data = data?;
             let information = match &data {
-                Data::Unrecognized(Unrecognized::Empty) => Vec::new(),
-                Data::Unrecognized(_) => return unsupported("packet.data: undecoded, and its bytes are not in the neutral form".into()),
+                Data::Unrecognized(_) => Vec::new(),
                 data => data.encode().map_err(|e| Unreadable::Refused(e.code(), format!("the inner packet's data: {e}")))?,
             };
             // Packet is non-exhaustive: start from decoding the information field, then say what the
@@ -1249,4 +1274,44 @@ fn read_weather(o: &Keys) -> Read<Option<Weather>> {
         unit: w.string("unit")?,
         extra,
     }))
+}
+
+/// The marker `read_json` puts where the generator wrote a NaN or an infinity, which JSON cannot hold.
+const NONFINITE: &str = "\u{0}nonfinite:";
+
+/// A JSON line as the generator writes it, with the non-standard tokens `NaN`, `Infinity` and
+/// `-Infinity` (`--nonfinite`) read as numbers: [`num`] gives them back.
+#[allow(dead_code)]
+pub fn read_json(line: &str) -> serde_json::Result<Value> {
+    let mut text = String::with_capacity(line.len());
+    let (mut in_string, mut escaped) = (false, false);
+    let mut rest = line;
+    while let Some(c) = rest.chars().next() {
+        if in_string {
+            in_string = c != '"' || escaped;
+            escaped = c == '\\' && !escaped;
+        } else if c == '"' {
+            in_string = true;
+        } else if let Some(token) = ["-Infinity", "Infinity", "NaN"].into_iter().find(|t| rest.starts_with(t)) {
+            text.push_str(&format!("\"\\u0000nonfinite:{token}\""));
+            rest = &rest[token.len()..];
+            continue;
+        }
+        text.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    serde_json::from_str(&text)
+}
+
+/// A number in the neutral form, including the marked non-finite ones `read_json` leaves.
+pub fn num(v: &Value) -> Option<f64> {
+    match v {
+        Value::String(s) => match s.strip_prefix(NONFINITE)? {
+            "NaN" => Some(f64::NAN),
+            "Infinity" => Some(f64::INFINITY),
+            "-Infinity" => Some(f64::NEG_INFINITY),
+            _ => None,
+        },
+        v => v.as_f64(),
+    }
 }

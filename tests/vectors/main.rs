@@ -265,7 +265,10 @@ fn reencode(case: &Value) -> Result<(), String> {
     let (info, destination) = match written {
         Err(e) => {
             return if expected == "refused" {
-                Ok(())
+                match case.get("reencode_refusal").and_then(Value::as_str) {
+                    Some(code) if code != e.code().id() => Err(format!("reencode: expected the refusal {code}, got {}: {e}", e.code())),
+                    _ => Ok(()),
+                }
             } else {
                 Err(format!("reencode: expected {expected}, but the encoder refused: {e}"))
             };
@@ -315,13 +318,16 @@ fn encode(case: &Value) -> Result<(), String> {
     let expect = &case["expect"];
     let written = match neutral::try_read_data(&input["encode"]) {
         Err(neutral::Unreadable::Unsupported(why)) => return Err(format!("encode: this crate's data cannot hold it: {why}")),
-        Err(neutral::Unreadable::Refused(_, why)) => Err(why),
-        Ok(data) => Packet::create(source(input), destination(input), Vec::new(), data).map_err(|e| e.to_string()),
+        Err(neutral::Unreadable::Refused(code, why)) => Err((code, why)),
+        Ok(data) => Packet::create(source(input), destination(input), Vec::new(), data).map_err(|e| (e.code(), e.to_string())),
     };
     let packet = match written {
-        Err(e) => {
+        Err((code, e)) => {
             return if expect.get("refused").and_then(Value::as_bool) == Some(true) {
-                Ok(())
+                match expect.get("refusal").and_then(Value::as_str) {
+                    Some(want) if want != code.id() => Err(format!("encode: expected the refusal {want}, got {code}: {e}")),
+                    _ => Ok(()),
+                }
             } else {
                 Err(format!("encode: expected {}, but the encoder refused: {e}", expect["info"]))
             };
@@ -348,9 +354,12 @@ fn readback(case: &Value) -> Result<(), String> {
     let Ok(packet) = decode(&case["input"], ParseOptions::LENIENT) else {
         return Ok(());
     };
-    if matches!(packet.data, Data::Unrecognized(_))
-        || matches!(&packet.data, Data::ThirdParty(p) if matches!(p.data, Data::Unrecognized(_)))
-    {
+    // Undecoded data has no neutral form to read back, at any depth of third-party packets.
+    let mut innermost = &packet.data;
+    while let Data::ThirdParty(p) = innermost {
+        innermost = &p.data;
+    }
+    if matches!(innermost, Data::Unrecognized(_)) {
         return Ok(());
     }
     let written = neutral::data(&packet.data);

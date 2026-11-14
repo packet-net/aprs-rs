@@ -375,11 +375,18 @@ pub(crate) fn capabilities(ctx: &mut Context, info: &[u8]) -> Option<Data> {
     Some(Data::Capabilities(Capabilities { capabilities: items }))
 }
 
+/// How many third-party headers a decoder reads, one inside another.
+const MAX_THIRD_PARTY_DEPTH: usize = 4;
+
 /// `}` and a whole TNC2 packet, decoded with the same options. Its source may be any 1-9
 /// printable ASCII characters other than `>` and `:` (APRS12c ch. 17); a defect its header may
 /// tolerate is a warning on the inner packet, and rejects it when not tolerated.
 pub(crate) fn third_party(ctx: &mut Context, info: &[u8]) -> Option<Data> {
-    match Packet::decode_third_party(&info[1..], ctx.options) {
+    if ctx.depth >= MAX_THIRD_PARTY_DEPTH {
+        ctx.error(Code::InvalidThirdParty, "third-party packets nest at most four deep", Some(1));
+        return None;
+    }
+    match Packet::decode_third_party(&info[1..], ctx.options, ctx.depth + 1) {
         Ok(inner) => Some(Data::ThirdParty(Box::new(inner))),
         Err(_) => {
             ctx.error(Code::InvalidThirdParty, "the third-party header is not SOURCE>DEST,PATH: (APRS12c ch. 17)", Some(1));
@@ -477,13 +484,13 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
         Data::Nmea(n) => return encode_nmea(n),
         Data::MaidenheadBeacon(m) => {
             let mut p = Pending::default();
-            if !status::is_locator(m.locator.as_bytes()) {
-                p.note(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 characters, e.g. IO91 or IO91SX"));
+            if !status::is_locator(m.locator.as_bytes()) || m.locator != m.locator.to_ascii_uppercase() {
+                p.note(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 upper-case characters, e.g. IO91 or IO91SX"));
             }
             p.run(printable(&m.comment, "a beacon comment"));
             p.finish()?;
             out.push(b'[');
-            out.extend_from_slice(m.locator.to_ascii_uppercase().as_bytes());
+            out.extend_from_slice(m.locator.as_bytes());
             out.push(b']');
             out.extend_from_slice(m.comment.as_bytes());
         }
@@ -547,6 +554,19 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             out.extend_from_slice(items.join(",").as_bytes());
         }
         Data::ThirdParty(p) => {
+            // Counted by walking the chain, not by recursing: a caller can build one thousands deep.
+            let mut depth = 1;
+            let mut inner = &p.data;
+            while let Data::ThirdParty(next) = inner {
+                depth += 1;
+                inner = &next.data;
+            }
+            if depth > MAX_THIRD_PARTY_DEPTH {
+                return Err(EncodeError::new(
+                    RefusalCode::InvalidThirdPartyHeader,
+                    "third-party packets nest at most four deep, and a decoder reads no more",
+                ));
+            }
             third_party_header(p)?;
             out.push(b'}');
             out.extend_from_slice(&p.to_tnc2());
@@ -603,6 +623,11 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
 fn encode_nmea(n: &Nmea) -> Result<Vec<u8>, EncodeError> {
     let mut p = Pending::default();
     let sentence = n.sentence.as_bytes();
+    for value in [n.latitude, n.longitude, n.course_degrees, n.speed_knots, n.altitude_m].into_iter().flatten() {
+        if !value.is_finite() {
+            p.note(EncodeError::new(RefusalCode::NotANumber, "an NMEA field is not a number"));
+        }
+    }
     if text::has_line_break(n.comment.as_bytes()) {
         p.note(EncodeError::new(RefusalCode::InvalidCharacter, "an NMEA comment cannot contain a line break"));
     }

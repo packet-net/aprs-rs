@@ -582,7 +582,13 @@ fn id_ok(id: &str) -> bool {
 fn id_and_reply(out: &mut Vec<u8>, id: &Option<String>, reply_ack: &Option<String>, p: &mut Pending) {
     match (id, reply_ack) {
         (None, None) => {}
-        (None, Some(_)) => p.note(EncodeError::new(RefusalCode::MissingField, "a reply-ack goes with a message ID")),
+        (None, Some(r)) => {
+            // A reply-ack wrong on its own is wrong whatever else is given.
+            if !r.is_empty() && !id_ok(r) {
+                p.note(EncodeError::new(RefusalCode::InvalidMessageId, "a reply-ack is 1-5 letters or digits"));
+            }
+            p.note(EncodeError::new(RefusalCode::MissingField, "a reply-ack goes with a message ID"));
+        }
         (Some(id), reply) => {
             if !id_ok(id) {
                 p.note(EncodeError::new(RefusalCode::InvalidMessageId, "a message ID is 1-5 letters or digits (APRS12c ch. 14)"));

@@ -217,6 +217,12 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned, mut p: Pending) -> R
         }
         dao_digits = position::encode_uncompressed(out, &f.position, f.symbol, dao_mode, &mut p);
         extension = uncompressed_extension(out, f, &mut p);
+        if count + usize::from(f.weather.is_some()) > 1 && extension {
+            // When several things want the one extension the first is written and the rest are not,
+            // but each keeps its own checks: a PHG digit of 10 beside a course is out of range, not
+            // only in conflict (interpretations.md, "Which refusal a record with two faults gets").
+            other_extensions_checked(f, &mut p);
+        }
     }
 
     if let Some(w) = &f.weather {
@@ -277,7 +283,9 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned, mut p: Pending) -> R
     }
     let text_at = out.len();
     let mut trailer = Vec::new();
-    if let Some(t) = &f.telemetry {
+    // A weather report has no comment, so base-91 telemetry has no place in it and its own checks
+    // do not run.
+    if let Some(t) = f.telemetry.as_ref().filter(|_| f.weather.is_none()) {
         telemetry_into(&mut trailer, t, &mut p);
     }
     if let Some(d) = f.dao {
@@ -384,6 +392,14 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned, p: &mut Pending) -> bool {
                 "the cs bytes carry the GGA altitude, so a compressed position cannot also carry a course, speed, range or wind",
             ));
         }
+        // What wants the cs bytes besides the altitude keeps its own checks: the place exists but
+        // is wanted twice.
+        if let Some(w) = wind {
+            wind_code(w, p);
+        }
+        if course_speed {
+            course_speed_code(f, p);
+        }
         if let Some(feet) = f.altitude_feet {
             if !feet.is_finite() {
                 p.note(EncodeError::new(RefusalCode::NotANumber, "the altitude is not a number"));
@@ -401,7 +417,11 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned, p: &mut Pending) -> bool {
             }
         }
     } else if let Some(w) = wind {
-        // A weather station's cs course and speed are its wind.
+        // A weather station's cs course and speed are its wind. A course or speed has no place
+        // there, but is judged in the checks of the form the place has before the conflict.
+        if course_speed {
+            course_speed_code(f, p);
+        }
         if let Some(range) = f.range_miles {
             range_step(range, p);
             p.note(EncodeError::new(RefusalCode::ExtensionConflict, "the cs bytes carry the wind or a range, not both"));
@@ -414,18 +434,7 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned, p: &mut Pending) -> bool {
                 "the cs bytes carry the wind as a direction and a speed together, so both are needed",
             ));
         }
-        if let Some(dir) = w.wind_direction_degrees {
-            match direction_code(dir, "wind direction") {
-                Ok(v) => c = v,
-                Err(e) => p.note(e),
-            }
-        }
-        if let Some(mph) = w.wind_speed_mph {
-            match speed_code(mph / KNOTS_TO_MPH) {
-                Ok(v) => s = v,
-                Err(e) => p.note(e),
-            }
-        }
+        (c, s) = wind_code(w, p);
     } else if let Some(range) = f.range_miles {
         if course_speed {
             p.note(EncodeError::new(
@@ -433,19 +442,8 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned, p: &mut Pending) -> bool {
                 "the cs bytes carry a course and speed or a range, not both (APRS12c ch. 9)",
             ));
         }
-        // The steps are 2 x 1.08^s miles for every whole s, and a range rounds to the nearest;
-        // one whose s is below the byte's 0 is refused (1.95 miles is s 0, 1.9 is s -1).
-        if let Some(course) = f.course_degrees {
-            // A course of 0 has no form, whatever else is wrong.
-            match whole_degrees(course, "course") {
-                Err(e) => p.note(e),
-                Ok(0) => p.note(EncodeError::new(
-                    RefusalCode::ValueHasNoForm,
-                    "a compressed course of 0 would read back as 360, and the cs bytes have no unknown course",
-                )),
-                Ok(_) => {}
-            }
-        }
+        // A course and speed beside the range keep their own checks (a course of 0 has no form).
+        course_speed_code(f, p);
         if let Some(step) = range_step(range, p) {
             (c, s) = (b'{' - 33, step);
         }
@@ -459,27 +457,7 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned, p: &mut Pending) -> bool {
                 "the cs bytes carry a course and a speed together, so a compressed report needs both",
             ));
         }
-        if let Some(course) = f.course_degrees {
-            // Unknown (0) and in range (1-360) are decided in whole degrees; a known course is then rounded
-            // once to the 4-degree step, where the step at north is 360.
-            match whole_degrees(course, "course") {
-                Err(e) => p.note(e),
-                Ok(0) => p.note(EncodeError::new(
-                    RefusalCode::ValueHasNoForm,
-                    "a compressed course of 0 would read back as 360, and the cs bytes have no unknown course",
-                )),
-                Ok(_) => match direction_code(course, "course") {
-                    Ok(v) => c = v,
-                    Err(e) => p.note(e),
-                },
-            }
-        }
-        if let Some(knots) = f.speed_knots {
-            match speed_code(knots) {
-                Ok(v) => s = v,
-                Err(e) => p.note(e),
-            }
-        }
+        (c, s) = course_speed_code(f, p);
     } else {
         // No course/speed, range or altitude: the spec's own form for that, which has no type byte.
         if f.compression.is_some() {
@@ -495,6 +473,54 @@ fn compressed_cs(out: &mut Vec<u8>, f: &Positioned, p: &mut Pending) -> bool {
     out.push(s + 33);
     out.push(type_to_bits(t) + 33);
     altitude
+}
+
+/// A compressed report's c and s bytes for its course and speed, noting what is wrong with each
+/// value on its own: a course of 0 has no form, and the others are in range or not.
+fn course_speed_code(f: &Positioned, p: &mut Pending) -> (u8, u8) {
+    let (mut c, mut s) = (0, 0);
+    if let Some(course) = f.course_degrees {
+        // Unknown (0) and in range (1-360) are decided in whole degrees; a known course is then rounded
+        // once to the 4-degree step, where the step at north is 360.
+        match whole_degrees(course, "course") {
+            Err(e) => p.note(e),
+            Ok(0) => p.note(EncodeError::new(
+                RefusalCode::ValueHasNoForm,
+                "a compressed course of 0 would read back as 360, and the cs bytes have no unknown course",
+            )),
+            Ok(_) => match direction_code(course, "course") {
+                Ok(v) => c = v,
+                Err(e) => p.note(e),
+            },
+        }
+    }
+    if let Some(knots) = f.speed_knots {
+        match speed_code(knots) {
+            Ok(v) => s = v,
+            Err(e) => p.note(e),
+        }
+    }
+    (c, s)
+}
+
+/// A compressed weather report's c and s bytes for its wind, noting what is wrong with each value
+/// on its own. A direction is in range or not in whole degrees, as a course is, and one in range is
+/// then rounded once to the 4-degree step.
+fn wind_code(w: &crate::Weather, p: &mut Pending) -> (u8, u8) {
+    let (mut c, mut s) = (0, 0);
+    if let Some(dir) = w.wind_direction_degrees {
+        match whole_degrees(dir, "wind direction").and_then(|_| direction_code(dir, "wind direction")) {
+            Ok(v) => c = v,
+            Err(e) => p.note(e),
+        }
+    }
+    if let Some(mph) = w.wind_speed_mph {
+        match speed_code(mph / KNOTS_TO_MPH) {
+            Ok(v) => s = v,
+            Err(e) => p.note(e),
+        }
+    }
+    (c, s)
 }
 
 /// A compressed range's s byte: the steps are 2 x 1.08^s miles for every whole s, and a range rounds
@@ -563,6 +589,37 @@ fn three(out: &mut Vec<u8>, v: Option<u32>, max: u32, what: &str) -> Result<(), 
         Some(_) => return Err(EncodeError::new(RefusalCode::ValueOutOfRange, format!("{what} does not fit in its three digits"))),
     }
     Ok(())
+}
+
+/// Runs the checks of every kind of data extension but the one `uncompressed_extension` writes.
+fn other_extensions_checked(f: &Positioned, p: &mut Pending) {
+    let kinds: [fn(&mut Positioned, &Positioned); 5] = [
+        |g, f| {
+            g.course_degrees = f.course_degrees;
+            g.speed_knots = f.speed_knots;
+            g.df_bearing = f.df_bearing;
+            g.storm = f.storm;
+        },
+        |g, f| g.phg = f.phg,
+        |g, f| g.range_miles = f.range_miles,
+        |g, f| g.dfs = f.dfs,
+        |g, f| g.area = f.area,
+    ];
+    // Weather is written first; without it, the first kind present is.
+    let mut first = f.weather.is_none();
+    for kind in kinds {
+        let mut only = Positioned { symbol: f.symbol, ..Positioned::default() };
+        kind(&mut only, f);
+        let mut scratch = Pending::default();
+        if !uncompressed_extension(&mut Vec::new(), &only, &mut scratch) {
+            continue;
+        }
+        if first {
+            first = false;
+            continue;
+        }
+        uncompressed_extension(&mut Vec::new(), &only, p);
+    }
 }
 
 /// Writes the 7-byte data extension of an uncompressed position; `true` if there is one.
@@ -717,8 +774,8 @@ fn whole(v: Option<f64>, what: &str) -> Result<Option<u32>, EncodeError> {
     match v {
         None => Ok(None),
         // Rounded first, so -0.3 is 0.
-        Some(x) if crate::steps::round(x) >= 0.0 => Ok(Some(crate::steps::round(x) as u32)),
-        Some(_) => Err(EncodeError::new(RefusalCode::ValueOutOfRange, format!("{what} cannot be negative"))),
+        Some(x) if x.is_finite() && crate::steps::round(x) >= 0.0 => Ok(Some(crate::steps::round(x) as u32)),
+        Some(x) => Err(EncodeError::new(RefusalCode::for_value(x), format!("{what} cannot be negative"))),
     }
 }
 
@@ -811,7 +868,10 @@ pub(crate) fn telemetry_into(out: &mut Vec<u8>, t: &crate::CommentTelemetry, p: 
     if t.sequence > max || t.analog.iter().any(|v| *v > max) {
         p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "comment telemetry values are 0-8280"));
     }
-    if t.analog.is_empty() || t.analog.len() > 5 || (t.digital.is_some() && t.analog.len() != 5) {
+    if t.analog.len() > 5 {
+        p.note(EncodeError::new(RefusalCode::TooLong, "comment telemetry has at most 5 analog values"));
+    }
+    if t.analog.is_empty() || (t.digital.is_some() && t.analog.len() != 5) {
         p.note(EncodeError::new(
             RefusalCode::Malformed,
             "comment telemetry has 1-5 analog values, and the digital bits only after all five",
@@ -847,6 +907,11 @@ fn reads_back(written: &[u8], f: &Positioned) -> Result<(), &'static str> {
     };
     // A /A= or RNG value is written rounded to its whole step.
     let rounded = |a: Option<f64>, b: Option<f64>| a.is_some() && a == b.map(crate::steps::round);
+    // The cs bytes cannot hold an altitude of 1 foot or less: the nearest is cs 0, 1 foot, which
+    // a compressed weather report (no comment, so no `/A=`) is written with alone.
+    let cs_floor = |f: &Positioned, back: Option<f64>| {
+        f.compressed && f.weather.is_some() && f.altitude_feet.is_some_and(|feet| feet <= 1.0) && back == Some(1.0)
+    };
     let frequency_fields =
         |v: &Option<crate::VoiceFrequency>| v.as_ref().map(|x| (x.tone, x.tone_value, x.offset_khz, x.range, x.range_km, x.narrow));
     let checks = [
@@ -861,7 +926,12 @@ fn reads_back(written: &[u8], f: &Positioned) -> Result<(), &'static str> {
         (back.signpost == f.signpost, "signpost"),
         (back.dao.map(|d| d.datum) == f.dao.map(|d| d.datum), "DAO"),
         (back.weather.as_ref().map(weather::text_parts) == f.weather.as_ref().map(weather::text_parts), "weather"),
-        (close(back.altitude_feet, f.altitude_feet, 0.01) || rounded(back.altitude_feet, f.altitude_feet), "altitude"),
+        (
+            close(back.altitude_feet, f.altitude_feet, 0.01)
+                || rounded(back.altitude_feet, f.altitude_feet)
+                || cs_floor(f, back.altitude_feet),
+            "altitude",
+        ),
         (close(back.range_miles, f.range_miles, 0.1) || rounded(back.range_miles, f.range_miles), "range"),
     ];
     match checks.iter().find(|(same, _)| !same) {

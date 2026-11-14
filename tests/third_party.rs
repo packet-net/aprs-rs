@@ -33,3 +33,26 @@ fn a_late_position_is_noted_before_its_own_diagnostics() {
     let codes: Vec<_> = packet.diagnostics.iter().map(|d| d.code).collect();
     assert_eq!(codes, [pdn_aprs::Code::PositionNotAtStart, pdn_aprs::Code::WeatherComment]);
 }
+
+/// A caller can build a chain of third-party packets as deep as it likes; the encoder refuses one
+/// deeper than four without recursing (vectors README, Encoding).
+#[test]
+fn a_caller_built_chain_ten_thousand_deep_is_refused_without_recursion() {
+    use pdn_aprs::{Address, RefusalCode};
+    let address = || Address::new("A").unwrap();
+    let mut chain = Packet::decode(address(), Address::new("B").unwrap(), Vec::new(), b">hi", ParseOptions::LENIENT);
+    for _ in 0..10_000 {
+        let data = Data::ThirdParty(Box::new(chain));
+        let mut outer = Packet::decode(address(), Address::new("B").unwrap(), Vec::new(), b">x", ParseOptions::LENIENT);
+        outer.data = data;
+        chain = outer;
+    }
+    let refusal = chain.data.encode().unwrap_err();
+    assert_eq!(refusal.code(), RefusalCode::InvalidThirdPartyHeader);
+    // Dropping, cloning, comparing and printing a chain this deep recurse (the types are plain
+    // data); unwind it here so the test does not.
+    let mut next = chain.data;
+    while let Data::ThirdParty(mut p) = next {
+        next = core::mem::replace(&mut p.data, Data::Unrecognized(pdn_aprs::Unrecognized::Empty));
+    }
+}

@@ -398,9 +398,14 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     // Latitude digits into the destination, blanked for ambiguity: rounding then blanking keeps the
     // box the position is in, and a decoded position (the centre of its box) writes back the same
     // digits.
-    let mut lat_units = crate::steps::round(p.latitude.abs() * 60.0 * per_minute) as u64;
-    let lat_extra = (lat_units % extra_base) as u8;
-    lat_units /= extra_base;
+    // An ambiguous position is cut to its box, not rounded and then cut again (interpretations.md).
+    let cut = p.ambiguity > 0 && dao.is_none();
+    let (lat_units, lat_extra) = if cut {
+        (crate::position::cut_to_box(p.latitude, p.ambiguity), 0)
+    } else {
+        let units = crate::steps::round(p.latitude.abs() * 60.0 * per_minute) as u64;
+        (units / extra_base, (units % extra_base) as u8)
+    };
     // The box, in hundredths of a minute, that each level of ambiguity blanks.
     let box_size = [1u64, 10, 100, 1000, 6000][p.ambiguity as usize];
     if p.ambiguity > 0 && lat_units / box_size * box_size + box_size / 2 > 90 * 6000 {
@@ -410,9 +415,12 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         ));
     }
     let lat_text = format!("{:02}{:02}{:02}", lat_units / 6000, lat_units % 6000 / 100, lat_units % 100);
-    let mut lon_units = crate::steps::round(p.longitude.abs() * 60.0 * per_minute) as u64;
-    let lon_extra = (lon_units % extra_base) as u8;
-    lon_units /= extra_base;
+    let (mut lon_units, lon_extra) = if cut {
+        (crate::position::cut_to_box(p.longitude, p.ambiguity), 0)
+    } else {
+        let units = crate::steps::round(p.longitude.abs() * 60.0 * per_minute) as u64;
+        (units / extra_base, (units % extra_base) as u8)
+    };
     // The longitude digits the ambiguity makes a decoder ignore hold the centre it reports (vectors
     // README, Mic-E).
     if p.ambiguity > 0 {
@@ -542,8 +550,8 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     }
     if let Some(loc) = &r.locator {
         let b = loc.as_bytes();
-        if locator_len(&[b, b"/G"].concat()) != Some(b.len()) {
-            pend.note(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 characters, e.g. IO91 or IO91SX"));
+        if locator_len(&[b, b"/G"].concat()) != Some(b.len()) || *loc != loc.to_ascii_uppercase() {
+            pend.note(EncodeError::new(RefusalCode::Malformed, "a grid locator is 4 or 6 upper-case characters, e.g. IO91 or IO91SX"));
         }
         out.extend_from_slice(b);
         out.extend_from_slice(b"/G");
@@ -561,26 +569,40 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         }
     }
     let before_extension = out.len();
-    if let Some(ph) = f.phg {
-        pend.run(encode::phg_codes(&mut out, ph));
-        if let Some(rate) = ph.beacons_per_hour {
-            match comment::beacon_rate_char(rate) {
-                Some(c) => {
-                    out.push(c);
-                    out.push(b'/');
+    // One of PHG, RNG and DFS is written; any other keeps its own checks.
+    let mut written = false;
+    for kind in 0..3 {
+        let mut scratch = Vec::new();
+        let target = if written { &mut scratch } else { &mut out };
+        match kind {
+            0 => {
+                let Some(ph) = f.phg else { continue };
+                pend.run(encode::phg_codes(target, ph));
+                if let Some(rate) = ph.beacons_per_hour {
+                    match comment::beacon_rate_char(rate) {
+                        Some(c) => {
+                            target.push(c);
+                            target.push(b'/');
+                        }
+                        None => pend.note(EncodeError::new(RefusalCode::ValueOutOfRange, "PHGR beacons per hour is 1-35")),
+                    }
                 }
-                None => pend.note(EncodeError::new(RefusalCode::ValueOutOfRange, "PHGR beacons per hour is 1-35")),
+            }
+            1 => {
+                let Some(range) = f.range_miles else { continue };
+                let n = crate::steps::round(range);
+                if !(0.0..=9999.0).contains(&n) {
+                    pend.note(EncodeError::new(RefusalCode::for_value(range), "RNG range is 0-9999 miles"));
+                } else {
+                    target.extend_from_slice(format!("RNG{:04}", n as u32).as_bytes());
+                }
+            }
+            _ => {
+                let Some(dfs) = f.dfs else { continue };
+                pend.run(encode::dfs_codes(target, dfs));
             }
         }
-    } else if let Some(range) = f.range_miles {
-        let n = crate::steps::round(range);
-        if !(0.0..=9999.0).contains(&n) {
-            pend.note(EncodeError::new(RefusalCode::for_value(range), "RNG range is 0-9999 miles"));
-        } else {
-            out.extend_from_slice(format!("RNG{:04}", n as u32).as_bytes());
-        }
-    } else if let Some(dfs) = f.dfs {
-        pend.run(encode::dfs_codes(&mut out, dfs));
+        written = true;
     }
     let after_extension = (out.len() > before_extension).then_some(out.len());
     if let Some(feet) = altitude_in_text {

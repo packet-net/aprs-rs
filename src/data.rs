@@ -54,7 +54,10 @@ pub enum Data {
     Query(Query),
     /// Station capabilities: `<` (APRS12c ch. 15).
     Capabilities(Capabilities),
-    /// Third-party traffic: `}` and a whole packet inside (APRS12c ch. 17).
+    /// Third-party traffic: `}` and a whole packet inside (APRS12c ch. 17). A decoder reads at most four
+    /// levels, and the encoder refuses data nested deeper (`invalid-third-party-header`) without recursing.
+    /// Dropping, cloning, comparing and printing a chain a caller built thousands deep does recurse, as
+    /// it does for any boxed type; take the chain apart in a loop first if you build one that deep.
     ThirdParty(Box<Packet>),
     /// User-defined data: `{` (APRS12c ch. 19).
     UserDefined(UserDefined),

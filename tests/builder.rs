@@ -493,3 +493,26 @@ fn weather_halves_and_the_direction_alone() {
     let line = sent(me().position(51.4543, -0.9781).symbol(Symbol::CAR).course_degrees(359.5).speed_knots(1.0).build().unwrap());
     assert!(line.contains("360/001"), "{line}");
 }
+
+#[test]
+fn a_builder_names_a_value_out_of_range_before_the_ambiguity_edge() {
+    use pdn_aprs::RefusalCode;
+    let code = |r: Result<Packet, pdn_aprs::EncodeError>| r.unwrap_err().code();
+    let edge = || me().position(90.0, 10.0).symbol(Symbol::CAR).ambiguity(2);
+    assert_eq!(code(edge().build()), RefusalCode::ValueHasNoForm);
+    assert_eq!(code(edge().course_degrees(360.5).speed_knots(1.0).build()), RefusalCode::ValueOutOfRange);
+    assert_eq!(code(edge().altitude_feet(999999.5).build()), RefusalCode::ValueOutOfRange);
+    assert_eq!(code(me().position(-90.00001, 10.0).symbol(Symbol::CAR).ambiguity(2).build()), RefusalCode::ValueOutOfRange);
+    let mic = || me().mic_e(90.0, 10.0).ambiguity(2).symbol(Symbol::CAR);
+    assert_eq!(code(mic().build()), RefusalCode::ValueHasNoForm);
+    assert_eq!(code(mic().speed_knots(999.5).build()), RefusalCode::ValueOutOfRange);
+}
+
+#[test]
+fn a_telemetry_builder_names_a_line_break_before_too_many_values() {
+    use pdn_aprs::RefusalCode;
+    let six = [Some(1.0); 6];
+    let code = |b: pdn_aprs::TelemetryBuilder| b.build().unwrap_err().code();
+    assert_eq!(code(me().telemetry(1).analog(&six)), RefusalCode::TooLong);
+    assert_eq!(code(me().telemetry(1).analog(&six).comment("a\rb")), RefusalCode::InvalidCharacter);
+}
