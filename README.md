@@ -226,4 +226,4 @@ The crate is `#![no_std]` and needs only `alloc`; its one dependency, [`libm`](h
 
 ## Licence
 
-AGPL-3.0-or-later ([`LICENSE`](https://github.com/packet-net/aprs-rs/blob/main/LICENSE)). It includes data from the APRS device identification database, CC BY-SA 2.0; see [`THIRD-PARTY-NOTICES.md`](https://github.com/packet-net/aprs-rs/blob/main/THIRD-PARTY-NOTICES.md).
+MIT ([`LICENSE`](https://github.com/packet-net/aprs-rs/blob/main/LICENSE)). It includes data from the APRS device identification database, CC BY-SA 2.0; see [`THIRD-PARTY-NOTICES.md`](https://github.com/packet-net/aprs-rs/blob/main/THIRD-PARTY-NOTICES.md).
