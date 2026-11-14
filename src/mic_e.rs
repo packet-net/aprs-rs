@@ -222,9 +222,14 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
         // Base-91 telemetry and a !DAO! are lifted out before the locator is read, so a locator
         // followed straight by them alone has nothing after it (vectors interpretations.md,
         // "Where a Mic-E locator is read").
-        if !s.is_empty() && !comment::without_telemetry_and_dao(&s).is_empty() {
-            if s[0] == b' ' {
-                s.remove(0);
+        let lifted = comment::without_telemetry_and_dao(&s);
+        if !lifted.is_empty() {
+            if lifted[0] == b' ' {
+                // Its space is the locator's, even with telemetry between them in the bytes; one
+                // at the very start is dropped here, the other is the comment's own delimiter.
+                if s[0] == b' ' {
+                    s.remove(0);
+                }
             } else if !ctx.tolerate(
                 Code::MissingSpaceAfterLocator,
                 "text straight after the grid locator; a space comes first (APRS12c ch. 10)",
@@ -517,33 +522,40 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         }
         out.push(t as u8);
     }
-    // Mic-E altitude is whole metres; one that is not exactly (a /A= altitude in feet, such as
-    // 30105, which is 9176 metres less 0.01 foot) goes in the text as /A=, so that it reads back
-    // the same (vectors README, Encoding).
+    // A Mic-E altitude goes in the Mic-E altitude bytes (whole metres, rounded to the nearest), unless
+    // it came from a `/A=` (the report says so) or only a `/A=` holds it: a whole number of feet within
+    // six digits that the bytes do not hold exactly (vectors README, Encoding).
     let mut altitude_in_text = None;
     if let Some(feet) = f.altitude_feet {
-        let metres = crate::steps::round(feet / METRES_TO_FEET);
-        if r.altitude_in_comment || !crate::steps::same_number(metres * METRES_TO_FEET, feet) {
+        if r.altitude_in_comment || only_a_text_altitude_holds(feet) {
             altitude_in_text = Some(feet);
         } else {
+            let metres = crate::steps::round(feet / METRES_TO_FEET);
             let datum = metres + 10_000.0;
             if !(0.0..91.0 * 91.0 * 91.0).contains(&datum) {
                 pend.note(EncodeError::new(RefusalCode::for_value(feet), "the Mic-E altitude is out of range"));
             } else {
                 let at = out.len();
-                base91::encode(datum as u32, 3, &mut out);
-                out.push(b'}');
-                // With no type code before it (legacy telemetry is taken off first), a first byte that is one reads back as the type code,
-                // and beyond six digits no `/A=` can say the altitude instead.
+                let mut bytes = Vec::new();
+                base91::encode(datum as u32, 3, &mut bytes);
+                bytes.push(b'}');
+                // With no type code before it (legacy telemetry is taken off first), a first byte that is one reads back as the type code:
+                // the altitude goes in a `/A=` if one holds it exactly, and has no form if not.
                 if r.type_code.is_none()
                     && at == status_start + if r.legacy_telemetry.is_empty() { 0 } else { 6 }
-                    && matches!(out[at], b'`' | b'\'' | b'>' | b']' | b' ')
-                    && !(-99_999.0..=999_999.0).contains(&crate::steps::round(feet))
+                    && matches!(bytes[0], b'`' | b'\'' | b'>' | b']' | b' ')
                 {
-                    pend.note(EncodeError::new(
-                        RefusalCode::ValueHasNoForm,
-                        "this Mic-E altitude has no form: its first byte would read as a type code and no /A= holds it",
-                    ));
+                    if whole_feet_in_six_digits(feet) {
+                        altitude_in_text = Some(feet);
+                    } else {
+                        pend.note(EncodeError::new(
+                            RefusalCode::ValueHasNoForm,
+                            "this Mic-E altitude has no form: its first byte would read as a type code and no /A= holds it",
+                        ));
+                    }
+                }
+                if altitude_in_text.is_none() {
+                    out.extend_from_slice(&bytes);
                 }
             }
         }
@@ -627,8 +639,8 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
 
     let text = f.comment.as_bytes();
     // A weather report has no comment: that is the fault, and the characters are not looked at.
-    if f.weather.is_none() && crate::text::has_line_break(text) {
-        pend.note(EncodeError::new(RefusalCode::InvalidCharacter, "comment text cannot contain a line break"));
+    if f.weather.is_none() && crate::text::has_control_character(text) {
+        pend.note(EncodeError::new(RefusalCode::InvalidCharacter, "comment text cannot contain a control character"));
     }
     let mut trailer = Vec::new();
     if let Some(t) = &f.telemetry {
@@ -655,8 +667,6 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
             Some(_) => {}
         }
     }
-    pend.finish()?;
-
     let text_at = out.len();
     let needs_space = !text.is_empty() && f.frequency.is_some();
     // Status text that would start with a type code character or 0x1D (Rev 0 telemetry) is written
@@ -664,7 +674,18 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     // start of the status text counts: after a type code or telemetry, it is written straight on.
     let status_starts_with_code = text_at == status_start && matches!(text.first(), Some(b'`' | b'\'' | b'>' | b']' | b' ' | 0x1D));
     let separators: &[&[u8]] = if needs_space {
-        &[b" ", b"", b" /"]
+        // After a frequency, free text follows a space. Where that space and the text's end would
+        // read as a device suffix (` X` at the end), the text takes a `/` rather than joining the
+        // frequency: ` /X`.
+        let mut probe = alloc::vec![b' '];
+        probe.extend_from_slice(text);
+        probe.extend_from_slice(&trailer);
+        probe.extend_from_slice(suffix);
+        if deviceid::mic_e_suffix_len(r.type_code.map(|c| c as u8), &probe) > suffix.len() {
+            &[b" ", b" /", b""]
+        } else {
+            &[b" ", b"", b" /"]
+        }
     } else if status_starts_with_code {
         &[b"/"]
     } else {
@@ -672,6 +693,10 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         // Mic-E altitude (`1{5}`), where `/` would join them too (vectors README, Encoding).
         &[b"", b"/", b" "]
     };
+    // The size and the read-back are judged on the bytes written, so they come before the fault is
+    // named.
+    let mut late = None;
+    let mut read_back = false;
     for separator in separators {
         out.truncate(text_at);
         out.extend_from_slice(separator);
@@ -681,21 +706,54 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         // A CR or LF at the end (the last byte of Rev 0 telemetry, say) reads back as a
         // trailing line break, a warning.
         if matches!(out.last(), Some(b'\r' | b'\n')) {
-            return Err(EncodeError::new(
+            late = Some(EncodeError::new(
                 RefusalCode::InvalidCharacter,
                 "the information field would end in a CR or LF, which reads back as a trailing line break",
             ));
+            break;
         }
         if reads_back(r, &out[status_start..]) {
-            let destination = Address::new(&dest)
-                .map_err(|_| EncodeError::new(RefusalCode::InvalidAddress, "the Mic-E destination is not an address"))?;
-            return Ok((destination, out));
+            read_back = true;
+            break;
         }
     }
-    Err(EncodeError::new(
-        RefusalCode::TextReadsAsField,
-        "the status text does not read back as given: a device suffix the database does not know, or text that decodes as a structured element; set the property instead",
-    ))
+    if !read_back && late.is_none() {
+        // Nothing reads back: the size is of the first form written.
+        out.truncate(text_at);
+        out.extend_from_slice(separators[0]);
+        out.extend_from_slice(text);
+        out.extend_from_slice(&trailer);
+        out.extend_from_slice(suffix);
+    }
+    pend.finish_faults()?;
+    if let Some(e) = late {
+        return Err(e);
+    }
+    if !read_back {
+        return Err(EncodeError::new(
+            RefusalCode::TextReadsAsField,
+            "the status text does not read back as given: a device suffix the database does not know, or text that decodes as a structured element; set the property instead",
+        ));
+    }
+    let destination =
+        Address::new(&dest).map_err(|_| EncodeError::new(RefusalCode::InvalidAddress, "the Mic-E destination is not an address"))?;
+    crate::refusal::check_size(out.len())?;
+    Ok((destination, out))
+}
+
+/// A whole number of feet (within 1e-6) that a `/A=` can write: six digits, or `-` and five.
+fn whole_feet_in_six_digits(feet: f64) -> bool {
+    let n = crate::steps::round(feet);
+    (feet - n).abs() <= 1e-6 && (-99_999.0..=999_999.0).contains(&n)
+}
+
+/// Whether the altitude can only be written as a `/A=`: whole feet that the Mic-E bytes do not hold
+/// exactly, that is not a whole number of metres (within 1e-6) between -10000 and 743570.
+fn only_a_text_altitude_holds(feet: f64) -> bool {
+    let metres = feet / METRES_TO_FEET;
+    let n = crate::steps::round(metres);
+    let in_bytes = (metres - n).abs() <= 1e-6 && (-10_000.0..=743_570.0).contains(&n);
+    whole_feet_in_six_digits(feet) && !in_bytes
 }
 
 fn reads_back(r: &MicEReport, status_bytes: &[u8]) -> bool {
@@ -721,7 +779,12 @@ fn reads_back(r: &MicEReport, status_bytes: &[u8]) -> bool {
         && a.telemetry == b.telemetry
         && a.dao.map(|d| d.datum) == b.dao.map(|d| d.datum)
         && freq(&a.frequency) == freq(&b.frequency)
-        // A /A= altitude is whole feet, rounded as a position's is.
-        && (close(a.altitude_feet, b.altitude_feet) || a.altitude_feet.map(crate::steps::round) == b.altitude_feet.map(crate::steps::round))
+        // A /A= altitude is whole feet, rounded as a position's is; one in the Mic-E bytes is whole metres.
+        && if back.altitude_in_comment {
+            close(a.altitude_feet, b.altitude_feet) || a.altitude_feet.map(crate::steps::round) == b.altitude_feet.map(crate::steps::round)
+        } else {
+            let metres = |v: Option<f64>| v.map(|f| crate::steps::round(f / METRES_TO_FEET));
+            metres(a.altitude_feet) == metres(b.altitude_feet)
+        }
         && a.range_miles.map(crate::steps::round) == b.range_miles.map(crate::steps::round)
 }

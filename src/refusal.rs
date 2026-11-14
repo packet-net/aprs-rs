@@ -1,5 +1,6 @@
 //! Refusal reason codes: why an encoder or builder would not write the data as given.
 
+use alloc::format;
 use core::fmt;
 
 /// Why data was refused. The ids match the `refusals` list in the conformance vectors' `codes.json`.
@@ -24,11 +25,11 @@ pub enum RefusalCode {
     InvalidMessageId,
     /// Text starts or ends with a space that would be read back as padding.
     PaddingSpace,
-    /// Free text or a list is longer than its field allows.
+    /// Free text or a list is longer than its own field allows (message text over 67 characters, and the like).
     TooLong,
     /// Text in a fixed-form field is not that form (a locator, a bit sense, a capability token).
     Malformed,
-    /// Free text holds a character its field cannot carry, such as a line break.
+    /// Free text holds a character its field cannot carry, such as a control character (a byte below 0x20 or 0x7F).
     InvalidCharacter,
     /// Free text would read back as a structured element and no clean form avoids it.
     TextReadsAsField,
@@ -60,11 +61,13 @@ pub enum RefusalCode {
     NotEncodable,
     /// Fallback: the library's own read-back check found the bytes decode to different data and no rule names why.
     DoesNotReadBack,
+    /// The information field as written is over 256 bytes and nothing else is wrong. It is the last check of all.
+    InformationFieldTooLong,
 }
 
 impl RefusalCode {
     /// Every code, in the order of the vectors' `refusals` list.
-    pub const ALL: [RefusalCode; 26] = [
+    pub const ALL: [RefusalCode; 27] = [
         RefusalCode::InvalidAddress,
         RefusalCode::Ax25CannotCarry,
         RefusalCode::Tnc2CannotCarry,
@@ -91,6 +94,7 @@ impl RefusalCode {
         RefusalCode::InvalidNmea,
         RefusalCode::NotEncodable,
         RefusalCode::DoesNotReadBack,
+        RefusalCode::InformationFieldTooLong,
     ];
 
     /// The kebab-case id used in the conformance vectors, e.g. `value-out-of-range`.
@@ -122,6 +126,7 @@ impl RefusalCode {
             RefusalCode::InvalidNmea => "invalid-nmea",
             RefusalCode::NotEncodable => "not-encodable",
             RefusalCode::DoesNotReadBack => "does-not-read-back",
+            RefusalCode::InformationFieldTooLong => "information-field-too-long",
         }
     }
 
@@ -142,9 +147,22 @@ impl fmt::Display for RefusalCode {
     }
 }
 
+/// The longest information field an encoder writes, in bytes.
+pub(crate) const MAX_INFORMATION_FIELD: usize = 256;
+
+/// `information-field-too-long` when the information field, `bytes` long, is over 256 bytes. It is the last check.
+pub(crate) fn check_size(bytes: usize) -> Result<(), crate::EncodeError> {
+    if bytes > MAX_INFORMATION_FIELD {
+        return Err(crate::EncodeError::size(format!(
+            "the information field is at most {MAX_INFORMATION_FIELD} bytes, and this one is {bytes}"
+        )));
+    }
+    Ok(())
+}
+
 /// The order in which a refusal with several faults names its code (vectors DESIGN.md, ruling 1):
 /// the first code that applies.
-const ORDER: [RefusalCode; 26] = [
+const ORDER: [RefusalCode; 27] = [
     RefusalCode::NotEncodable,
     RefusalCode::InvalidAddress,
     RefusalCode::Ax25CannotCarry,
@@ -171,9 +189,15 @@ const ORDER: [RefusalCode; 26] = [
     RefusalCode::ValueGivenTwice,
     RefusalCode::TextReadsAsField,
     RefusalCode::DoesNotReadBack,
+    RefusalCode::InformationFieldTooLong,
 ];
 
 impl RefusalCode {
+    /// Whether this code comes before `other` in the order a refusal with several faults names its code.
+    pub(crate) fn precedes(self, other: RefusalCode) -> bool {
+        self.rank() < other.rank()
+    }
+
     fn rank(self) -> usize {
         ORDER.iter().position(|c| *c == self).unwrap_or(ORDER.len())
     }
@@ -183,7 +207,7 @@ impl RefusalCode {
 /// above, so the refusal does not depend on which check happens to run first. The encoder goes on
 /// after a fault, writing bytes that are thrown away, and gives the result at the end.
 #[derive(Default)]
-pub(crate) struct Pending(Option<crate::EncodeError>);
+pub(crate) struct Pending(Option<crate::EncodeError>, Option<usize>);
 
 impl Pending {
     pub(crate) fn note(&mut self, e: crate::EncodeError) {
@@ -203,7 +227,22 @@ impl Pending {
         }
     }
 
+    /// Remembers the size of the information field, `bytes` long. It is judged last, on the bytes
+    /// written: only when nothing else is wrong does `finish` name `information-field-too-long` for it.
+    pub(crate) fn size(&mut self, bytes: usize) {
+        self.1 = Some(bytes);
+    }
+
+    /// The first fault in the order; failing that, `information-field-too-long` when the size remembered is over 256 bytes.
     pub(crate) fn finish(self) -> Result<(), crate::EncodeError> {
+        match self.0 {
+            Some(e) => Err(e),
+            None => self.1.map_or(Ok(()), check_size),
+        }
+    }
+
+    /// The faults only, for a caller that judges the size itself after a later check.
+    pub(crate) fn finish_faults(self) -> Result<(), crate::EncodeError> {
         self.0.map_or(Ok(()), Err)
     }
 }

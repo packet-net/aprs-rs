@@ -172,6 +172,11 @@ impl EncodeError {
         EncodeError { code, message: message.into() }
     }
 
+    /// The refusal for an information field over 256 bytes, which comes after every other.
+    pub(crate) fn size(message: impl Into<String>) -> EncodeError {
+        EncodeError { code: RefusalCode::InformationFieldTooLong, message: message.into() }
+    }
+
     /// Why the data was refused, as a code a program can act on. Callers must allow codes they do not know.
     pub fn code(&self) -> RefusalCode {
         self.code
@@ -406,6 +411,10 @@ impl Packet {
     }
 
     /// The packet as a TNC2 text line (without a line ending). The last used path entry is marked `*`.
+    ///
+    /// This writes out a packet the program already holds, so it is not an encoder: the information
+    /// field is passed through as it stands and no size check is made (a decoded packet over 256
+    /// bytes is written as received). `Data::encode` and the builders are the encoders that refuse one.
     pub fn to_tnc2(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(32 + self.information.len());
         out.extend_from_slice(self.source.as_str().as_bytes());
@@ -426,6 +435,9 @@ impl Packet {
 
     /// The packet as an AX.25 UI frame in KISS form (no flags, no FCS). Fails if an address
     /// cannot be sent over the air, or the path is longer than 8 entries.
+    ///
+    /// Like [`to_tnc2`](Packet::to_tnc2), this writes out a packet the program already holds and is
+    /// not an encoder: the information field is passed through as it stands, with no size check.
     pub fn to_ax25(&self) -> Result<Vec<u8>, EncodeError> {
         if self.path.len() > 8 {
             return Err(EncodeError::new(RefusalCode::Ax25CannotCarry, "an AX.25 frame has room for at most 8 digipeaters"));

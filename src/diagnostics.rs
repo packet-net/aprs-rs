@@ -51,6 +51,8 @@ pub enum Code {
     TrailingLineBreak,
     /// Text that is not valid UTF-8 (UAP 5.16).
     NonUtf8Text,
+    /// Text holds a control character: a byte below 0x20 or the byte 0x7F.
+    ControlCharacterInText,
     /// The information field is shorter than its format requires.
     Truncated,
     /// The first byte is not a data type identifier (APRS12c ch. 20).
@@ -180,6 +182,7 @@ impl Code {
         Code::TooManyDigipeaters,
         Code::TrailingLineBreak,
         Code::NonUtf8Text,
+        Code::ControlCharacterInText,
         Code::Truncated,
         Code::NotAprs,
         Code::ReservedDataType,
@@ -249,6 +252,7 @@ impl Code {
             Code::TooManyDigipeaters => "too-many-digipeaters",
             Code::TrailingLineBreak => "trailing-line-break",
             Code::NonUtf8Text => "non-utf8-text",
+            Code::ControlCharacterInText => "control-character-in-text",
             Code::Truncated => "truncated",
             Code::NotAprs => "not-aprs",
             Code::ReservedDataType => "reserved-data-type",
@@ -316,6 +320,7 @@ impl Code {
                 | Code::InvalidAx25AddressCharacters
                 | Code::TrailingLineBreak
                 | Code::NonUtf8Text
+                | Code::ControlCharacterInText
                 | Code::OutOfRangeValue
                 | Code::InvalidTimestamp
                 | Code::LowercaseHemisphere

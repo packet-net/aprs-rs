@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use crate::RefusalCode;
 use crate::context::Context;
 use crate::refusal::Pending;
-use crate::{Code, EncodeError, Weather, WeatherField};
+use crate::{Code, EncodeError, ParseOptions, Weather, WeatherField};
 
 /// How the wind is read from the weather fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,8 +40,10 @@ pub(crate) struct Run {
 /// speed until the speed is known (see [`Wind`]), and snowfall otherwise; `L` and `l` are one
 /// field, luminosity. The run stops at the first thing that is not a field, at a defined field
 /// already read, and at `c` once the wind direction is known. Extra fields are kept as a list, so
-/// a repeated extra letter does not stop it.
-pub(crate) fn fields(ctx: &mut Context, bytes: &[u8], offset: usize, weather: &mut Weather, wind: Wind) -> Option<Run> {
+/// a repeated extra letter does not stop it. `end` is where the weather text ends: the length of
+/// `bytes`, or in a positioned report the start of the trailing base-91 telemetry or `!DAO!` that is
+/// lifted first (the end a run-on value is judged against).
+pub(crate) fn fields(ctx: &mut Context, bytes: &[u8], offset: usize, weather: &mut Weather, wind: Wind, end: usize) -> Option<Run> {
     let mut at = 0;
     // Fields read so far, by the field rather than the letter: snowfall is `S`, to keep it apart
     // from the wind speed `s`, and both luminosity letters are `L`.
@@ -71,6 +73,35 @@ pub(crate) fn fields(ctx: &mut Context, bytes: &[u8], offset: usize, weather: &m
         };
         if width > 0 && seen.contains(&key) {
             break;
+        }
+        // A fixed-width value whose digits run on by two or more, then the end of the field or a
+        // field the run goes on to read: out of range, dropped, and the fields carry on after it.
+        if width > 0 && !snow {
+            if let Some(len) = run_on(bytes, at, width, letter) {
+                let next = at + 1 + len;
+                let mut read = seen.clone();
+                read.push(key);
+                let state = (direction_known || letter == b'c', speed_known || letter == b's');
+                let goes_on = next >= end.min(bytes.len()) || reads_next(bytes, next, &read, state, wind, run.direction || letter == b'c');
+                if goes_on {
+                    if !ctx.tolerate(
+                        Code::OutOfRangeValue,
+                        "a weather value that runs on by two or more digits was dropped",
+                        Some(offset + at),
+                    ) {
+                        return None;
+                    }
+                    seen.push(key);
+                    assign(ctx, weather, letter, snow, None, offset + at);
+                    match letter {
+                        b'c' => (direction_known, run.direction) = (true, true),
+                        b's' => (speed_known, run.speed) = (true, true),
+                        _ => {}
+                    }
+                    at = next;
+                    continue;
+                }
+            }
         }
         let field = if width > 0 { value(ctx, bytes, at, offset, width, letter, snow)? } else { None };
         if let Some((v, len)) = field {
@@ -122,6 +153,49 @@ pub(crate) fn fields(ctx: &mut Context, bytes: &[u8], offset: usize, weather: &m
     }
     run.len = at;
     Some(run)
+}
+
+/// The length of the value after the letter at `at` when it is digits (after a `-` on a temperature)
+/// that run on from the field's `width` by two or more.
+fn run_on(bytes: &[u8], at: usize, width: usize, letter: u8) -> Option<usize> {
+    let minus = usize::from(letter == b't' && bytes.get(at + 1) == Some(&b'-'));
+    let digits = bytes[at + 1 + minus..].iter().take_while(|b| b.is_ascii_digit()).count();
+    (minus + digits >= width + 2 && digits > 0).then_some(minus + digits)
+}
+
+/// Whether a field the run goes on to read starts at `at`: a letter APRS12c defines, not already
+/// read (`seen`), with a value.
+fn reads_next(
+    bytes: &[u8],
+    at: usize,
+    seen: &[u8],
+    (direction_known, speed_known): (bool, bool),
+    wind: Wind,
+    direction_read: bool,
+) -> bool {
+    let letter = bytes[at];
+    if letter == b'c' && direction_known {
+        return false;
+    }
+    let snow = letter == b's' && (speed_known || (wind == Wind::AsFields && !direction_read));
+    let width = match letter {
+        b'c' | b's' | b'g' | b't' | b'r' | b'p' | b'P' | b'L' | b'l' | b'#' => 3,
+        b'h' => 2,
+        b'b' => 5,
+        _ => return false,
+    };
+    let key = match letter {
+        b's' if snow => b'S',
+        b'l' => b'L',
+        other => other,
+    };
+    if seen.contains(&key) {
+        return false;
+    }
+    // Whether a field follows does not depend on what a strict reading makes of it: a later defect never
+    // changes the diagnosis of an earlier one.
+    let mut probe = Context::new(ParseOptions::LENIENT);
+    matches!(value(&mut probe, bytes, at, 0, width, letter, snow), Some(Some(_)))
 }
 
 fn is_known(letter: u8) -> bool {
