@@ -574,7 +574,9 @@ pub struct MicEReport {
     /// The altitude is written in the status text as `/A=` (feet) rather than in the Mic-E altitude
     /// bytes (whole metres). Set by the decoder when the altitude came from a `/A=`, and honoured by
     /// the encoder, so that encoding a copy of a report writes the bytes the report was built from.
-    /// An altitude the Mic-E bytes cannot hold exactly is written as `/A=` whatever this says.
+    /// With this false, the encoder writes the altitude in the Mic-E altitude bytes, rounded to the metre,
+    /// unless it is a whole number of feet within a `/A=`'s six digits that the bytes do not hold exactly
+    /// (not a whole number of metres, or outside -10000 to 743570), when only a `/A=` can say it.
     pub altitude_in_comment: bool,
     /// The shared positioned fields.
     pub fields: Positioned,

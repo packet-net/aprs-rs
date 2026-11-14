@@ -115,8 +115,8 @@ pub(crate) fn encode(s: &Status) -> Result<Vec<u8>, EncodeError> {
         (None, None) => {}
         _ => p.note(EncodeError::new(RefusalCode::MissingField, "a status grid locator and its symbol go together")),
     }
-    if crate::text::has_line_break(s.text.as_bytes()) {
-        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "status text cannot contain a line break"));
+    if crate::text::has_control_character(s.text.as_bytes()) {
+        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "status text cannot contain a control character"));
     }
     out.extend_from_slice(s.text.as_bytes());
     if let Some(b) = s.beam {
@@ -129,6 +129,7 @@ pub(crate) fn encode(s: &Status) -> Result<Vec<u8>, EncodeError> {
         }
         out.extend_from_slice(&[b'^', h, pw]);
     }
+    p.size(out.len());
     p.finish()?;
     // The text must read back as itself: status text that looks like a timestamp or a grid
     // locator would not.

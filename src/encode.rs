@@ -19,7 +19,8 @@ use crate::{
 
 impl Data {
     /// The information field for this data. Fails, naming the field, when the data cannot be
-    /// written as APRS12c allows. Mic-E data is refused, since it carries half its position in
+    /// written as APRS12c allows, and when the information field would be over 256 bytes (`too-long`).
+    /// Text with a control character is refused (`invalid-character`). Mic-E data is refused, since it carries half its position in
     /// the destination address: use [`crate::Packet::create`], which works that address out.
     pub fn encode(&self) -> Result<Vec<u8>, EncodeError> {
         let mut out = Vec::new();
@@ -278,8 +279,8 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned, mut p: Pending) -> R
 
     let text = f.comment.as_bytes();
     // A weather report has no comment: that is the fault, and the characters are not looked at.
-    if f.weather.is_none() && crate::text::has_line_break(text) {
-        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "comment text cannot contain a line break"));
+    if f.weather.is_none() && crate::text::has_control_character(text) {
+        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "comment text cannot contain a control character"));
     }
     let text_at = out.len();
     let mut trailer = Vec::new();
@@ -317,25 +318,44 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned, mut p: Pending) -> R
         }
         trailer.push(b'!');
     }
-    // What is wrong on its own, or between fields, is named before the read-back is tried.
-    p.finish()?;
-
     // Write the text as it is (after a frequency, a space first); if it does not read back
-    // unchanged, try it without the space, then after a '/' delimiter.
+    // unchanged, try it without the space, then after a '/' delimiter. A weather report has no place
+    // for a comment, so the text makes no bytes there.
     let separators: &[&[u8]] = if f.frequency.is_some() && !text.is_empty() { &[b" ", b"", b" /"] } else { &[b"", b"/"] };
     let mut differs = "";
+    let mut read_back = false;
     for separator in separators {
         out.truncate(text_at);
         if f.weather.is_some() && !separator.is_empty() {
             break;
         }
-        out.extend_from_slice(separator);
-        out.extend_from_slice(text);
+        if f.weather.is_none() {
+            out.extend_from_slice(separator);
+            out.extend_from_slice(text);
+        }
         out.extend_from_slice(&trailer);
         match reads_back(&out[start..], f) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                read_back = true;
+                break;
+            }
             Err(what) => differs = what,
         }
+    }
+    if !read_back {
+        // Nothing reads back: the size is of the first form written.
+        out.truncate(text_at);
+        if f.weather.is_none() {
+            out.extend_from_slice(separators[0]);
+            out.extend_from_slice(text);
+        }
+        out.extend_from_slice(&trailer);
+    }
+    // What is wrong on its own, or between fields, is named before the read-back result is, and
+    // the size, which only the bytes finally written have, comes last.
+    p.finish_faults()?;
+    if read_back {
+        return crate::refusal::check_size(out.len());
     }
     if f.weather.is_some() {
         return Err(EncodeError::new(

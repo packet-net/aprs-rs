@@ -62,29 +62,37 @@ fn mic_e_is_made_by_create_and_never_loses_its_destination() {
 }
 
 #[test]
-fn a_mic_e_altitude_in_the_comment_re_encodes_where_it_was() {
+fn a_mic_e_altitude_goes_in_the_bytes_unless_it_came_from_a_slash_a() {
     let decode = |line: &[u8]| Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
     let written = |p: &Packet| {
         let again = Packet::create(p.source.clone(), p.destination.clone(), p.path.clone(), p.data.clone()).unwrap();
         (again.information, again.destination)
     };
-    // The Mic-E bytes: 9176 metres. The /A= : 100 feet, which no whole metre says.
     let built = |altitude: &dyn Fn(pdn_aprs::MicEBuilder) -> pdn_aprs::MicEBuilder| {
-        altitude(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR)).build().unwrap()
+        altitude(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR)).build()
     };
-    for (packet, in_comment) in [(built(&|b| b.altitude_m(9176.0)), false), (built(&|b| b.altitude_feet(100.0)), true)] {
+    // Metres or feet, a builder writes the Mic-E altitude bytes, to the nearest metre: 100 feet is 30 metres,
+    // and 1000 feet is 305.
+    for altitude in [9176.0, 100.0, 1000.0] {
+        let packet = built(&|b| if altitude == 9176.0 { b.altitude_m(altitude) } else { b.altitude_feet(altitude) }).unwrap();
+        assert!(!String::from_utf8_lossy(&packet.information).contains("/A="), "{}", String::from_utf8_lossy(&packet.information));
         let heard = decode(&packet.to_tnc2());
         let Data::MicE(report) = &heard.data else { panic!("a Mic-E report") };
-        assert_eq!(report.altitude_in_comment, in_comment);
+        assert!(!report.altitude_in_comment);
         assert_eq!(written(&heard), (packet.information.clone(), packet.destination.clone()));
     }
-    // Feet that are exactly whole metres still go where the data says.
-    let metres = 30.0;
-    let feet = metres / 0.3048;
-    let in_bytes = built(&|b| b.altitude_m(metres));
-    let in_text = built(&|b| b.altitude_feet(feet));
-    assert!(!in_bytes.information.ends_with(b"}") || !String::from_utf8_lossy(&in_bytes.information).contains("/A="));
-    assert!(String::from_utf8_lossy(&in_text.information).contains("/A="), "{}", String::from_utf8_lossy(&in_text.information));
+    let (feet_100, metres_30) = (built(&|b| b.altitude_feet(100.0)).unwrap(), built(&|b| b.altitude_m(30.0)).unwrap());
+    assert_eq!(feet_100.information, metres_30.information);
+    // Outside the Mic-E bytes' range (-10000 to 743570 metres) is refused, not moved to a `/A=`.
+    for feet in [-40_000.0, 2_450_000.0] {
+        assert_eq!(built(&|b| b.altitude_feet(feet)).unwrap_err().code(), RefusalCode::ValueOutOfRange);
+    }
+    // An altitude read from a `/A=` is written back as one.
+    let line = b"DO1BR-9>UR1QW0:`~\\(\x1c\x1d;(/3\"3r}DO1BR6W&/A=00000070cm";
+    let heard = decode(line);
+    let Data::MicE(report) = &heard.data else { panic!("a Mic-E report") };
+    assert!(report.altitude_in_comment);
+    assert!(String::from_utf8_lossy(&written(&heard).0).contains("/A=000000"));
 }
 
 #[test]

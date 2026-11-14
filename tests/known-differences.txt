@@ -1,10 +1,8 @@
 # Checks where this crate deliberately differs from the recorded expectation. They run as ignored
 # tests, one per line: the test name, then the reason.
 #
-# Two encode cases are records this crate's data cannot hold; the dump tool writes them `unsupported`, which
-# the vectors do not count as a failure.
-encode::encode/position-without-a-symbol Position::symbol is not optional, so a record with no symbol cannot be made
-encode::encode/nested-third-party-ending-in-undecoded-data undecoded data has no neutral form of its bytes, so it cannot be nested
+# None now. The two records this crate's data cannot hold (a position with no symbol, undecoded data
+# inside a third-party packet) are refused by the reader with the code their value decides, and compared.
 #
-# Before those two: The eight this list first held were observed cases recording Packet.Aprs
+# Before: The eight this list first held were observed cases recording Packet.Aprs
 # quirks; Packet.Aprs was fixed and the cases refreshed (packet-net/aprs-vectors PR #1).

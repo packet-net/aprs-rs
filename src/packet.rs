@@ -165,11 +165,23 @@ impl core::error::Error for HeaderError {}
 pub struct EncodeError {
     code: RefusalCode,
     message: String,
+    /// Whether this is the information field's 256 bytes, the last check of all.
+    size: bool,
 }
 
 impl EncodeError {
     pub(crate) fn new(code: RefusalCode, message: impl Into<String>) -> EncodeError {
-        EncodeError { code, message: message.into() }
+        EncodeError { code, message: message.into(), size: false }
+    }
+
+    /// The refusal for an information field over 256 bytes, which comes after every other.
+    pub(crate) fn size(message: impl Into<String>) -> EncodeError {
+        EncodeError { code: RefusalCode::TooLong, message: message.into(), size: true }
+    }
+
+    /// Whether this refusal is only the information field's size, which any other fault comes before.
+    pub(crate) fn is_size(&self) -> bool {
+        self.size
     }
 
     /// Why the data was refused, as a code a program can act on. Callers must allow codes they do not know.
