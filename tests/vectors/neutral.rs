@@ -1288,7 +1288,7 @@ pub fn read_json(line: &str) -> serde_json::Result<Value> {
     let mut rest = line;
     while let Some(c) = rest.chars().next() {
         if in_string {
-            in_string = !(c == '"' && !escaped);
+            in_string = c != '"' || escaped;
             escaped = c == '\\' && !escaped;
         } else if c == '"' {
             in_string = true;
