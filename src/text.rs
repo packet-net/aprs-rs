@@ -6,8 +6,21 @@ use crate::Code;
 use crate::context::Context;
 
 /// Decodes text. Valid UTF-8 is read as UTF-8; any invalid byte is read as Latin-1, which is a
-/// tolerated defect ([`Code::NonUtf8Text`]). `None` when that defect is not tolerated.
+/// tolerated defect ([`Code::NonUtf8Text`]). A byte below 0x20 or 0x7F is another tolerated defect
+/// ([`Code::ControlCharacterInText`]), judged last and once for the text, which is kept as sent.
+/// `None` when a defect is not tolerated.
 pub(crate) fn decode(ctx: &mut Context, bytes: &[u8], offset: usize) -> Option<String> {
+    let text = decode_unjudged(ctx, bytes, offset)?;
+    if has_control_character(bytes)
+        && !ctx.tolerate(Code::ControlCharacterInText, "text holds a control character (a byte below 0x20 or 0x7F)", Some(offset))
+    {
+        return None;
+    }
+    Some(text)
+}
+
+/// Like [`decode`], but a control character is not judged (test data and the like).
+pub(crate) fn decode_unjudged(ctx: &mut Context, bytes: &[u8], offset: usize) -> Option<String> {
     match core::str::from_utf8(bytes) {
         Ok(text) => Some(String::from(text)),
         Err(_) => {
@@ -26,6 +39,11 @@ pub(crate) fn for_display(bytes: &[u8]) -> String {
         Ok(text) => String::from(text),
         Err(_) => bytes.iter().map(|&b| b as char).collect(),
     }
+}
+
+/// Whether text has a byte below 0x20 or the byte 0x7F (TAB, CR and LF included).
+pub(crate) fn has_control_character(bytes: &[u8]) -> bool {
+    bytes.iter().any(|&b| b < 0x20 || b == 0x7F)
 }
 
 /// Whether text has a CR or LF, which would end the packet on the air or on APRS-IS.
