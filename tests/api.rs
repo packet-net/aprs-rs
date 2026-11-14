@@ -293,3 +293,13 @@ fn what_create_accepts_reads_back() {
     }
     assert!(accepted > 100);
 }
+
+#[test]
+fn mic_e_locator_then_telemetry_then_a_spaced_comment_has_its_space() {
+    let line = b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0'p| DG2MM";
+    let strict = Packet::decode_tnc2(line, ParseOptions::STRICT).unwrap();
+    assert!(strict.diagnostics.iter().all(|d| d.code != Code::MissingSpaceAfterLocator));
+    let Data::MicE(report) = strict.data else { panic!("not Mic-E") };
+    assert_eq!(report.locator.as_deref(), Some("IO91"));
+    assert_eq!(report.fields.comment, "DG2MM");
+}

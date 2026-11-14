@@ -222,9 +222,14 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
         // Base-91 telemetry and a !DAO! are lifted out before the locator is read, so a locator
         // followed straight by them alone has nothing after it (vectors interpretations.md,
         // "Where a Mic-E locator is read").
-        if !s.is_empty() && !comment::without_telemetry_and_dao(&s).is_empty() {
-            if s[0] == b' ' {
-                s.remove(0);
+        let lifted = comment::without_telemetry_and_dao(&s);
+        if !lifted.is_empty() {
+            if lifted[0] == b' ' {
+                // Its space is the locator's, even with telemetry between them in the bytes; one
+                // at the very start is dropped here, the other is the comment's own delimiter.
+                if s[0] == b' ' {
+                    s.remove(0);
+                }
             } else if !ctx.tolerate(
                 Code::MissingSpaceAfterLocator,
                 "text straight after the grid locator; a space comes first (APRS12c ch. 10)",
