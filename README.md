@@ -2,7 +2,7 @@
 
 An APRS (Automatic Packet Reporting System) encoder and decoder in Rust. It covers every APRS 1.2 data type in [APRS12c](https://github.com/wb2osz/aprsspec), from TNC2 / APRS-IS text lines or AX.25 UI frames. It is `no_std` with `alloc`, and has no `unsafe`.
 
-Conforms to [aprs-vectors](https://github.com/packet-net/aprs-vectors) 1.1: every case passes.
+Conforms to [aprs-vectors](https://github.com/packet-net/aprs-vectors) 1.1: every case passes, apart from two encode cases (below) that this crate's data cannot hold.
 
 - **Decoding never fails because of the information field.** Every deviation from the spec becomes a [`Diagnostic`] with a stable [`Code`], and the rest of the packet is still read where it can be.
 - **Strict or lenient, one defect at a time.** [`ParseOptions`] says which of the 32 tolerable defects to accept: lower-case hemispheres, unpadded object names, text after weather data, and so on. [`ParseOptions::LENIENT`] (the default) accepts them all, each with a warning. [`ParseOptions::STRICT`] accepts none. Any single one can be switched off.
@@ -214,7 +214,7 @@ Values are in the units APRS sends (knots, feet, mph, degrees Fahrenheit), with 
 
 ## Conformance
 
-`cargo test` runs the whole [packet-net/aprs-vectors](https://github.com/packet-net/aprs-vectors) suite (a git submodule at `vectors/`): every example in APRS12c and *Understanding APRS Packets*, every tolerable defect, the encoder's rules, 1,395 real APRS-IS packets, 40 more that settled a disagreement between this crate and the C# implementation, and 159 that settle what differential fuzzing of all five implementations found. Each case is checked lenient, strict, with only its own tolerance switched off, re-encoded (byte for byte, against the case's canonical bytes), and read back. A deliberate difference from a recorded expectation would be listed, with its reason, in [`tests/known-differences.txt`](https://github.com/packet-net/aprs-rs/blob/main/tests/known-differences.txt); there are none.
+`cargo test` runs the whole [packet-net/aprs-vectors](https://github.com/packet-net/aprs-vectors) suite (a git submodule at `vectors/`): every example in APRS12c and *Understanding APRS Packets*, every tolerable defect, the encoder's rules, a corpus of real APRS-IS packets, the cases that settled disagreements between this crate and the C# implementation, and those that settle what differential fuzzing of the implementations (C#, Rust, Python, TypeScript, C and Go) found. Each case is checked lenient, strict, with only its own tolerance switched off, re-encoded (byte for byte, against the case's canonical bytes), and read back. Deliberate differences from a recorded expectation are listed, with their reasons, in [`tests/known-differences.txt`](https://github.com/packet-net/aprs-rs/blob/main/tests/known-differences.txt). There are two, both encode cases this crate's data cannot hold, so they are skipped (the vectors do not count that as a failure): a position with no symbol (`encode/position-without-a-symbol`, because `Position::symbol` is not optional) and a third-party packet nested around undecoded data (`encode/nested-third-party-ending-in-undecoded-data`, because undecoded data has no neutral form of its bytes to nest).
 
 This crate was written from the spec, the vectors and their [interpretations](https://github.com/packet-net/aprs-vectors/blob/main/interpretations.md), not by porting the C# implementation. Doing so found three places where the vectors had recorded a C# quirk rather than a rule; the C# was fixed and the cases refreshed.
 

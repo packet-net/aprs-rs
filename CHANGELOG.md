@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `Packet::create` (and so every builder's `build`) refuses with `invalid-address` a header that a TNC2 line cannot carry: an address that is not 1-9 letters, digits or `-` (a third-party source such as `PY2SP_R-R` used as an outer source, or an empty address). Before, it built the packet and `to_tnc2()` wrote a line that `decode_tnc2` rejected. This matches the C library, which refuses the same header with the same code. A Mic-E destination is worked out from the report, so it is not checked.
+- README: the conformance statement names the two encode cases this crate skips, and no longer quotes case counts or "five implementations".
+
 ## 1.1.0 (2026-11-14)
 
 Round 3 of the conformance vectors (pinned at 10d4e25). Two encode cases (no symbol, an undecoded inner packet) are records this crate's data cannot hold; they are listed in `tests/known-differences.txt`.
