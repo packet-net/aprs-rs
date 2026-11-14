@@ -60,8 +60,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let line = line?;
         let record = match mode {
             Mode::Decode => decode_record(n, &hex_bytes(&line)),
-            Mode::Encode => encode_record(&serde_json::from_str(&line)?),
-            Mode::Build => build_record(&serde_json::from_str(&line)?),
+            Mode::Encode => encode_record(&neutral::read_json(&line)?),
+            Mode::Build => build_record(&neutral::read_json(&line)?),
         };
         serde_json::to_writer(&mut out, &record)?;
         out.write_all(b"\n")?;
@@ -266,8 +266,89 @@ fn unsupported<T>(why: impl Into<String>) -> Built<T> {
     Err(NotBuilt::Unsupported(why.into()))
 }
 
+/// The Refusal reasons order (vectors README): the first code that applies is the one named.
+const ORDER: [&str; 26] = [
+    "not-encodable",
+    "invalid-address",
+    "ax25-cannot-carry",
+    "tnc2-cannot-carry",
+    "invalid-third-party-header",
+    "invalid-addressee",
+    "invalid-name",
+    "invalid-timestamp",
+    "not-a-number",
+    "value-out-of-range",
+    "value-has-no-form",
+    "invalid-code",
+    "invalid-symbol",
+    "invalid-character",
+    "too-long",
+    "padding-space",
+    "malformed",
+    "invalid-message-id",
+    "invalid-nmea",
+    "extension-conflict",
+    "field-not-allowed",
+    "symbol-mismatch",
+    "missing-field",
+    "value-given-twice",
+    "text-reads-as-field",
+    "does-not-read-back",
+];
+
+/// The pairs of keys that give one quantity in two units. A recipe holding both is one input with
+/// the quantity given twice.
+const UNIT_PAIRS: [(&str, &str); 6] = [
+    ("speed_knots", "speed_kmh"),
+    ("altitude_feet", "altitude_m"),
+    ("temperature_f", "temperature_c"),
+    ("rain_1h_in", "rain_1h_mm"),
+    ("rain_24h_in", "rain_24h_mm"),
+    ("rain_midnight_in", "rain_midnight_mm"),
+];
+
+/// A recipe's arguments with one unit of each pair in `both` kept (`choice` bit i set keeps the
+/// second unit of pair i).
+fn with_units(input: &Value, both: &[(&str, &str)], choice: usize) -> Value {
+    let mut v = input.clone();
+    if let Some(args) = v.get_mut("args").and_then(Value::as_object_mut) {
+        for (i, (first, second)) in both.iter().enumerate() {
+            args.remove(if choice >> i & 1 == 1 { *first } else { *second });
+        }
+    }
+    v
+}
+
 fn build_record(input: &Value) -> Value {
     let n = input.get("n").cloned().unwrap_or(Value::Null);
+    let both: Vec<(&str, &str)> = UNIT_PAIRS
+        .iter()
+        .copied()
+        .filter(|(a, b)| {
+            input.get("args").is_some_and(|args| args.get(a).is_some_and(|v| !v.is_null()) && args.get(b).is_some_and(|v| !v.is_null()))
+        })
+        .collect();
+    if !both.is_empty() {
+        // One quantity in two units: every value is checked on its own, by building once with each
+        // unit, and the refusal is the first code in the order among those results and
+        // `value-given-twice`. A line is never built from one unit.
+        let mut best = "value-given-twice".to_string();
+        let mut why = "a quantity is given in two units".to_string();
+        for choice in 0..1usize << both.len() {
+            match build(&with_units(input, &both, choice)) {
+                Ok(_) => {}
+                Err(NotBuilt::Unsupported(why)) => return json!({"n": n, "result": "unsupported", "reason": why}),
+                Err(NotBuilt::Refused(code, text)) => {
+                    let rank = |c: &str| ORDER.iter().position(|x| *x == c).unwrap_or(ORDER.len());
+                    if rank(code.id()) < rank(&best) {
+                        best = code.id().to_string();
+                        why = text;
+                    }
+                }
+            }
+        }
+        return json!({"n": n, "result": "refused", "reason": why, "refusal": best});
+    }
     match build(input) {
         Ok(p) => {
             let line = p.to_tnc2();
@@ -307,7 +388,7 @@ impl<'a> Args<'a> {
     fn float(&self, k: &str) -> Built<Option<f64>> {
         match self.get(k) {
             None => Ok(None),
-            Some(v) => v.as_f64().map(Some).ok_or_else(|| NotBuilt::Unsupported(format!("{k}: not a number"))),
+            Some(v) => neutral::num(v).map(Some).ok_or_else(|| NotBuilt::Unsupported(format!("{k}: not a number"))),
         }
     }
 
@@ -348,7 +429,7 @@ impl<'a> Args<'a> {
 }
 
 fn whole(v: &Value) -> Option<i64> {
-    v.as_i64().or_else(|| v.as_f64().filter(|f| f.fract() == 0.0 && f.abs() < 1e15).map(|f| f as i64))
+    v.as_i64().or_else(|| neutral::num(v).filter(|f| f.fract() == 0.0 && f.abs() < 1e15).map(|f| f as i64))
 }
 
 /// The options every positioned builder shares: the same methods on each builder type.
@@ -537,7 +618,7 @@ fn build(input: &Value) -> Built<Packet> {
                 let given = a.iter().rposition(|v| !v.is_null()).map_or(0, |i| i + 1);
                 let values = a[..given]
                     .iter()
-                    .map(|v| if v.is_null() { Ok(None) } else { v.as_f64().map(Some).ok_or(()) })
+                    .map(|v| if v.is_null() { Ok(None) } else { neutral::num(v).map(Some).ok_or(()) })
                     .collect::<Result<Vec<Option<f64>>, ()>>()
                     .map_err(|()| NotBuilt::Unsupported("analog: not a number".into()))?;
                 b = b.analog(&values);
@@ -568,7 +649,7 @@ fn build(input: &Value) -> Built<Packet> {
                 None => Vec::new(),
                 Some(a) => a
                     .as_array()
-                    .and_then(|a| a.iter().map(Value::as_f64).collect::<Option<Vec<f64>>>())
+                    .and_then(|a| a.iter().map(neutral::num).collect::<Option<Vec<f64>>>())
                     .ok_or_else(|| NotBuilt::Unsupported("coefficients: the builder takes numbers".into()))?,
             };
             let mut b = station.telemetry_coefficients(&coefficients);
@@ -671,7 +752,7 @@ fn frequency(f: &Value) -> Built<Frequency> {
     if let Some(k) = f.as_object().and_then(|o| o.keys().find(|k| !["mhz", "tone", "tone_value", "offset_khz"].contains(&k.as_str()))) {
         return unsupported(format!("frequency.{k}: the builder has no such option"));
     }
-    let mhz = f.get("mhz").and_then(Value::as_f64).ok_or_else(|| NotBuilt::Unsupported("frequency.mhz: missing".into()))?;
+    let mhz = f.get("mhz").and_then(neutral::num).ok_or_else(|| NotBuilt::Unsupported("frequency.mhz: missing".into()))?;
     let tone = match f.get("tone").and_then(Value::as_str) {
         None => None,
         Some("tone") => Some(Tone::Tone),
@@ -679,7 +760,7 @@ fn frequency(f: &Value) -> Built<Frequency> {
         Some("dcs") => Some(Tone::Dcs),
         Some(_) => return unsupported("frequency.tone: the builder has no such tone"),
     };
-    let value = f.get("tone_value").and_then(Value::as_f64);
+    let value = f.get("tone_value").and_then(neutral::num);
     let offset = match f.get("offset_khz") {
         None | Some(Value::Null) => None,
         Some(v) => Some(

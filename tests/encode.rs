@@ -62,3 +62,24 @@ fn mic_e_telemetry_ending_in_a_cr_is_refused() {
     assert!(create(report(13)).is_err());
     assert!(create(report(14)).is_ok());
 }
+
+/// A value that is not a number is `not-a-number`, which comes before out-of-range and the text
+/// faults, wherever it is: a speed of infinity beside a comment with a line break, an NMEA field
+/// of NaN, and a latitude out of range beside a longitude of NaN in a compressed position.
+#[test]
+fn a_value_that_is_not_a_number_is_named_before_the_faults_after_it() {
+    use pdn_aprs::{Nmea, Position, PositionReport, Positioned, RefusalCode, Symbol};
+    let code = |d: Data| d.encode().unwrap_err().code();
+    let fields = |position: Position| Positioned { position, symbol: Symbol::CAR, ..Positioned::default() };
+    let at = Position { latitude: 10.0, longitude: 10.0, ambiguity: 0 };
+    let report = |f: Positioned| Data::Position(PositionReport { timestamp: None, messaging: false, fields: f });
+    let mut f = fields(at);
+    f.speed_knots = Some(f64::INFINITY);
+    f.comment = "a\rb".into();
+    assert_eq!(code(report(f)), RefusalCode::NotANumber);
+    let mut f = fields(Position { latitude: -90.00001, longitude: f64::NAN, ambiguity: 0 });
+    f.compressed = true;
+    assert_eq!(code(report(f)), RefusalCode::NotANumber);
+    let nmea = Nmea { sentence: "GPVTG,318.7,T".into(), course_degrees: Some(f64::NAN), comment: "a\rb".into(), ..Nmea::default() };
+    assert_eq!(code(Data::Nmea(nmea)), RefusalCode::NotANumber);
+}

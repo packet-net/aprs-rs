@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Round 3 of the conformance vectors (pinned at f2f6ab5). Two encode cases (no symbol, an undecoded inner packet) are records this crate's data cannot hold; they are listed in `tests/known-differences.txt`.
+Round 3 of the conformance vectors (pinned at 10d4e25). Two encode cases (no symbol, an undecoded inner packet) are records this crate's data cannot hold; they are listed in `tests/known-differences.txt`.
 
 - A decoder reads at most four levels of third-party header; a fifth `}` makes the packet holding it `unrecognized` with `error:invalid-third-party`. Decoding a line of thousands of nested `}` no longer overflows the stack.
 - An AX.25 address holding anything but upper-case letters and digits (a lower-case letter is still tolerated) is `invalid-address`, and a call of spaces only is an empty source (`invalid-address`), destination (`empty-destination`) or digipeater (`empty-path-entry`).
@@ -16,6 +16,9 @@ Round 3 of the conformance vectors (pinned at f2f6ab5). Two encode cases (no sym
 - A course or speed beside a compressed weather report's wind is judged in the cs-byte checks before `extension-conflict`, so a course of 0 is `value-has-no-form`.
 - The telemetry builder names a fault ranked before too-long (a line break in the comment) ahead of too many analog values; builders in general refuse in the encoder's order: a value out of range (a course of 360.5, a latitude past 90, a Mic-E speed of 999.5) is `value-out-of-range` before an ambiguous position at 90 or 180 degrees is `value-has-no-form`.
 - The encoder refuses third-party data nested more than four deep (`invalid-third-party-header`), counting the levels in a loop, so a chain a caller built thousands deep is refused without recursion. Dropping, cloning, comparing or printing such a chain still recurses (plain boxed data); the limit is documented on `Data::ThirdParty`.
+- A compressed weather report whose GGA altitude is 1 foot or less is written with the nearest cs value (1 foot, `!!`) alone, as it has no comment to carry a `/A=`; it used to be refused as `text-reads-as-field`.
+- A value that is not a number (NaN, an infinity) is `not-a-number` in its place in the order everywhere: a speed or other whole-number field, the coordinates of a compressed position, and the numeric fields of an NMEA sentence; before, some were named `value-out-of-range` or reached a later fault first.
+- The dump tool reads the `NaN`, `Infinity` and `-Infinity` tokens the generator's `--nonfinite` writes, and a recipe giving one quantity in two units is built once with each unit and refused with the first code in the order among both results and `value-given-twice`; it is never built from one unit and never `unsupported`.
 - The vectors runner compares the refusal code a case names, not only that there was a refusal.
 
 ### Behaviour changes

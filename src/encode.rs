@@ -774,8 +774,8 @@ fn whole(v: Option<f64>, what: &str) -> Result<Option<u32>, EncodeError> {
     match v {
         None => Ok(None),
         // Rounded first, so -0.3 is 0.
-        Some(x) if crate::steps::round(x) >= 0.0 => Ok(Some(crate::steps::round(x) as u32)),
-        Some(_) => Err(EncodeError::new(RefusalCode::ValueOutOfRange, format!("{what} cannot be negative"))),
+        Some(x) if x.is_finite() && crate::steps::round(x) >= 0.0 => Ok(Some(crate::steps::round(x) as u32)),
+        Some(x) => Err(EncodeError::new(RefusalCode::for_value(x), format!("{what} cannot be negative"))),
     }
 }
 
@@ -907,6 +907,11 @@ fn reads_back(written: &[u8], f: &Positioned) -> Result<(), &'static str> {
     };
     // A /A= or RNG value is written rounded to its whole step.
     let rounded = |a: Option<f64>, b: Option<f64>| a.is_some() && a == b.map(crate::steps::round);
+    // The cs bytes cannot hold an altitude of 1 foot or less: the nearest is cs 0, 1 foot, which
+    // a compressed weather report (no comment, so no `/A=`) is written with alone.
+    let cs_floor = |f: &Positioned, back: Option<f64>| {
+        f.compressed && f.weather.is_some() && f.altitude_feet.is_some_and(|feet| feet <= 1.0) && back == Some(1.0)
+    };
     let frequency_fields =
         |v: &Option<crate::VoiceFrequency>| v.as_ref().map(|x| (x.tone, x.tone_value, x.offset_khz, x.range, x.range_km, x.narrow));
     let checks = [
@@ -921,7 +926,12 @@ fn reads_back(written: &[u8], f: &Positioned) -> Result<(), &'static str> {
         (back.signpost == f.signpost, "signpost"),
         (back.dao.map(|d| d.datum) == f.dao.map(|d| d.datum), "DAO"),
         (back.weather.as_ref().map(weather::text_parts) == f.weather.as_ref().map(weather::text_parts), "weather"),
-        (close(back.altitude_feet, f.altitude_feet, 0.01) || rounded(back.altitude_feet, f.altitude_feet), "altitude"),
+        (
+            close(back.altitude_feet, f.altitude_feet, 0.01)
+                || rounded(back.altitude_feet, f.altitude_feet)
+                || cs_floor(f, back.altitude_feet),
+            "altitude",
+        ),
         (close(back.range_miles, f.range_miles, 0.1) || rounded(back.range_miles, f.range_miles), "range"),
     ];
     match checks.iter().find(|(same, _)| !same) {

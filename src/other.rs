@@ -623,6 +623,11 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
 fn encode_nmea(n: &Nmea) -> Result<Vec<u8>, EncodeError> {
     let mut p = Pending::default();
     let sentence = n.sentence.as_bytes();
+    for value in [n.latitude, n.longitude, n.course_degrees, n.speed_knots, n.altitude_m].into_iter().flatten() {
+        if !value.is_finite() {
+            p.note(EncodeError::new(RefusalCode::NotANumber, "an NMEA field is not a number"));
+        }
+    }
     if text::has_line_break(n.comment.as_bytes()) {
         p.note(EncodeError::new(RefusalCode::InvalidCharacter, "an NMEA comment cannot contain a line break"));
     }

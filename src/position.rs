@@ -406,8 +406,11 @@ pub(crate) fn encode_compressed(out: &mut Vec<u8>, position: &Position, symbol: 
     }
     let mut position = *position;
     if !(-90.0..=90.0).contains(&position.latitude) || !(-180.0..=180.0).contains(&position.longitude) {
-        let value = if (-90.0..=90.0).contains(&position.latitude) { position.longitude } else { position.latitude };
-        p.note(EncodeError::new(RefusalCode::for_value(value), "the position is out of range"));
+        for (value, limit) in [(position.latitude, 90.0), (position.longitude, 180.0)] {
+            if !(-limit..=limit).contains(&value) {
+                p.note(EncodeError::new(RefusalCode::for_value(value), "the position is out of range"));
+            }
+        }
         position = Position { latitude: 0.0, longitude: 0.0, ambiguity: 0 };
     }
     let (y, x) = compressed_steps(&position);

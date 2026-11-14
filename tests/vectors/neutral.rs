@@ -440,7 +440,7 @@ impl<'a> Keys<'a> {
     fn float(&self, k: &str) -> Read<Option<f64>> {
         match self.get(k) {
             None => Ok(None),
-            Some(v) => v.as_f64().map(Some).ok_or_else(|| Unreadable::Unsupported(format!("{}: not a number", self.name(k)))),
+            Some(v) => num(v).map(Some).ok_or_else(|| Unreadable::Unsupported(format!("{}: not a number", self.name(k)))),
         }
     }
 
@@ -468,9 +468,12 @@ impl<'a> Keys<'a> {
                 .map(Some)
                 .map_err(|_| Unreadable::Refused(pdn_aprs::RefusalCode::ValueOutOfRange, format!("{}: outside its field", self.name(k))));
         }
-        let Some(x) = v.as_f64().filter(|x| x.is_finite()) else {
+        let Some(x) = num(v) else {
             return unsupported(format!("{}: not a number", self.name(k)));
         };
+        if !x.is_finite() {
+            return Err(Unreadable::Refused(pdn_aprs::RefusalCode::NotANumber, format!("{}: not a number", self.name(k))));
+        }
         T::try_from(round_steps(x) as i128).map(Some).map_err(|_| {
             Unreadable::Refused(pdn_aprs::RefusalCode::ValueOutOfRange, format!("{}: outside its field once rounded", self.name(k)))
         })
@@ -538,7 +541,7 @@ fn whole(v: &Value) -> Option<i128> {
     if let Some(n) = v.as_u64() {
         return Some(i128::from(n));
     }
-    let f = v.as_f64()?;
+    let f = num(v)?;
     (f.fract() == 0.0 && f.abs() < 1e30).then_some(f as i128)
 }
 
@@ -721,7 +724,7 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             addressee: o.text("addressee")?,
             coefficients: o
                 .array("coefficients")?
-                .map(|a| a.iter().map(Value::as_f64).collect::<Option<Vec<f64>>>())
+                .map(|a| a.iter().map(num).collect::<Option<Vec<f64>>>())
                 .unwrap_or(Some(Vec::new()))
                 .ok_or_else(|| Unreadable::Unsupported("coefficients: each is a number".into()))?,
             coefficients_text: Vec::new(),
@@ -758,9 +761,7 @@ pub fn try_read_data(v: &Value) -> Read<Data> {
             },
             analog: o
                 .array("analog")?
-                .map(|a| {
-                    a.iter().map(|x| if x.is_null() { Some(None) } else { x.as_f64().map(Some) }).collect::<Option<Vec<Option<f64>>>>()
-                })
+                .map(|a| a.iter().map(|x| if x.is_null() { Some(None) } else { num(x).map(Some) }).collect::<Option<Vec<Option<f64>>>>())
                 .unwrap_or(Some(Vec::new()))
                 .ok_or_else(|| Unreadable::Unsupported("analog: each is a number or null".into()))?,
             analog_text: Vec::new(),
@@ -1273,4 +1274,44 @@ fn read_weather(o: &Keys) -> Read<Option<Weather>> {
         unit: w.string("unit")?,
         extra,
     }))
+}
+
+/// The marker `read_json` puts where the generator wrote a NaN or an infinity, which JSON cannot hold.
+const NONFINITE: &str = "\u{0}nonfinite:";
+
+/// A JSON line as the generator writes it, with the non-standard tokens `NaN`, `Infinity` and
+/// `-Infinity` (`--nonfinite`) read as numbers: [`num`] gives them back.
+#[allow(dead_code)]
+pub fn read_json(line: &str) -> serde_json::Result<Value> {
+    let mut text = String::with_capacity(line.len());
+    let (mut in_string, mut escaped) = (false, false);
+    let mut rest = line;
+    while let Some(c) = rest.chars().next() {
+        if in_string {
+            in_string = !(c == '"' && !escaped);
+            escaped = c == '\\' && !escaped;
+        } else if c == '"' {
+            in_string = true;
+        } else if let Some(token) = ["-Infinity", "Infinity", "NaN"].into_iter().find(|t| rest.starts_with(t)) {
+            text.push_str(&format!("\"\\u0000nonfinite:{token}\""));
+            rest = &rest[token.len()..];
+            continue;
+        }
+        text.push(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    serde_json::from_str(&text)
+}
+
+/// A number in the neutral form, including the marked non-finite ones `read_json` leaves.
+pub fn num(v: &Value) -> Option<f64> {
+    match v {
+        Value::String(s) => match s.strip_prefix(NONFINITE)? {
+            "NaN" => Some(f64::NAN),
+            "Infinity" => Some(f64::INFINITY),
+            "-Infinity" => Some(f64::NEG_INFINITY),
+            _ => None,
+        },
+        v => v.as_f64(),
+    }
 }
