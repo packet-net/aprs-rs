@@ -514,3 +514,19 @@ fn inner_mic_e_data_is_written_under_the_destination_it_computes_and_no_other() 
     inner.destination = Address::new("S32U6U").unwrap();
     assert_eq!(Data::ThirdParty(inner).encode().unwrap_err().code(), RefusalCode::NotEncodable);
 }
+
+#[test]
+fn a_held_mic_e_report_is_not_written_under_another_mic_e_destination() {
+    let held = Packet::decode_tnc2(b"N0CALL>S32U6T:`(_fn\"Oj/", ParseOptions::LENIENT).unwrap();
+    assert!(matches!(held.data, Data::MicE(_)));
+    assert!(held.to_tnc2().is_ok());
+    for other in ["S32U7T", "S32U6T-3"] {
+        let mut moved = held.clone();
+        moved.destination = Address::new(other).unwrap();
+        assert_eq!(moved.to_tnc2().unwrap_err().code(), RefusalCode::NotEncodable, "{other}");
+        assert_eq!(moved.to_ax25().unwrap_err().code(), RefusalCode::NotEncodable, "{other}");
+    }
+    // A built packet whose latitude lies between steps is still written under the destination it computes.
+    let built = Station::new("N0CALL").unwrap().mic_e(51.123456789, -0.5).symbol(Symbol::CAR).altitude_feet(1000.0).build().unwrap();
+    assert!(built.to_tnc2().is_ok());
+}

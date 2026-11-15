@@ -126,7 +126,7 @@ pub(crate) fn seal(given: &Data, forms: Forms) -> Result<Sealed, EncodeError> {
 }
 
 /// Whether an information field, read under the header it is written with, is Mic-E data where `held` is
-/// not, or is not where `held` is: the one way a header changes how bytes read (a Mic-E destination with
+/// not, or is not where `held` is, or is another Mic-E report than `held`: the one way a header changes how bytes read (a Mic-E destination with
 /// the data type identifiers `` ` ``, `'`, 0x1C and 0x1D). Such a field paired with such a header is
 /// `not-encodable`: it would read back as other data.
 pub(crate) fn header_reads_as_other_data(
@@ -140,7 +140,12 @@ pub(crate) fn header_reads_as_other_data(
         return false;
     }
     let read = crate::Packet::decode(source.clone(), destination.clone(), path.to_vec(), information, ParseOptions::LENIENT);
-    matches!(read.data, Data::MicE(_)) != matches!(held, Data::MicE(_))
+    match (&read.data, held) {
+        // Mic-E read under a Mic-E destination other than the one the data computes is another report: the
+        // decoded data is compared with the held data by the read-back's comparison, rounding allowed.
+        (Data::MicE(_), Data::MicE(_)) => expected(held, &read.data) != read.data,
+        _ => matches!(read.data, Data::MicE(_)) != matches!(held, Data::MicE(_)),
+    }
 }
 
 /// The refusal for a field that reads as other data under the header it is written with.
