@@ -139,6 +139,10 @@ pub(crate) fn header_reads_as_other_data(
     if !matches!(information.first(), Some(b'`' | b'\'' | 0x1C | 0x1D)) && !matches!(held, Data::MicE(_)) {
         return false;
     }
+    // A number that is not a number is that fault, named by the data's own check, not a destination's.
+    if has_non_finite(held) {
+        return false;
+    }
     let read = crate::Packet::decode(source.clone(), destination.clone(), path.to_vec(), information, ParseOptions::LENIENT);
     match (&read.data, held) {
         // Mic-E read under a Mic-E destination other than the one the data computes is another report: the
