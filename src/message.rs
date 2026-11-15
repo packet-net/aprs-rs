@@ -384,22 +384,26 @@ fn query_type_ok(t: &str) -> bool {
 pub(crate) fn encode(data: &Data) -> Result<Forms, EncodeError> {
     let mut out = Vec::new();
     let mut p = Pending::default();
+    // The refusal to give if what is written does not read back as the report it was meant for.
+    let mut unread = None;
     match data {
         Data::Message(m) => {
             addressee(&mut out, &m.addressee, &mut p);
             // An addressee that makes a bulletin of it is not the form a message needs.
-            not_a_bulletin(&m.addressee, &mut p);
+            if let Some(refusal) = bulletin_refusal(&m.addressee) {
+                p.note(refusal);
+            }
             message_text(&mut out, &m.text, true, &mut p);
             id_and_reply(&mut out, &m.message_id, &m.reply_ack, &mut p);
         }
         Data::Ack(a) => {
             addressee(&mut out, &a.addressee, &mut p);
-            not_a_bulletin(&a.addressee, &mut p);
+            unread = bulletin_refusal(&a.addressee);
             ack_or_reject(&mut out, b"ack", &a.acked_id, &a.message_id, &a.reply_ack, &mut p);
         }
         Data::Reject(r) => {
             addressee(&mut out, &r.addressee, &mut p);
-            not_a_bulletin(&r.addressee, &mut p);
+            unread = bulletin_refusal(&r.addressee);
             ack_or_reject(&mut out, b"rej", &r.rejected_id, &r.message_id, &r.reply_ack, &mut p);
         }
         Data::Bulletin(b) | Data::NwsBulletin(b) => {
@@ -517,17 +521,21 @@ pub(crate) fn encode(data: &Data) -> Result<Forms, EncodeError> {
         _ => return Err(EncodeError::new(RefusalCode::NotEncodable, "not a message")),
     }
     p.finish_faults()?;
-    Ok(Forms::new(out))
+    let forms = Forms::new(out);
+    Ok(match unread {
+        Some(refusal) => forms.unless_read_back(refusal),
+        None => forms,
+    })
 }
 
 /// An addressee of `NWS-`, `NWS_` or `BLN` and a bulletin form makes a bulletin, not this report.
-fn not_a_bulletin(addressee: &str, p: &mut Pending) {
-    if matches!(bulletin_kind(&mut Context::new(ParseOptions::LENIENT), addressee), Some(Some(_))) {
-        p.note(EncodeError::new(
+fn bulletin_refusal(addressee: &str) -> Option<EncodeError> {
+    matches!(bulletin_kind(&mut Context::new(ParseOptions::LENIENT), addressee), Some(Some(_))).then(|| {
+        EncodeError::new(
             RefusalCode::InvalidAddressee,
             "an addressee of NWS-, NWS_ or BLN and a bulletin form makes a bulletin, not this report",
-        ));
-    }
+        )
+    })
 }
 
 /// An addressee, which is nine characters with no space or `:`.

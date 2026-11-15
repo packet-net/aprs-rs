@@ -32,17 +32,26 @@ use crate::{
 pub(crate) struct Forms {
     destination: Option<Address>,
     candidates: Vec<Vec<u8>>,
+    /// The refusal of a rule the read-back would catch a fault of, given when no form reads back.
+    unread: Option<EncodeError>,
 }
 
 impl Forms {
     /// A first form.
     pub(crate) fn new(first: Vec<u8>) -> Forms {
-        Forms { destination: None, candidates: alloc::vec![first] }
+        Forms { destination: None, candidates: alloc::vec![first], unread: None }
     }
 
     /// The next form to try if the ones before it do not read back.
     pub(crate) fn then(mut self, next: Vec<u8>) -> Forms {
         self.candidates.push(next);
+        self
+    }
+
+    /// The rule's refusal to give when no form reads back, where the fault is one a named rule covers
+    /// (Refusal reasons: the read-back's code is the named rule's, where it caught a fault one covers).
+    pub(crate) fn unless_read_back(mut self, refusal: EncodeError) -> Forms {
+        self.unread = Some(refusal);
         self
     }
 
@@ -81,7 +90,7 @@ struct Mismatch {
 /// Reads back each form and returns the first that matches the data, or refuses. The refusal is
 /// `text-reads-as-field` when free text reads back changed and `does-not-read-back` otherwise.
 pub(crate) fn seal(given: &Data, forms: Forms) -> Result<Sealed, EncodeError> {
-    let Forms { destination, candidates } = forms;
+    let Forms { destination, candidates, unread } = forms;
     let mut first = None;
     for bytes in candidates {
         match matches(given, destination.as_ref(), &bytes) {
@@ -93,6 +102,9 @@ pub(crate) fn seal(given: &Data, forms: Forms) -> Result<Sealed, EncodeError> {
                 first.get_or_insert(m);
             }
         }
+    }
+    if let Some(named) = unread {
+        return Err(named);
     }
     Err(match first {
         Some(Mismatch { text: true, what }) => EncodeError::new(
@@ -616,7 +628,11 @@ pub(crate) fn tnc2_header(
     let mut ctx = Context::new(ParseOptions::LENIENT);
     let read = crate::packet::tnc2_header(&mut ctx, &out, third_party);
     let reads_back = match read {
-        Ok(((s, d, p), _)) => ctx.diagnostics.is_empty() && header_read(&s, &d, &p) == header_given(source, destination, path),
+        // No diagnostic, but the one an empty destination in the header given (a decoded packet's, tolerated on the way in) has again.
+        Ok(((s, d, p), _)) => {
+            let own = |c: Code| c == Code::EmptyDestination && destination.as_str().is_empty();
+            ctx.diagnostics.iter().all(|d| own(d.code)) && header_read(&s, &d, &p) == header_given(source, destination, path)
+        }
         Err(_) => false,
     };
     if reads_back {
@@ -675,4 +691,118 @@ pub(crate) fn ax25_header(
     } else {
         EncodeError::new(RefusalCode::Ax25CannotCarry, "the addresses do not read back as given")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! The read-back covers every report type: for each, the data a decoder gives for a packet, and
+    //! the bytes of that packet with one field's byte changed (a writer's mistake). The right bytes
+    //! seal; the wrong ones are refused. A type the read-back skipped would let its wrong bytes through.
+
+    use alloc::vec::Vec;
+
+    use super::{Forms, seal};
+    use crate::{Address, Data, Packet, ParseOptions, RefusalCode};
+
+    /// (what, the TNC2 line, the same information field with one byte changed).
+    const SAMPLES: &[(&str, &str, &str)] = &[
+        ("position", "N0CALL>APZ001:!5127.26N/00058.69W>088/036Mobile", "!5127.26N/00058.69W>088/037Mobile"),
+        ("position, compressed", "N0CALL>APZ001:!/5L!!<*e7>7P[", "!/5L!!<*e7>7P\\"),
+        ("position, weather", "N0CALL>APZ001:!5127.00N/00058.80W_220/004g005t077", "!5127.00N/00058.80W_220/004g005t078"),
+        (
+            "object",
+            "N0CALL>APZ001:;MYRPTR   *251830z5127.00N/00058.80Wr145.725MHz T118 -060",
+            ";MYRPTR   *251830z5127.00N/00058.81Wr145.725MHz T118 -060",
+        ),
+        ("item", "N0CALL>APZ001:)MARKER!4903.50N/07201.75W-hello", ")MARKER!4903.50N/07201.75W-hellp"),
+        ("message", "N0CALL>APZ001::G3NRW    :Hi Ian{01", ":G3NRW    :Hi Ibn{01"),
+        ("ack", "N0CALL>APZ001::G3NRW    :ack01", ":G3NRW    :ack02"),
+        ("reject", "N0CALL>APZ001::G3NRW    :rej01", ":G3NRW    :rej02"),
+        ("bulletin", "N0CALL>APZ001::BLN1     :weather alert", ":BLN1     :weather alerx"),
+        ("NWS bulletin", "N0CALL>APZ001::NWS-12345:storm", ":NWS-12345:storn"),
+        ("telemetry names", "N0CALL>APZ001::N0CALL   :PARM.Volts,Amps", ":N0CALL   :PARM.Volts,Ampz"),
+        ("telemetry units", "N0CALL>APZ001::N0CALL   :UNIT.V,A", ":N0CALL   :UNIT.V,B"),
+        ("telemetry coefficients", "N0CALL>APZ001::N0CALL   :EQNS.0,1,0,0,2,0", ":N0CALL   :EQNS.0,1,0,0,3,0"),
+        ("telemetry bits", "N0CALL>APZ001::N0CALL   :BITS.11111111,Project", ":N0CALL   :BITS.11111110,Project"),
+        ("directed query", "N0CALL>APZ001::G3NRW    :?APRSP", ":G3NRW    :?APRSD"),
+        ("status", "N0CALL>APZ001:>hello", ">hellp"),
+        ("telemetry", "N0CALL>APZ001:T#005,199,000,255,073,123,01101001", "T#005,199,000,255,073,123,01101000"),
+        (
+            "positionless weather",
+            "N0CALL>APZ001:_10090556c220s004g005t077r001p002P003h50b09720",
+            "_10090556c220s004g005t077r001p002P003h50b09721",
+        ),
+        ("raw weather", "N0CALL>APZ001:#abc", "#abd"),
+        ("NMEA", "N0CALL>APZ001:$GPGLL,4916.45,N,12311.12,W,225444,A", "$GPGLL,4916.45,N,12311.12,W,225444,V"),
+        ("Maidenhead beacon", "N0CALL>APZ001:[IO91SX]hi", "[IO91SY]hi"),
+        ("query", "N0CALL>APZ001:?APRS?", "?IGATE?"),
+        ("query with a footprint", "N0CALL>APZ001:?APRS?34.00,-118.00,0100", "?APRS?34.00,-118.00,0101"),
+        ("capabilities", "N0CALL>APZ001:<IGATE,MSG_CNT=30", "<IGATE,MSG_CNT=31"),
+        ("third-party", "N0CALL>APZ001:}G4ABC>APZ001,TCPIP,N0CALL*:>hi", "}G4ABC>APZ001,TCPIP,N0CALL*:>hj"),
+        ("user-defined", "N0CALL>APZ001:{AB123", "{AB124"),
+        ("test", "N0CALL>APZ001:,hello", ",hellp"),
+        ("Agrelo DF", "N0CALL>APZ001:%123/4", "%123/5"),
+    ];
+
+    /// Mic-E, which needs its destination: the same, with the packet made by `Packet::create`.
+    fn mic_e() -> (Data, Address, Vec<u8>) {
+        let line = b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0'p| DG2MM";
+        let packet = Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+        let sealed = packet.data.seal().expect("the data of a decoded Mic-E report seals");
+        let (destination, bytes) = sealed.into_parts();
+        (packet.data, destination.unwrap(), bytes)
+    }
+
+    #[test]
+    fn every_report_type_is_read_back() {
+        for (what, line, wrong) in SAMPLES {
+            let packet = Packet::decode_tnc2(line.as_bytes(), ParseOptions::LENIENT).unwrap();
+            let right = &line.as_bytes()[line.find(':').unwrap() + 1..];
+            let good =
+                seal(&packet.data, Forms::new(right.to_vec())).unwrap_or_else(|e| panic!("{what}: the right bytes are refused: {e}"));
+            assert_eq!(good.into_bytes(), right, "{what}");
+            let refused = seal(&packet.data, Forms::new(wrong.as_bytes().to_vec()));
+            let refused = refused.err().unwrap_or_else(|| panic!("{what}: wrong bytes {wrong:?} were let through"));
+            assert!(
+                matches!(refused.code(), RefusalCode::DoesNotReadBack | RefusalCode::TextReadsAsField),
+                "{what}: refused as {} not by the read-back",
+                refused.code()
+            );
+        }
+    }
+
+    #[test]
+    fn mic_e_is_read_back_with_the_destination_computed() {
+        let (data, destination, bytes) = mic_e();
+        // The destination is part of what is read: the latitude digits are in it.
+        let elsewhere = Address::new("S32UVU").unwrap();
+        assert!(seal(&data, Forms::new(bytes.clone()).to(elsewhere)).is_err());
+        let mut wrong = bytes.clone();
+        wrong[4] += 1;
+        assert!(seal(&data, Forms::new(wrong).to(destination.clone())).is_err(), "a wrong speed byte");
+        assert!(seal(&data, Forms::new(bytes).to(destination)).is_ok());
+    }
+
+    #[test]
+    fn a_form_that_fails_is_skipped_for_the_next_and_none_means_a_refusal() {
+        let packet = Packet::decode_tnc2(b"N0CALL>APZ001:>hello", ParseOptions::LENIENT).unwrap();
+        let sealed = seal(&packet.data, Forms::new(b">hellp".to_vec()).then(b">hello".to_vec())).unwrap();
+        assert_eq!(sealed.into_bytes(), b">hello");
+        let none = seal(&packet.data, Forms::new(b">hellp".to_vec()).then(b">hellq".to_vec()));
+        assert!(none.is_err());
+    }
+
+    #[test]
+    fn bytes_over_256_are_read_back_before_they_are_measured() {
+        let packet = Packet::decode_tnc2(b"N0CALL>APZ001:>hello", ParseOptions::LENIENT).unwrap();
+        // Wrong and over 256: the read-back's code, never the size's.
+        let mut wrong = alloc::vec![b'>'];
+        wrong.extend(core::iter::repeat_n(b'x', 300));
+        assert_eq!(seal(&packet.data, Forms::new(wrong)).err().unwrap().code(), RefusalCode::TextReadsAsField);
+        // Right and over 256: the size's.
+        let big = Data::Status(crate::Status { text: "x".repeat(300), ..Default::default() });
+        let mut right = alloc::vec![b'>'];
+        right.extend(core::iter::repeat_n(b'x', 300));
+        assert_eq!(seal(&big, Forms::new(right)).err().unwrap().code(), RefusalCode::InformationFieldTooLong);
+    }
 }
