@@ -396,7 +396,10 @@ fn braces(fields: &mut Positioned, c: &mut Text) {
             && if signpost { text::is_printable_ascii(inner) } else { text::all_digits(inner) }
     };
     let found = (0..c.b.len()).filter(|&i| c.b[i] == b'{').find_map(|open| {
-        let close = open + 1 + c.b[open + 1..].iter().position(|&b| b == b'}')?;
+        // The closing brace is at most four bytes on (one to three characters between): looking
+        // further would make a long run of `{` quadratic.
+        let window = &c.b[open + 1..c.b.len().min(open + 5)];
+        let close = open + 1 + window.iter().position(|&b| b == b'}')?;
         (well_formed(&c.b[open + 1..close]) && !c.splits(open, close + 1)).then_some((open, close))
     });
     let Some((open, close)) = found else { return };
@@ -687,18 +690,27 @@ fn find_altitude(c: &Text) -> Option<(usize, i32)> {
         if c.splits(i, i + 9) {
             return None;
         }
-        let w = &c.b[i..i + 9];
-        if &w[..3] != b"/A=" {
-            return None;
-        }
-        if text::all_digits(&w[3..9]) {
-            Some((i, text::digits(&w[3..9]) as i32))
-        } else if w[3] == b'-' && text::all_digits(&w[4..9]) {
-            Some((i, -(text::digits(&w[4..9]) as i32)))
-        } else {
-            None
-        }
+        altitude_text(&c.b[i..i + 9]).map(|feet| (i, feet))
     })
+}
+
+/// The feet in a `/A=` altitude that is the whole of `w`: `/A=` and six digits, or `/A=-` and five.
+fn altitude_text(w: &[u8]) -> Option<i32> {
+    if w.len() != 9 || &w[..3] != b"/A=" {
+        return None;
+    }
+    if text::all_digits(&w[3..9]) {
+        Some(text::digits(&w[3..9]) as i32)
+    } else if w[3] == b'-' && text::all_digits(&w[4..9]) {
+        Some(-(text::digits(&w[4..9]) as i32))
+    } else {
+        None
+    }
+}
+
+/// Whether `w` is a whole `/A=` altitude (nine bytes), as `find_altitude` reads one.
+pub(crate) fn is_whole_altitude_text(w: Option<&[u8]>) -> bool {
+    w.and_then(altitude_text).is_some()
 }
 
 /// Base-91 comment telemetry `|ss11...|`: 2-7 pairs between bars.

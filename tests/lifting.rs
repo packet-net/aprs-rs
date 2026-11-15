@@ -140,3 +140,48 @@ fn a_strict_mic_e_decoder_reads_a_later_altitude_as_text_and_never_rejects_by_it
         assert!(packet.diagnostics.iter().all(|d| d.code != pdn_aprs::Code::MicEAltitudeNotFirst), "{}", String::from_utf8_lossy(line));
     }
 }
+
+const MIC_E: &str = "N0CALL>S32UVT:`(_fn\"Oj/`";
+
+fn mic_e(status: &str, options: ParseOptions) -> pdn_aprs::MicEReport {
+    match Packet::decode_tnc2(format!("{MIC_E}{status}").as_bytes(), options).unwrap().data {
+        Data::MicE(m) => m,
+        _ => panic!("not a Mic-E report"),
+    }
+}
+
+/// The search for a later Mic-E altitude never uses the bytes of a whole `/A=`.
+#[test]
+fn a_later_mic_e_altitude_never_uses_the_bytes_of_a_whole_altitude() {
+    for options in [ParseOptions::LENIENT, ParseOptions::STRICT] {
+        let m = mic_e("x/A=000100}", options);
+        assert_eq!((m.fields.altitude_feet, m.fields.comment.as_str()), (Some(100.0), "x}"));
+        // A negative one, and one with more text either side.
+        let m = mic_e("x/A=-00016}y", options);
+        assert_eq!((m.fields.altitude_feet, m.fields.comment.as_str()), (Some(-16.0), "x}y"));
+        let m = mic_e("/A=000100}", options);
+        assert_eq!((m.fields.altitude_feet, m.fields.comment.as_str()), (Some(100.0), "}"));
+    }
+}
+
+#[test]
+fn a_later_mic_e_altitude_clear_of_a_whole_altitude_is_still_taken() {
+    let m = mic_e("x/A=000100}y\"4e}z", ParseOptions::LENIENT);
+    assert_eq!((m.fields.altitude_feet, m.fields.comment.as_str()), (Some(100.0), "x}yz"));
+    // Before the `/A=`, too.
+    let m = mic_e("x\"4e}y/A=000100", ParseOptions::LENIENT);
+    assert_eq!((m.fields.altitude_feet, m.fields.comment.as_str()), (Some(100.0), "xy"));
+    // An altitude that is not whole protects nothing: its last three digits and `}` are one.
+    let m = mic_e("x/A=00100}", ParseOptions::LENIENT);
+    assert_eq!(m.fields.comment, "x/A=00");
+    assert!(m.fields.altitude_feet.is_some_and(|f| f > 400_000.0));
+}
+
+/// The comment written after a `/A=` needs no space now: `00x}` is not a Mic-E altitude.
+#[test]
+fn a_comment_after_an_altitude_is_written_straight_on() {
+    let packet = Packet::decode_tnc2(format!("{MIC_E}x/A=000100}}").as_bytes(), ParseOptions::LENIENT).unwrap();
+    let out = Packet::create(packet.source, packet.destination, Vec::new(), packet.data).unwrap();
+    let line = out.to_tnc2();
+    assert!(line.ends_with(b"/A=000100x}"), "{}", String::from_utf8_lossy(&line));
+}

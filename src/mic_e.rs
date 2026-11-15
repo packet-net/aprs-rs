@@ -248,7 +248,9 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
     // leaves a boundary, which no other element is read across.
     let mut lifted = None;
     if altitude_first.is_none() {
-        if let Some(i) = (0..s.len().saturating_sub(3)).find(|&i| altitude(&s[i..]).is_some()) {
+        if let Some(i) =
+            (0..s.len().saturating_sub(3)).find(|&i| altitude(&s[i..]).is_some() && !shares_a_byte_with_an_altitude_text(&s, i))
+        {
             if ctx.allows(
                 Code::MicEAltitudeNotFirst,
                 "a Mic-E altitude after other status text instead of first (APRS12c ch. 10)",
@@ -270,6 +272,14 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
         report.fields.altitude_feet = altitude_before;
     }
     ok
+}
+
+/// Whether the four bytes at `i` share a byte with a `/A=` altitude that stands whole in `s`
+/// (`/A=` and six digits, or `-` and five). The search for a later Mic-E altitude never uses such
+/// bytes, as it never uses a locator's or a data extension's (vectors README, Mic-E).
+fn shares_a_byte_with_an_altitude_text(s: &[u8], i: usize) -> bool {
+    // A 9-byte `/A=` that overlaps `i..i + 4` starts between `i - 8` and `i + 3`.
+    (i.saturating_sub(8)..i + 4).any(|j| comment::is_whole_altitude_text(s.get(j..j + 9)))
 }
 
 /// A Mic-E altitude, `xxx}`, at the start of `s`, in feet.
