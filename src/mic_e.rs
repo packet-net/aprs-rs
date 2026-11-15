@@ -215,31 +215,33 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
         s.drain(..4);
     }
 
-    // A grid locator and the /G symbol, then a space before any text.
-    let mut locator_text: Option<Vec<u8>> = None;
+    // A grid locator and the /G symbol, then a space before any text. The space is judged on the
+    // text left once every element lifted from it is out, by the comment's own lifting (vectors
+    // interpretations.md, "Where a Mic-E locator is read"), so it stays in `s` until then.
+    let mut after_locator = false;
     if let Some(len) = locator_len(&s) {
         report.locator = Some(String::from_utf8_lossy(&s[..len]).to_ascii_uppercase());
         s.drain(..len + 2);
-        // Base-91 telemetry and a !DAO! are lifted out before the locator is read, so a locator
-        // followed straight by them alone has nothing after it (vectors interpretations.md,
-        // "Where a Mic-E locator is read"). Its space is the locator's, even with telemetry between
-        // them in the bytes; one at the very start is dropped here, the other is the comment's own
-        // delimiter. A later Mic-E altitude is lifted too, and what is left between its bars can be
-        // telemetry, so the judgement waits until that altitude is out (below).
-        if s.first() == Some(&b' ') {
-            s.remove(0);
-        } else {
-            locator_text = Some(s.clone());
-        }
+        after_locator = true;
     }
 
-    // A data extension at the start of the text, lifted before an altitude is looked for later
-    // on, so its bytes are never read as one (`0PH}` in `PHG3330PH}`); one later on is found by
-    // the comment's rules.
-    let mut extension_len = 0;
-    if let Some(len) = comment::mic_e_extension(&mut report.fields, &s) {
-        s.drain(..len);
-        extension_len = len;
+    // A data extension at the start of the text (after the locator's space, which it needs), lifted
+    // before an altitude is looked for later on, so its bytes are never read as one (`0PH}` in
+    // `PHG3330PH}`); one later on is found by the comment's rules.
+    let separator = usize::from(after_locator && s.first() == Some(&b' '));
+    if let Some(len) = comment::mic_e_extension(&mut report.fields, &s[separator..]) {
+        s.drain(..separator + len);
+        if after_locator
+            && separator == 0
+            && !ctx.tolerate(
+                Code::MissingSpaceAfterLocator,
+                "text straight after the grid locator; a space comes first (APRS12c ch. 10)",
+                Some(offset),
+            )
+        {
+            return false;
+        }
+        after_locator = false;
     }
 
     // An altitude later in the text, when none came first: a tolerated reading. Taking it out
@@ -254,12 +256,11 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
             ) {
                 report.fields.altitude_feet = altitude(&s[i..]);
                 s.drain(i..i + 4);
-                if let Some(t) = locator_text.as_mut() {
-                    t.drain(extension_len + i..extension_len + i + 4);
-                }
                 joined = Some(i);
             } else if joins_into_altitude(&s) {
-                if !locator_space_ok(ctx, locator_text.take(), offset) {
+                // The decoder rejects the packet and so lifts nothing; the locator's space, met
+                // first, is judged on the same plan of what would be lifted.
+                if after_locator && !comment::locator_space(ctx, &mut comment::without_telemetry_and_dao(&s), offset) {
                     return false;
                 }
                 // Strictly the altitude is text and telemetry and the !DAO! are lifted as usual,
@@ -274,30 +275,16 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
             }
         }
     }
-    if !locator_space_ok(ctx, locator_text.take(), offset) {
-        return false;
-    }
     let altitude_before = report.fields.altitude_feet;
     // A `/A=` in the text wins over the Mic-E bytes, even when it says the same: whether the text
     // gave one is seen by letting it write into an empty field.
     report.fields.altitude_feet = None;
-    let ok = comment::tail(ctx, &mut report.fields, &s, offset, joined);
+    let ok = comment::tail(ctx, &mut report.fields, &s, offset, joined, after_locator);
     report.altitude_in_comment = report.fields.altitude_feet.is_some();
     if !report.altitude_in_comment {
         report.fields.altitude_feet = altitude_before;
     }
     ok
-}
-
-/// The locator's space, judged on `text` (what follows the locator) once every lifted element is
-/// out: nothing left, or a space first, is fine; text straight after the locator is tolerated.
-fn locator_space_ok(ctx: &mut Context, text: Option<Vec<u8>>, offset: usize) -> bool {
-    let Some(text) = text else { return true };
-    let lifted = comment::without_telemetry_and_dao(&text);
-    if lifted.is_empty() || lifted[0] == b' ' {
-        return true;
-    }
-    ctx.tolerate(Code::MissingSpaceAfterLocator, "text straight after the grid locator; a space comes first (APRS12c ch. 10)", Some(offset))
 }
 
 /// Whether the text left once base-91 telemetry and the `!DAO!` are lifted out of `s` holds a

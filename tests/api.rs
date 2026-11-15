@@ -329,6 +329,50 @@ fn mic_e_locator_space_is_judged_after_a_lifted_altitude_leaves_telemetry() {
     assert!(has_missing_space(&Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap()));
 }
 
+/// The locator's space is judged on what the decoder's own lifting leaves (vectors interpretations.md,
+/// "Where a Mic-E locator is read"). Two spaces after the locator: the first separates it, the comment
+/// loses one more, so it is `x`, whatever was lifted in between.
+#[test]
+fn mic_e_two_spaces_after_the_locator_give_the_comment_x() {
+    let comment = |line: &[u8]| {
+        let packet = Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+        assert!(packet.diagnostics.iter().all(|d| d.code != Code::MissingSpaceAfterLocator), "{}", String::from_utf8_lossy(line));
+        let Data::MicE(report) = packet.data else { panic!("not Mic-E") };
+        report.fields.comment
+    };
+    // A later altitude, telemetry, and both: two variations of each.
+    for line in [
+        &b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G\"4e}  x"[..],
+        &b"N0CALL>S32UVT:`(_fn\"Oj/`IO91SX/G\"4e}  x"[..],
+        &b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0'p|  x"[..],
+        &b"N0CALL>S32UVT:`(_fn\"Oj/`IO91SX/G|!:&0'p|  x"[..],
+        &b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0hl!Y[/>\"4e}='p|  x"[..],
+        &b"N0CALL>S32UVT:`(_fn\"Oj/`IO91SX/G|!:&0hl!Y[/>\"4e}='p|  x"[..],
+    ] {
+        assert_eq!(comment(line), "x", "{}", String::from_utf8_lossy(line));
+    }
+    // One space is only the separator.
+    assert_eq!(comment(b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0'p| x"), "x");
+}
+
+/// A `!DAO!` that exists only by joining the text either side of a lifted altitude is not lifted, so
+/// the text after the locator starts with it and the locator's space is missing.
+#[test]
+fn mic_e_a_dao_joined_across_an_altitude_is_text_after_the_locator() {
+    for (line, comment) in [
+        (&b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G!W1\"4e}2! hi"[..], "!W12! hi"),
+        (&b"N0CALL>S32UVT:`(_fn\"Oj/`IO91SX/G!W1\"4e}2! hi"[..], "!W12! hi"),
+    ] {
+        let lenient = Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+        assert!(lenient.diagnostics.iter().any(|d| d.code == Code::MissingSpaceAfterLocator), "{}", String::from_utf8_lossy(line));
+        let Data::MicE(report) = &lenient.data else { panic!("not Mic-E") };
+        assert!(report.fields.dao.is_none());
+        assert_eq!(report.fields.comment, comment);
+        let strict = Packet::decode_tnc2(line, ParseOptions::STRICT).unwrap();
+        assert!(strict.diagnostics.iter().any(|d| d.code == Code::MissingSpaceAfterLocator && d.severity == Severity::Error));
+    }
+}
+
 /// A garbled timestamp whose seven bytes end in a time indicator and are followed by an uncompressed
 /// position: the position after the seven bytes wins, even where the bytes after the DTI would read
 /// as a compressed position (vectors README, "Timestamps that are not there").

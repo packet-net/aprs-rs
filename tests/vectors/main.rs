@@ -21,16 +21,16 @@ use compare::differences;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libtest_mimic::{Arguments, Failed, Trial};
 use pdn_aprs::{Address, Code, Data, HeaderError, Packet, ParseOptions, PathEntry, Severity, Unrecognized};
 use serde_json::Value;
 
-/// How many cases the tolerance check runs on, and which it skips (see `tolerance_skipped`).
+/// How many cases the tolerance check runs on.
 static CHECKED: AtomicUsize = AtomicUsize::new(0);
-static SKIPPED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// How many cases have lenient diagnostics naming exactly one tolerable code, and a strict result.
+static ELIGIBLE: AtomicUsize = AtomicUsize::new(0);
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors")
@@ -53,11 +53,14 @@ fn main() {
             add_trials(&mut trials, case.clone(), &known);
         }
     }
-    let skipped = SKIPPED.lock().unwrap();
-    eprintln!("tolerance check: runs on {} cases, skipped for {}: {:?}", CHECKED.load(Ordering::Relaxed), skipped.len(), *skipped);
-    // The vectors' RULED.md: only one case leaves the check; a mistake that skips more would show here.
-    assert!(skipped.len() <= 1, "the tolerance check skipped more cases than the vectors allow: {skipped:?}");
-    libtest_mimic::run(&args, trials).exit();
+    let full_run = args.filter.is_none() && args.skip.is_empty() && !args.list && !args.ignored && !args.exact;
+    let conclusion = libtest_mimic::run(&args, trials);
+    if full_run {
+        let (checked, eligible) = (CHECKED.load(Ordering::Relaxed), ELIGIBLE.load(Ordering::Relaxed));
+        eprintln!("tolerance check: ran on {checked} of {eligible} cases whose lenient diagnostics name exactly one tolerable code");
+        assert_eq!(checked, eligible, "the tolerance check must run on every case that qualifies");
+    }
+    conclusion.exit();
 }
 
 fn known_differences() -> BTreeMap<String, String> {
@@ -94,12 +97,8 @@ fn add_trials(trials: &mut Vec<Trial>, case: Value, known: &BTreeMap<String, Str
     add("lenient", lenient);
     add("strict", strict);
     if case["strict"].is_object() && tolerance_for(&case).is_some() {
-        if tolerance_skipped(&case) {
-            SKIPPED.lock().unwrap().push(id.clone());
-        } else {
-            CHECKED.fetch_add(1, Ordering::Relaxed);
-            add("tolerance", tolerance);
-        }
+        ELIGIBLE.fetch_add(1, Ordering::Relaxed);
+        add("tolerance", tolerance);
     }
     if case.get("reencode").is_some() {
         add("reencode", reencode);
@@ -255,13 +254,6 @@ fn tolerance_for(case: &Value) -> Option<Code> {
     (codes.len() == 1).then(|| codes[0])
 }
 
-/// The tolerance check is skipped for a case whose `strict` is rejected by a code other than the one
-/// tolerable code (turning that tolerance off can then bring out another defect; README, "Checking a case").
-fn tolerance_skipped(case: &Value) -> bool {
-    let Some(code) = tolerance_for(case) else { return false };
-    case["strict"].get("rejected_by").and_then(Value::as_str).is_some_and(|x| Code::from_id(x) != Some(code))
-}
-
 // ------------------------------------------------------------------ the checks
 
 fn lenient(case: &Value) -> Result<(), String> {
@@ -273,9 +265,25 @@ fn strict(case: &Value) -> Result<(), String> {
 }
 
 fn tolerance(case: &Value) -> Result<(), String> {
+    CHECKED.fetch_add(1, Ordering::Relaxed);
     let code = tolerance_for(case).unwrap();
     let decoded = decode(&case["input"], ParseOptions::LENIENT.without(code));
-    result(check_strict(case, &decoded).into_iter().map(|d| format!("with only {code} not tolerated: {d}")).collect())
+    let other = case["strict"].get("rejected_by").and_then(Value::as_str).filter(|x| Code::from_id(x) != Some(code));
+    let differences = match other {
+        // Strict is rejected by a different code: turning off this one tolerance must give a
+        // reading whose diagnostics include that code as a warning (README, "Checking a case").
+        Some(x) => match &decoded {
+            Ok(p)
+                if p.data != Data::Unrecognized(Unrecognized::Malformed)
+                    && neutral::diagnostics(&p.diagnostics).contains(&format!("warning:{x}")) =>
+            {
+                vec![]
+            }
+            _ => vec![format!("expected a reading with warning:{x}, got {}", describe(&decoded))],
+        },
+        None => check_strict(case, &decoded),
+    };
+    result(differences.into_iter().map(|d| format!("with only {code} not tolerated: {d}")).collect())
 }
 
 fn show(bytes: &[u8]) -> String {

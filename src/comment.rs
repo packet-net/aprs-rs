@@ -159,7 +159,7 @@ pub(crate) fn decode(ctx: &mut Context, fields: &mut Positioned, cs: Option<Cs>,
             Some(n) => at = n,
         }
     }
-    tail(ctx, fields, &bytes[at..], offset + at, None)
+    tail(ctx, fields, &bytes[at..], offset + at, None, false)
 }
 
 /// Where the weather text of a positioned report ends in `bytes`: the start of the trailing base-91
@@ -172,7 +172,7 @@ fn weather_end(bytes: &[u8]) -> usize {
 /// what is left is the software type and unit, or else text that a weather report should not have.
 fn weather_tail(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], offset: usize) -> bool {
     let mut c: Vec<u8> = bytes.to_vec();
-    if !lift_telemetry_and_dao(ctx, fields, &mut c, offset, None) {
+    if !lift_telemetry_and_dao(ctx, fields, &mut c, offset, None, false) {
         return false;
     }
     if c.is_empty() || weather::software_and_unit(&c, fields.weather.get_or_insert_with(Weather::default)) {
@@ -188,37 +188,50 @@ fn weather_tail(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], offset
 /// DAO-shaped run inside it is not taken for a DAO. A `!DAO!` is five bytes as sent, so one that
 /// spans `joined` (where bytes were taken out before, bringing the bytes on either side together)
 /// is not one.
-fn lift_telemetry_and_dao(ctx: &mut Context, fields: &mut Positioned, c: &mut Vec<u8>, offset: usize, joined: Option<usize>) -> bool {
-    let telemetry = find_telemetry(c);
-    let dao = find_dao(c, telemetry.as_ref().map(|t| t.0.clone()), joined);
+///
+/// `after_locator`: `c` follows a Mic-E locator, whose space is judged on what is left once the
+/// elements are out ([`locator_space`]), before the `!DAO!`'s own checks.
+fn lift_telemetry_and_dao(
+    ctx: &mut Context,
+    fields: &mut Positioned,
+    c: &mut Vec<u8>,
+    offset: usize,
+    joined: Option<usize>,
+    after_locator: bool,
+) -> bool {
+    let (telemetry, dao) = plan_lift(c, joined);
     let mut removals: Vec<core::ops::Range<usize>> = Vec::new();
-    if let Some((range, t)) = telemetry {
+    removals.extend(telemetry.as_ref().map(|t| t.0.clone()));
+    removals.extend(dao.as_ref().map(|d| d.0.clone()));
+    removals.sort_by_key(|r| core::cmp::Reverse(r.start));
+    for r in removals {
+        c.drain(r);
+    }
+    if after_locator && !locator_space(ctx, c, offset) {
+        return false;
+    }
+    if let Some((_, t)) = telemetry {
         fields.telemetry = Some(t);
-        removals.push(range);
     }
     if let Some((range, found)) = dao {
         if !apply_dao(ctx, fields, found, offset + range.start) {
             return false;
         }
-        removals.push(range);
-    }
-    removals.sort_by_key(|r| core::cmp::Reverse(r.start));
-    for r in removals {
-        c.drain(r);
     }
     true
 }
 
-/// Where the base-91 telemetry and `!DAO!` [`tail`] would lift out of `c` are, last first.
-pub(crate) fn telemetry_and_dao_spans(c: &[u8]) -> Vec<core::ops::Range<usize>> {
-    let telemetry = find_telemetry(c).map(|t| t.0);
-    let dao = find_dao(c, telemetry.clone(), None).map(|d| d.0);
-    let mut spans: Vec<core::ops::Range<usize>> = telemetry.into_iter().chain(dao).collect();
-    spans.sort_by_key(|r| core::cmp::Reverse(r.start));
-    spans
+type Lifted<T> = Option<(core::ops::Range<usize>, T)>;
+
+/// The telemetry block and the `!DAO!` that lifting takes out of `c`. The telemetry block is
+/// located first, and a `!DAO!` does not span `joined`.
+fn plan_lift(c: &[u8], joined: Option<usize>) -> (Lifted<CommentTelemetry>, Lifted<FoundDao>) {
+    let telemetry = find_telemetry(c);
+    let dao = find_dao(c, telemetry.as_ref().map(|t| t.0.clone()), joined);
+    (telemetry, dao)
 }
 
-/// `c` with its base-91 telemetry and `!DAO!` taken out, as [`tail`] would lift them.
+/// `c` with the telemetry and `!DAO!` that [`tail`] lifts out of it taken out, from the same plan.
 pub(crate) fn without_telemetry_and_dao(c: &[u8]) -> Vec<u8> {
     let mut rest = c.to_vec();
     for r in telemetry_and_dao_spans(c) {
@@ -227,14 +240,47 @@ pub(crate) fn without_telemetry_and_dao(c: &[u8]) -> Vec<u8> {
     rest
 }
 
+/// The space after a Mic-E locator, judged on `c`, the text after it with every lifted element
+/// out: nothing left is fine, a space first is the separator and is taken off, and anything else
+/// is a tolerated `missing-space-after-locator`.
+pub(crate) fn locator_space(ctx: &mut Context, c: &mut Vec<u8>, offset: usize) -> bool {
+    match c.first() {
+        None => true,
+        Some(b' ') => {
+            c.remove(0);
+            true
+        }
+        Some(_) => ctx.tolerate(
+            Code::MissingSpaceAfterLocator,
+            "text straight after the grid locator; a space comes first (APRS12c ch. 10)",
+            Some(offset),
+        ),
+    }
+}
+
+/// Where the base-91 telemetry and `!DAO!` [`tail`] would lift out of `c` are, last first.
+pub(crate) fn telemetry_and_dao_spans(c: &[u8]) -> Vec<core::ops::Range<usize>> {
+    let (telemetry, dao) = plan_lift(c, None);
+    let mut spans: Vec<core::ops::Range<usize>> = telemetry.map(|t| t.0).into_iter().chain(dao.map(|d| d.0)).collect();
+    spans.sort_by_key(|r| core::cmp::Reverse(r.start));
+    spans
+}
+
 /// The comment after any data extension: lifts out telemetry and a `!DAO!` (from the end), then an
 /// altitude, signpost or corridor braces, a data extension found later in the text, and a voice
 /// frequency at the start, in the order that keeps one from being taken for another; the rest,
 /// less one leading delimiter, is the comment. `joined`: where bytes were already taken out of
 /// the text (a Mic-E altitude), which a `!DAO!` does not span.
-pub(crate) fn tail(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], offset: usize, joined: Option<usize>) -> bool {
+pub(crate) fn tail(
+    ctx: &mut Context,
+    fields: &mut Positioned,
+    bytes: &[u8],
+    offset: usize,
+    joined: Option<usize>,
+    after_locator: bool,
+) -> bool {
     let mut c: Vec<u8> = bytes.to_vec();
-    if !lift_telemetry_and_dao(ctx, fields, &mut c, offset, joined) {
+    if !lift_telemetry_and_dao(ctx, fields, &mut c, offset, joined, after_locator) {
         return false;
     }
 
