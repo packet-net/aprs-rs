@@ -10,7 +10,7 @@ const LARGE: usize = 160_000;
 /// Four times the size: linear is 4, quadratic 16. Well past linear, well short of quadratic.
 const MAX_RATIO: f64 = 9.0;
 
-const ELEMENTS: [&[u8]; 6] = [b"{", b"PHG1", b"|!!|", b"/A=000001", b"!W12!", b"\"4e}"];
+const ELEMENTS: [&[u8]; 10] = [b"{", b"PHG1", b"|!!|", b"/A=000001", b"!W12!", b"\"4e}", b"|", b"|!", b"|!!!!", b"|!!!!|!W12!|a b"];
 
 fn run(header: &[u8], element: &[u8], size: usize, options: ParseOptions) -> f64 {
     let mut line = header.to_vec();

@@ -713,27 +713,36 @@ pub(crate) fn is_whole_altitude_text(w: Option<&[u8]>) -> bool {
     w.and_then(altitude_text).is_some()
 }
 
-/// Base-91 comment telemetry `|ss11...|`: 2-7 pairs between bars.
+/// Base-91 comment telemetry `|ss11...|`: 2-7 pairs between bars. The bars are taken in pairs from
+/// the start: a bar and the next one that enclose a valid block (4 to 14 characters, an even number,
+/// each 0x21 to 0x7B, whole as sent) make a block and both bars are used; otherwise the bar is text and
+/// the next one is looked at. The LAST block found is the telemetry (packet-net/aprs-vectors#32), and no
+/// block means the bars are text. One pass over the bars, each pair looked at for at most 14 bytes, so it
+/// is linear in the comment.
 fn find_telemetry(text: &Text) -> Option<(core::ops::Range<usize>, CommentTelemetry)> {
     let c = &text.b[..];
-    // Only the last two bars are considered: telemetry goes at the end of the comment.
     let bars: Vec<usize> = c.iter().enumerate().filter(|(_, b)| **b == b'|').map(|(i, _)| i).collect();
-    if let [.., start, end] = bars[..] {
+    let mut last = None;
+    let mut i = 0;
+    while i + 1 < bars.len() {
+        let (start, end) = (bars[i], bars[i + 1]);
         let inner = &c[start + 1..end];
-        if text.splits(start, end + 1)
-            || inner.len() < 4
-            || inner.len() > 14
-            || inner.len() % 2 != 0
-            || !inner.iter().all(|&b| base91::is_digit(b))
+        if (4..=14).contains(&inner.len())
+            && inner.len() % 2 == 0
+            && inner.iter().all(|&b| base91::is_digit(b))
+            && !text.splits(start, end + 1)
         {
-            return None;
+            last = Some((start, end));
+            i += 2;
+        } else {
+            i += 1;
         }
-        let values: Vec<u16> = inner.chunks(2).map(|p| base91::decode(p).unwrap_or(0) as u16).collect();
-        let (sequence, rest) = values.split_first()?;
-        let (analog, digital) = if rest.len() == 6 { (&rest[..5], Some(rest[5] as u8)) } else { (rest, None) };
-        return Some((start..end + 1, CommentTelemetry { sequence: *sequence, analog: analog.to_vec(), digital }));
     }
-    None
+    let (start, end) = last?;
+    let values: Vec<u16> = c[start + 1..end].chunks(2).map(|p| base91::decode(p).unwrap_or(0) as u16).collect();
+    let (sequence, rest) = values.split_first()?;
+    let (analog, digital) = if rest.len() == 6 { (&rest[..5], Some(rest[5] as u8)) } else { (rest, None) };
+    Some((start..end + 1, CommentTelemetry { sequence: *sequence, analog: analog.to_vec(), digital }))
 }
 
 /// A `!DAO!` and the extra minutes of latitude and longitude it adds.
