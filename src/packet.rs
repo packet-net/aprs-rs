@@ -264,34 +264,15 @@ impl Packet {
     ///
     /// Refuses with `invalid-address` a header that a TNC2 line cannot carry: every address must be
     /// 1-9 letters, digits or `-`, so a third-party source such as `PY2SP_R-R` cannot head a packet
-    /// of its own, and no address may be empty; and with `tnc2-cannot-carry` a path with an entry not
-    /// marked used before one that is. The header is checked before the data, and the
+    /// of its own, and no address may be empty. The header is checked before the data, and the
     /// destination of Mic-E data is not checked because it is worked out from the report.
     pub fn create(source: Address, destination: Address, path: Vec<PathEntry>, data: Data) -> Result<Packet, EncodeError> {
-        Packet::create_in(source, destination, path, data, false)
-    }
-
-    /// [`Packet::create`] for a packet to be written as an AX.25 frame: the header is checked as a frame
-    /// carries it (`ax25-cannot-carry` for a call of more than six characters, a lower-case call, a
-    /// q-construct or an entry not marked used before one that is), still before the data.
-    pub fn create_for_ax25(source: Address, destination: Address, path: Vec<PathEntry>, data: Data) -> Result<Packet, EncodeError> {
-        Packet::create_in(source, destination, path, data, true)
-    }
-
-    fn create_in(source: Address, destination: Address, path: Vec<PathEntry>, data: Data, frame: bool) -> Result<Packet, EncodeError> {
         let mic_e = matches!(data, Data::MicE(_));
         if !Address::is_valid(source.as_str())
             || (!mic_e && !Address::is_valid(destination.as_str()))
             || path.iter().any(|e| !Address::is_valid(e.address.as_str()))
         {
             return Err(EncodeError::new(RefusalCode::InvalidAddress, "a header address is not 1-9 letters, digits or -"));
-        }
-        // The header in the form to be written, before any data fault: a Mic-E destination is worked out afterwards.
-        let header_destination = if mic_e { Address::unchecked("APZ001".to_string()) } else { destination.clone() };
-        if frame {
-            crate::readback::ax25_header(&source, &header_destination, &path, write_ax25_address)?;
-        } else {
-            crate::readback::tnc2_header(&source, &header_destination, &path, false)?;
         }
         let (computed, information) = data.seal()?.into_parts();
         let destination = computed.unwrap_or(destination);

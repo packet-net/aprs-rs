@@ -43,13 +43,12 @@ pub struct Station {
     source: Address,
     destination: Address,
     path: Vec<PathEntry>,
-    frame: bool,
 }
 
 impl Station {
     /// The station sending the packets, e.g. `M0LTE-9`.
     pub fn new(source: &str) -> Result<Station, InvalidAddress> {
-        Ok(Station { source: Address::new(source)?, destination: Address::new(DEFAULT_DESTINATION)?, path: Vec::new(), frame: false })
+        Ok(Station { source: Address::new(source)?, destination: Address::new(DEFAULT_DESTINATION)?, path: Vec::new() })
     }
 
     /// This station with another destination address, usually the application's allocated tocall.
@@ -71,14 +70,6 @@ impl Station {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Station { path, ..self.clone() })
-    }
-
-    /// This station for packets that will be written as AX.25 frames: a header a frame cannot carry (a
-    /// call of more than six characters, a q-construct) is refused when the packet is built, ahead of
-    /// any fault in the data, as `to_ax25` would refuse it. Without this, the header is checked as a
-    /// TNC2 line carries it.
-    pub fn for_ax25(&self) -> Station {
-        Station { frame: true, ..self.clone() }
     }
 
     /// The source address.
@@ -230,11 +221,7 @@ impl Station {
     }
 
     fn packet(&self, data: Data) -> Result<Packet, EncodeError> {
-        if self.frame {
-            Packet::create_for_ax25(self.source.clone(), self.destination.clone(), self.path.clone(), data)
-        } else {
-            Packet::create(self.source.clone(), self.destination.clone(), self.path.clone(), data)
-        }
+        Packet::create(self.source.clone(), self.destination.clone(), self.path.clone(), data)
     }
 }
 

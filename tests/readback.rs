@@ -159,17 +159,17 @@ fn an_ax25_frame_sets_the_h_bit_of_every_used_entry() {
 
 #[test]
 fn a_path_entry_not_used_before_a_used_one_cannot_be_carried() {
-    // Building knows it already, in the form to be written, and before any fault in the data.
+    // Building builds it: the refusal comes from the call that writes a form, and a fault in the data comes first.
     let unwritable = path(&[("WIDE1-1", false), ("N0CALL-1", true)]);
-    assert_eq!(Packet::create(me(), to(), unwritable.clone(), status("hi")).unwrap_err().code(), RefusalCode::Tnc2CannotCarry);
-    assert_eq!(Packet::create_for_ax25(me(), to(), unwritable.clone(), status("hi")).unwrap_err().code(), RefusalCode::Ax25CannotCarry);
+    let p = Packet::create(me(), to(), unwritable.clone(), status("hi")).unwrap();
+    assert_eq!(p.to_tnc2().unwrap_err().code(), RefusalCode::Tnc2CannotCarry);
+    assert_eq!(p.to_ax25().unwrap_err().code(), RefusalCode::Ax25CannotCarry);
     let bad_name = Data::Item(pdn_aprs::ItemReport { name: "TOOLONGNAMEX".into(), ..Default::default() });
-    assert_eq!(Packet::create(me(), to(), unwritable.clone(), bad_name.clone()).unwrap_err().code(), RefusalCode::Tnc2CannotCarry);
-    assert_eq!(Packet::create_for_ax25(me(), to(), unwritable, bad_name).unwrap_err().code(), RefusalCode::Ax25CannotCarry);
-    // A call a frame cannot carry is refused first when the frame is the form written, and written in a line.
-    let nine = Address::new("N0CALLXYZ").unwrap();
-    assert_eq!(Packet::create_for_ax25(nine.clone(), to(), Vec::new(), status("hi")).unwrap_err().code(), RefusalCode::Ax25CannotCarry);
-    assert_eq!(Packet::create(nine, to(), Vec::new(), status("hi")).unwrap().to_tnc2().unwrap(), b"N0CALLXYZ>APZ001:>hi");
+    assert_eq!(Packet::create(me(), to(), unwritable, bad_name).unwrap_err().code(), RefusalCode::InvalidName);
+    // A call a frame cannot carry is built, written in a line, and refused only when the frame is written.
+    let nine = Packet::create(Address::new("N0CALLXYZ").unwrap(), to(), Vec::new(), status("hi")).unwrap();
+    assert_eq!(nine.to_tnc2().unwrap(), b"N0CALLXYZ>APZ001:>hi");
+    assert_eq!(nine.to_ax25().unwrap_err().code(), RefusalCode::Ax25CannotCarry);
     // A path with no used entry, and one with a used first entry, are written.
     assert_eq!(packet(&[("WIDE1-1", false), ("WIDE2-1", false)]).to_tnc2().unwrap(), b"N0CALL>APZ001,WIDE1-1,WIDE2-1:>hi");
     assert_eq!(packet(&[("N0CALL-1", true), ("WIDE2-1", false)]).to_tnc2().unwrap(), b"N0CALL>APZ001,N0CALL-1*,WIDE2-1:>hi");
