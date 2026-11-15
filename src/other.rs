@@ -433,10 +433,11 @@ pub(crate) fn encode(data: &Data) -> Result<Forms, EncodeError> {
         }
         Ok(())
     };
-    // Test data is data, not text: only a line break would not read back.
+    // Test data is data, not text: only a line break at its end would not read back (one inside is
+    // written, and a line carrying it is refused when the line is written).
     let test_data = |t: &str| -> Result<(), EncodeError> {
-        if crate::text::has_line_break(t.as_bytes()) {
-            return Err(EncodeError::new(RefusalCode::InvalidCharacter, "test data cannot contain a line break"));
+        if matches!(t.as_bytes().last(), Some(b'\r' | b'\n')) {
+            return Err(EncodeError::new(RefusalCode::InvalidCharacter, "test data cannot end with a line break"));
         }
         Ok(())
     };
@@ -571,6 +572,9 @@ pub(crate) fn encode(data: &Data) -> Result<Forms, EncodeError> {
                     "third-party packets nest at most four deep, and a decoder reads no more",
                 ));
             }
+            if inner_reads_as_other_data(p) {
+                return Err(crate::readback::reads_as_other_data());
+            }
             third_party_header(p)?;
             out.push(b'}');
             out.extend_from_slice(&p.tnc2_unchecked());
@@ -700,14 +704,32 @@ fn encode_nmea(n: &Nmea) -> Result<Forms, EncodeError> {
     Ok(Forms::new(out))
 }
 
+/// Whether an inner packet's information field reads as other data under its own header, or its Mic-E
+/// data has an inner destination that is not the one it computes (it is never written under another).
+fn inner_reads_as_other_data(p: &Packet) -> bool {
+    if crate::readback::header_reads_as_other_data(&p.source, &p.destination, &p.path, &p.information, &p.data) {
+        return true;
+    }
+    match &p.data {
+        Data::MicE(_) => p.data.seal_for(false).ok().and_then(|s| s.into_parts().0).is_some_and(|computed| computed != p.destination),
+        _ => false,
+    }
+}
+
 /// The first rule an inner packet's data breaks, as the encoder would refuse it on its own: none for
 /// undecoded data, which has no neutral form and is written as received.
 fn inner_fault(data: &Data) -> Option<EncodeError> {
     match data {
         Data::Unrecognized(_) => None,
-        Data::MicE(r) => crate::mic_e::forms(r, false, false).err(),
-        Data::ThirdParty(p) => inner_fault(&p.data),
-        other => other.forms().err(),
+        // A deeper inner header is judged here too, where its bytes did not read back.
+        Data::ThirdParty(p) => {
+            if inner_reads_as_other_data(p) {
+                return Some(crate::readback::reads_as_other_data());
+            }
+            third_party_header(p).err().or_else(|| inner_fault(&p.data))
+        }
+        // Written on its own, with its own read-back and size: the first thing that refuses it is its fault.
+        other => other.seal_for(false).err(),
     }
 }
 

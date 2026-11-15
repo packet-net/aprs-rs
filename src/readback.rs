@@ -125,6 +125,32 @@ pub(crate) fn seal(given: &Data, forms: Forms) -> Result<Sealed, EncodeError> {
     })
 }
 
+/// Whether an information field, read under the header it is written with, is Mic-E data where `held` is
+/// not, or is not where `held` is: the one way a header changes how bytes read (a Mic-E destination with
+/// the data type identifiers `` ` ``, `'`, 0x1C and 0x1D). Such a field paired with such a header is
+/// `not-encodable`: it would read back as other data.
+pub(crate) fn header_reads_as_other_data(
+    source: &Address,
+    destination: &Address,
+    path: &[crate::PathEntry],
+    information: &[u8],
+    held: &Data,
+) -> bool {
+    if !matches!(information.first(), Some(b'`' | b'\'' | 0x1C | 0x1D)) && !matches!(held, Data::MicE(_)) {
+        return false;
+    }
+    let read = crate::Packet::decode(source.clone(), destination.clone(), path.to_vec(), information, ParseOptions::LENIENT);
+    matches!(read.data, Data::MicE(_)) != matches!(held, Data::MicE(_))
+}
+
+/// The refusal for a field that reads as other data under the header it is written with.
+pub(crate) fn reads_as_other_data() -> EncodeError {
+    EncodeError::new(
+        RefusalCode::NotEncodable,
+        "under this header the information field reads as other data (a Mic-E destination, or none)",
+    )
+}
+
 /// The header `N0CALL>APZ001` a form is read back under, or `N0CALL>` and the destination computed.
 fn well_formed_header(destination: Option<&Address>) -> (Address, Address) {
     (
@@ -193,6 +219,65 @@ fn same_diagnostics(a: &[crate::Diagnostic], b: &[crate::Diagnostic]) -> bool {
     left.sort();
     right.sort();
     left == right
+}
+
+/// Whether any number in the data is NaN or infinite, in every field of every type and in a third-party
+/// packet's inner data at every depth. A non-finite number is `not-a-number` wherever it is, never equal
+/// to a finite one and never absent.
+pub(crate) fn has_non_finite(data: &Data) -> bool {
+    let mut current = data;
+    loop {
+        let bad = match current {
+            Data::Position(r) => positioned_non_finite(&r.fields),
+            Data::Object(r) => positioned_non_finite(&r.fields),
+            Data::Item(r) => positioned_non_finite(&r.fields),
+            Data::MicE(r) => positioned_non_finite(&r.fields),
+            Data::Weather(w) => weather_non_finite(&w.weather),
+            Data::TelemetryCoefficients(t) => t.coefficients.iter().any(|v| !v.is_finite()),
+            Data::Telemetry(t) => t.analog.iter().flatten().any(|v| !v.is_finite()),
+            Data::Nmea(n) => {
+                [n.latitude, n.longitude, n.course_degrees, n.speed_knots, n.altitude_m].iter().flatten().any(|v| !v.is_finite())
+            }
+            Data::Query(q) => {
+                q.footprint.as_ref().is_some_and(|f| ![f.latitude, f.longitude, f.radius_miles].iter().all(|v| v.is_finite()))
+            }
+            _ => false,
+        };
+        if bad {
+            return true;
+        }
+        match current {
+            Data::ThirdParty(p) => current = &p.data,
+            _ => return false,
+        }
+    }
+}
+
+fn positioned_non_finite(f: &Positioned) -> bool {
+    let numbers = [f.position.latitude, f.position.longitude];
+    let options = [f.course_degrees, f.speed_knots, f.altitude_feet, f.range_miles];
+    numbers.iter().chain(options.iter().flatten()).any(|v| !v.is_finite())
+        || f.frequency.as_ref().is_some_and(|q| !q.mhz.is_finite())
+        || f.weather.as_ref().is_some_and(weather_non_finite)
+}
+
+fn weather_non_finite(w: &Weather) -> bool {
+    [
+        w.wind_direction_degrees,
+        w.wind_speed_mph,
+        w.wind_gust_mph,
+        w.temperature_f,
+        w.rain_1h_in,
+        w.rain_24h_in,
+        w.rain_midnight_in,
+        w.humidity_percent,
+        w.pressure_mbar,
+        w.luminosity_w_m2,
+        w.snow_24h_in,
+    ]
+    .iter()
+    .flatten()
+    .any(|v| !v.is_finite())
 }
 
 // ------------------------------------------------------------------ what the decode must hold

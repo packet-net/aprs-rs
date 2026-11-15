@@ -396,3 +396,121 @@ fn an_inner_source_is_judged_by_the_outer_address_rule_before_any_frame_check() 
     assert_eq!(inner.to_tnc2().unwrap(), b"abc>APRS:>hi");
     assert_eq!(inner.to_ax25().unwrap_err().code(), RefusalCode::Ax25CannotCarry);
 }
+
+// ------------------------------------------------------------------ second fix pass
+
+#[test]
+fn a_builder_judges_the_header_before_any_fault_in_the_data() {
+    let station = Station::new("N0CALL").unwrap().via(&["WIDE1-1", "WIDE2-1*"]).unwrap();
+    let invalid_path = |r: Result<Packet, EncodeError>, what: &str| assert_eq!(r.unwrap_err().code(), RefusalCode::InvalidPath, "{what}");
+    invalid_path(station.position(90.0, 0.0).symbol(Symbol::CAR).ambiguity(4).build(), "box past a pole");
+    invalid_path(station.telemetry(1000).build(), "sequence over 999");
+    invalid_path(station.telemetry(1).analog(&[None; 6]).build(), "six analog values");
+    invalid_path(station.object("OBJ").symbol(Symbol::CAR).permanent().build(), "object with no position");
+    invalid_path(station.position(10.0, 0.0).symbol(Symbol::CAR).tone(Tone::Tone, 100).build(), "tone with no frequency");
+    invalid_path(station.position(100.0, 0.0).symbol(Symbol::CAR).build(), "latitude out of range");
+}
+
+#[test]
+fn a_finite_value_the_builder_converts_past_the_largest_number_is_out_of_range() {
+    let station = Station::new("N0CALL").unwrap();
+    let w = || station.weather().at(1.0, 1.0).symbol(Symbol::WEATHER_STATION).wind_direction_degrees(10.0).wind_speed_mph(5.0);
+    let refused = |r: Result<Packet, EncodeError>, what: &str| assert_eq!(r.unwrap_err().code(), RefusalCode::ValueOutOfRange, "{what}");
+    refused(w().rain_1h_in(1e308).build(), "rain in inches");
+    refused(w().pressure_mbar(1e308).build(), "pressure");
+    refused(w().rain_1h_mm(1e308).build(), "rain in millimetres");
+    refused(w().temperature_c(1e308).build(), "temperature in Celsius");
+    refused(station.position(1.0, 1.0).symbol(Symbol::CAR).altitude_m(1e308).build(), "altitude in metres");
+    refused(station.mic_e(1.0, 1.0).symbol(Symbol::CAR).altitude_m(1e308).build(), "Mic-E altitude in metres");
+    // A value that is not a number is still not a number.
+    assert_eq!(w().rain_1h_in(f64::INFINITY).build().unwrap_err().code(), RefusalCode::NotANumber);
+}
+
+#[test]
+fn a_tone_value_without_its_tone_is_a_missing_field() {
+    let fields = Positioned {
+        frequency: Some(VoiceFrequency { mhz: 144.39, tone: None, tone_value: Some(100), ..Default::default() }),
+        ..position("")
+    };
+    let data = Data::Position(PositionReport { fields, ..Default::default() });
+    assert_eq!(refused(data), RefusalCode::MissingField);
+}
+
+#[test]
+fn a_corridor_width_on_an_area_that_is_not_a_line_is_not_allowed() {
+    let area = |shape, width| {
+        let fields = Positioned {
+            symbol: Symbol::new('\\', 'l'),
+            area: Some(AreaObject { shape, lat_offset: 1, color: AreaColor::Black, lon_offset: 1, corridor_width_miles: width }),
+            ..position("")
+        };
+        Data::Position(PositionReport { fields, ..Default::default() })
+    };
+    assert_eq!(refused(area(AreaShape::OpenCircle, Some(12))), RefusalCode::FieldNotAllowed);
+    assert!(area(AreaShape::LineDownRight, Some(12)).encode().is_ok());
+}
+
+#[test]
+fn a_deeper_inner_header_the_bytes_do_not_carry_is_an_invalid_third_party_header() {
+    let outer = Packet::decode_tnc2(b"N0CALL>APZ001:}G4ABC>APZ001:}G5ABC>APZ001,A*,B*:>hi", ParseOptions::LENIENT).unwrap();
+    let Data::ThirdParty(mut middle) = outer.data else { panic!() };
+    let Data::ThirdParty(inner) = &mut middle.data else { panic!() };
+    inner.path[0].used = false;
+    assert_eq!(refused(Data::ThirdParty(middle)), RefusalCode::InvalidThirdPartyHeader);
+}
+
+#[test]
+fn test_and_user_defined_data_hold_a_line_break_inside_and_a_line_refuses_it() {
+    for line in [&b"N0CALL>APZ001:,a\rb"[..], b"N0CALL>APZ001:{Axa\nb"] {
+        let p = Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+        // As an information field alone it is written; as a line it is `tnc2-cannot-carry`.
+        let data = Packet::decode(me(), to(), vec![], &line[14..], ParseOptions::LENIENT).data;
+        assert_eq!(data.encode().unwrap(), &line[14..]);
+        assert_eq!(p.to_tnc2().unwrap_err().code(), RefusalCode::Tnc2CannotCarry);
+    }
+    // Only data that ends in one is refused.
+    let test = Data::Test(TestData { data: "a\r".into() });
+    assert_eq!(refused(test), RefusalCode::InvalidCharacter);
+}
+
+#[test]
+fn a_timestamp_is_shown_as_held() {
+    assert_eq!(Timestamp::dhm(255, 1, 2).to_string(), "2550102z");
+    assert_eq!(Timestamp::dhm(9, 23, 45).to_string(), "092345z");
+}
+
+// ------------------------------------------------------------------ read back under the header written
+
+#[test]
+fn a_field_that_reads_as_other_data_under_its_header_is_not_encodable() {
+    // Raw bytes that are no report under a plain destination are a Mic-E position under S32U6T.
+    let line = b"N0CALL>APZ001:`(_fn\"Oj/";
+    let mut held = Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+    assert!(!matches!(held.data, Data::MicE(_)));
+    assert_eq!(held.to_tnc2().unwrap(), line);
+    held.destination = Address::new("S32U6T").unwrap();
+    assert_eq!(held.to_tnc2().unwrap_err().code(), RefusalCode::NotEncodable);
+    assert_eq!(held.to_ax25().unwrap_err().code(), RefusalCode::NotEncodable);
+    // The other way: a Mic-E report put under a plain destination.
+    let mut mic_e = Packet::decode_tnc2(b"N0CALL>S32U6T:`(_fn\"Oj/", ParseOptions::LENIENT).unwrap();
+    assert!(matches!(mic_e.data, Data::MicE(_)));
+    mic_e.destination = Address::new("APZ001").unwrap();
+    assert_eq!(mic_e.to_tnc2().unwrap_err().code(), RefusalCode::NotEncodable);
+    // As a third-party inner packet, under APZ001 it is written and under S32U6T it is not.
+    let outer = Packet::decode_tnc2(b"N0CALL>APZ001:}N0CALL>APZ001:`(_fn\"Oj/", ParseOptions::LENIENT).unwrap();
+    assert!(outer.data.encode().is_ok());
+    let Data::ThirdParty(mut inner) = outer.data else { panic!() };
+    inner.destination = Address::new("S32U6T").unwrap();
+    assert_eq!(Data::ThirdParty(inner).encode().unwrap_err().code(), RefusalCode::NotEncodable);
+}
+
+#[test]
+fn inner_mic_e_data_is_written_under_the_destination_it_computes_and_no_other() {
+    let outer = Packet::decode_tnc2(b"N0CALL>APZ001:}N0CALL>S32U6T:`(_fn\"Oj/", ParseOptions::LENIENT).unwrap();
+    assert_eq!(outer.data.encode().unwrap(), b"}N0CALL>S32U6T:`(_fn\"Oj/");
+    let Data::ThirdParty(mut inner) = outer.data else { panic!() };
+    assert!(matches!(inner.data, Data::MicE(_)));
+    // Another Mic-E destination reads as another position: the data is not written under it.
+    inner.destination = Address::new("S32U6U").unwrap();
+    assert_eq!(Data::ThirdParty(inner).encode().unwrap_err().code(), RefusalCode::NotEncodable);
+}

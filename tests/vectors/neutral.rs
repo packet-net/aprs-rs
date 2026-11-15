@@ -819,11 +819,7 @@ fn read_data(v: &Value) -> Read<Data> {
             locator: o.string("locator")?,
             legacy_telemetry: match o.array("legacy_telemetry")? {
                 None => Vec::new(),
-                Some(a) => a
-                    .iter()
-                    .map(|x| whole(x).and_then(|n| u8::try_from(n).ok()))
-                    .collect::<Option<Vec<u8>>>()
-                    .ok_or_else(|| Unreadable::Unsupported("legacy_telemetry: values are bytes, 0-255".into()))?,
+                Some(a) => a.iter().map(|x| whole_or_defer::<u8>(x, "legacy_telemetry")).collect::<Read<Vec<u8>>>()?,
             },
             destination_ssid: o.int("destination_ssid")?.unwrap_or(0),
             fields: read_positioned(&o)?,
@@ -1049,6 +1045,18 @@ fn read_data(v: &Value) -> Read<Data> {
             let data = data?;
             let information = match &data {
                 Data::Unrecognized(_) => Vec::new(),
+                // Mic-E data is written with the destination it computes; under any other inner destination it is not written.
+                Data::MicE(_) => {
+                    let made = Packet::create(Address::new("N0CALL").expect("an address"), destination.clone(), Vec::new(), data.clone())
+                        .map_err(|e| Unreadable::Refused(e.code(), format!("the inner packet's data: {e}")))?;
+                    if made.destination != destination {
+                        return Err(Unreadable::Refused(
+                            pdn_aprs::RefusalCode::NotEncodable,
+                            "the inner Mic-E data is not under the destination it computes".into(),
+                        ));
+                    }
+                    made.information
+                }
                 data => data.encode().map_err(|e| Unreadable::Refused(e.code(), format!("the inner packet's data: {e}")))?,
             };
             // Packet is non-exhaustive: start from decoding the information field, then say what the

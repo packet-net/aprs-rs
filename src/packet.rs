@@ -289,6 +289,10 @@ impl Packet {
         crate::readback::check_header(&source, (!mic_e).then_some(&destination), &path, false)?;
         let (computed, information) = data.seal_for(bytes_first)?.into_parts();
         let destination = computed.unwrap_or(destination);
+        // The field is read back under the header written, not only under the default one.
+        if crate::readback::header_reads_as_other_data(&source, &destination, &path, &information, &data) {
+            return Err(crate::readback::reads_as_other_data());
+        }
         let decoded = Packet::decode(source.clone(), destination.clone(), path.clone(), &information, ParseOptions::STRICT);
         Ok(Packet { source, destination, path, information, data, diagnostics: decoded.diagnostics, third_party: false })
     }
@@ -316,6 +320,9 @@ impl Packet {
 
     /// The packet as a TNC2 text line (without a line ending). The last used path entry is marked `*`.
     ///
+    /// The information field is read under the header written: bytes that read as other data under it (Mic-E
+    /// bytes under a plain destination, a plain field under a Mic-E destination) are `not-encodable`.
+    ///
     /// The header is read back before it is returned, as a user's decode of a line reads it, whatever
     /// the packet's origin: an address a TNC2 header cannot carry (a third-party inner packet's source
     /// such as `PY2SP_R-R`, say) is `invalid-address`, and a path with an entry not marked used before
@@ -328,6 +335,7 @@ impl Packet {
     /// packet over 256 bytes is written as received). `Data::encode` and the builders are the encoders
     /// that refuse one.
     pub fn to_tnc2(&self) -> Result<Vec<u8>, EncodeError> {
+        self.check_reads_as_held()?;
         let mut out = crate::readback::tnc2_header(&self.source, &self.destination, &self.path)?;
         if crate::readback::line_break_inside(&self.information) {
             return Err(EncodeError::new(
@@ -338,6 +346,16 @@ impl Packet {
         out.reserve(self.information.len());
         out.extend_from_slice(&self.information);
         Ok(out)
+    }
+
+    /// The information field read under the header this packet is written with must be the kind of data the
+    /// packet holds: Mic-E bytes under a plain destination, or a plain field under a Mic-E destination, are
+    /// other data there (`not-encodable`), as when a held packet is re-addressed.
+    fn check_reads_as_held(&self) -> Result<(), EncodeError> {
+        if crate::readback::header_reads_as_other_data(&self.source, &self.destination, &self.path, &self.information, &self.data) {
+            return Err(crate::readback::reads_as_other_data());
+        }
+        Ok(())
     }
 
     /// The TNC2 line with no read-back of its header: a third-party packet's inner packet, whose
@@ -369,6 +387,7 @@ impl Packet {
     /// not an encoder: `information` is passed through as it stands, with no size check, and the
     /// addresses are read back before the frame is returned.
     pub fn to_ax25(&self) -> Result<Vec<u8>, EncodeError> {
+        self.check_reads_as_held()?;
         let mut out = crate::readback::ax25_header(&self.source, &self.destination, &self.path, write_ax25_address)?;
         out.reserve(self.information.len());
         out.extend_from_slice(&self.information);

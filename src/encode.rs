@@ -46,9 +46,19 @@ impl Data {
     /// Mic-E altitude bytes are the first form, whatever the value (neutral data puts a whole number
     /// of feet that the bytes do not hold exactly in a `/A=` first). It is an argument, not a mark on the data.
     pub(crate) fn seal_for(&self, bytes_first: bool) -> Result<Sealed, EncodeError> {
-        match self {
+        // A non-finite number anywhere, an inner packet's included, is `not-a-number`, wherever the
+        // report's own checks stand in the order: a fault ranked before it is named first.
+        let not_a_number = crate::readback::has_non_finite(self);
+        let refuse = |e: EncodeError| {
+            if not_a_number && !e.code().precedes(RefusalCode::NotANumber) {
+                EncodeError::new(RefusalCode::NotANumber, "a number in the data is NaN or infinite")
+            } else {
+                e
+            }
+        };
+        let sealed = match self {
             Data::MicE(r) => {
-                let sealed = crate::readback::seal(self, crate::mic_e::forms(r, false, bytes_first)?);
+                let sealed = crate::readback::seal(self, crate::mic_e::forms(r, false, bytes_first).map_err(refuse)?);
                 match sealed {
                     // The next form the Encoding rule names: an altitude in a `/A=` where the Mic-E bytes do not read back.
                     Err(e)
@@ -56,14 +66,18 @@ impl Data {
                             && crate::mic_e::altitude_has_text_form(r, bytes_first) =>
                     {
                         // A form that reads back but is too long is refused for its size; any other fault is the first form's.
-                        crate::readback::seal(self, crate::mic_e::forms(r, true, bytes_first)?)
+                        crate::readback::seal(self, crate::mic_e::forms(r, true, bytes_first).map_err(refuse)?)
                             .map_err(|second| if second.code() == RefusalCode::InformationFieldTooLong { second } else { e })
                     }
                     other => other,
                 }
             }
-            other => crate::readback::seal(other, other.forms()?),
+            other => crate::readback::seal(other, other.forms().map_err(refuse)?),
+        };
+        if not_a_number && sealed.is_ok() {
+            return Err(EncodeError::new(RefusalCode::NotANumber, "a number in the data is NaN or infinite"));
         }
+        sealed.map_err(refuse)
     }
 
     /// The forms this data may be written in, best first. Nothing here returns bytes to a caller: they
@@ -300,6 +314,9 @@ pub(crate) fn positioned(mut out: Vec<u8>, f: &Positioned, mut p: Pending) -> Re
             out.push(b'}');
         }
         if let Some(w) = f.area.and_then(|a| a.corridor_width_miles) {
+            if !f.area.is_some_and(|a| matches!(a.shape, crate::AreaShape::LineDownRight | crate::AreaShape::LineDownLeft)) {
+                p.note(EncodeError::new(RefusalCode::FieldNotAllowed, "a corridor width goes only with an area that is a line"));
+            }
             if w > 999 {
                 p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "an area corridor width is at most 999 miles"));
             }
@@ -858,6 +875,9 @@ pub(crate) fn frequency(out: &mut Vec<u8>, f: &crate::VoiceFrequency, p: &mut Pe
             Tone::Ctcss => Some(b'C'),
             Tone::Dcs => Some(b'D'),
         };
+        if letter.is_none() && f.tone_value.is_some() {
+            p.note(EncodeError::new(RefusalCode::FieldNotAllowed, "this tone has no value: Toff and the 1750 Hz burst carry none"));
+        }
         if let Some(letter) = letter {
             match f.tone_value {
                 Some(value) if value <= 999 => {
@@ -870,6 +890,8 @@ pub(crate) fn frequency(out: &mut Vec<u8>, f: &crate::VoiceFrequency, p: &mut Pe
         }
     } else if f.narrow {
         p.note(EncodeError::new(RefusalCode::MissingField, "narrow band is written with the tone field, so it needs a tone"));
+    } else if f.tone_value.is_some() {
+        p.note(EncodeError::new(RefusalCode::MissingField, "a tone value needs the tone it belongs to"));
     }
     if let Some(offset) = f.offset_khz {
         if offset.unsigned_abs() > 9990 {

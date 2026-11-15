@@ -446,7 +446,21 @@ fn pass_through_inner(case: &Value) -> Result<(), String> {
     written_back(inner, &case["pass_through_inner"], "pass_through_inner")
 }
 
-fn written_back(packet: &Packet, want: &Value, key: &str) -> Result<(), String> {
+fn written_back(held: &Packet, want: &Value, key: &str) -> Result<(), String> {
+    // The held packet's information field written under another header, when the case gives one.
+    let mut readdressed = held.clone();
+    if let Some(h) = want.get("header") {
+        if let Some(s) = h.get("source").and_then(Value::as_str) {
+            readdressed.source = Address::new(s).map_err(|e| e.to_string())?;
+        }
+        if let Some(d) = h.get("destination").and_then(Value::as_str) {
+            readdressed.destination = Address::new(d).map_err(|e| e.to_string())?;
+        }
+        if let Some(p) = h.get("path").and_then(Value::as_array) {
+            readdressed.path = p.iter().filter_map(Value::as_str).map(neutral::read_path_entry).collect();
+        }
+    }
+    let packet = &readdressed;
     let mut out = Vec::new();
     let mut one = |what: &str,
                    written: Result<Vec<u8>, pdn_aprs::EncodeError>,

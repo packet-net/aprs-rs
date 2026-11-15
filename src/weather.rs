@@ -341,9 +341,9 @@ pub(crate) fn software_and_unit(rest: &[u8], weather: &mut Weather) -> bool {
 pub(crate) fn write_fields(out: &mut Vec<u8>, w: &Weather, p: &mut Pending) {
     p.run(field(out, b'g', w.wind_gust_mph, 3, false));
     p.run(field(out, b't', w.temperature_f, 3, true));
-    p.run(optional(out, b'r', w.rain_1h_in.map(|v| v * 100.0), 3));
-    p.run(optional(out, b'p', w.rain_24h_in.map(|v| v * 100.0), 3));
-    p.run(optional(out, b'P', w.rain_midnight_in.map(|v| v * 100.0), 3));
+    p.run(optional(out, b'r', w.rain_1h_in, 100.0, 3));
+    p.run(optional(out, b'p', w.rain_24h_in, 100.0, 3));
+    p.run(optional(out, b'P', w.rain_midnight_in, 100.0, 3));
     if let Some(h) = w.humidity_percent {
         // Rounded once to a whole percent: 99.7 is `h00`, and 0.4, which rounds to 0, is refused
         // since `h00` means 100.
@@ -358,7 +358,7 @@ pub(crate) fn write_fields(out: &mut Vec<u8>, w: &Weather, p: &mut Pending) {
             push_digits(out, h as u32 % 100, 2);
         }
     }
-    p.run(optional(out, b'b', w.pressure_mbar.map(|v| v * 10.0), 5));
+    p.run(optional(out, b'b', w.pressure_mbar, 10.0, 5));
     if let Some(l) = w.luminosity_w_m2 {
         // Rounded once to a whole number of W/m2.
         let given = l;
@@ -442,10 +442,12 @@ pub(crate) fn field(out: &mut Vec<u8>, letter: u8, value: Option<f64>, width: us
     Ok(())
 }
 
-fn optional(out: &mut Vec<u8>, letter: u8, value: Option<f64>, width: usize) -> Result<(), EncodeError> {
+/// A value in units of `1 / scale` of its field's step (hundredths of an inch, tenths of a millibar). The value
+/// is judged as given: one the scaling carries past the field is `value-out-of-range`, never `not-a-number`.
+fn optional(out: &mut Vec<u8>, letter: u8, value: Option<f64>, scale: f64, width: usize) -> Result<(), EncodeError> {
     if let Some(v) = value {
         out.push(letter);
-        number_field(out, v, width, false)?;
+        number_field_scaled(out, v, scale, width, false)?;
     }
     Ok(())
 }
@@ -453,7 +455,11 @@ fn optional(out: &mut Vec<u8>, letter: u8, value: Option<f64>, width: usize) -> 
 /// A value in its field's steps, rounded to the nearest (vectors README, Encoding), in `width`
 /// digits.
 fn number_field(out: &mut Vec<u8>, value: f64, width: usize, signed: bool) -> Result<(), EncodeError> {
-    let n = crate::steps::round(value);
+    number_field_scaled(out, value, 1.0, width, signed)
+}
+
+fn number_field_scaled(out: &mut Vec<u8>, value: f64, scale: f64, width: usize, signed: bool) -> Result<(), EncodeError> {
+    let n = crate::steps::round(value * scale);
     if n.is_nan() {
         return Err(EncodeError::new(RefusalCode::NotANumber, "a weather value is not a number"));
     }
