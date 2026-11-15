@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Round 5 of the conformance vectors (pinned at 4e558d598406d94a81c653cf5dfafdf4a11f7f55).
+Round 5 of the conformance vectors (pinned at adc0acaeeec193fa40fe7c7019ec253608cdc641).
 
 Writing and reading back:
 

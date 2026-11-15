@@ -380,3 +380,19 @@ fn a_display_is_not_a_writer() {
     let t = Timestamp::dhm(31, 25, 61);
     assert!(!t.to_string().is_empty());
 }
+
+#[test]
+fn an_inner_source_is_judged_by_the_outer_address_rule_before_any_frame_check() {
+    for source in ["a_b", "a b", "A*B"] {
+        let line = format!("N0CALL>APRS:}}{source}>APRS:>hi");
+        let outer = Packet::decode_tnc2(line.as_bytes(), ParseOptions::LENIENT).unwrap();
+        let Data::ThirdParty(inner) = &outer.data else { panic!("{source}") };
+        assert_eq!(inner.to_tnc2().unwrap_err().code(), RefusalCode::InvalidAddress, "{source}");
+        assert_eq!(inner.to_ax25().unwrap_err().code(), RefusalCode::InvalidAddress, "{source}");
+    }
+    // Lower case only is a valid line address, and a frame cannot carry it.
+    let outer = Packet::decode_tnc2(b"N0CALL>APRS:}abc>APRS:>hi", ParseOptions::LENIENT).unwrap();
+    let Data::ThirdParty(inner) = &outer.data else { panic!() };
+    assert_eq!(inner.to_tnc2().unwrap(), b"abc>APRS:>hi");
+    assert_eq!(inner.to_ax25().unwrap_err().code(), RefusalCode::Ax25CannotCarry);
+}
