@@ -12,7 +12,7 @@
 - Behaviour change: in Mic-E status text, the search for a later Mic-E altitude (three base-91 characters and `}` that is not at the start) never uses the bytes of a whole `/A=` altitude (`/A=` and six digits, or `-` and five), as it never uses a locator's bytes or a PHG's at the start. `x/A=000100}` is 100 feet with the comment `x}`, lenient and strict alike (it was a Mic-E altitude from `100}` and the comment `x/A=000`, leniently); a later altitude clear of the `/A=` is still taken, and a `/A=` that is not whole (five digits) protects nothing. The order of lifting is otherwise unchanged. A comment after a `/A=` in Mic-E status text is now written straight on (`/A=000100x}`, no space).
 - Fixed: a long run of `{` in the comment of a signpost report made the brace search quadratic (200 KB took about 4.7 s); it now looks only the longest a brace pair can be, and 200 KB takes about 1 ms. A new test (`tests/hostile.rs`) compares decode time at two sizes for runs of `{`, `PHG1`, `|!!|`, `/A=000001`, `!W12!` and `"4e}` in position, signpost and Mic-E reports.
 
-Round 5 of the conformance vectors (pinned at 1ada816457f86e596d1ea9dcf7706d15c28ebb2c).
+Round 5 of the conformance vectors (pinned at 832647b4e0e03261a786f434f2ba84aad809929f).
 
 ## 1.2.0 (2026-11-14)
 
