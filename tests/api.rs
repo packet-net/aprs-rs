@@ -304,6 +304,31 @@ fn mic_e_locator_then_telemetry_then_a_spaced_comment_has_its_space() {
     assert_eq!(report.fields.comment, "DG2MM");
 }
 
+/// A later Mic-E altitude lifted from between two bars leaves base-91 telemetry, which is lifted
+/// before the locator's space is judged: no `missing-space-after-locator` leniently, and a strict
+/// decoder (which leaves the altitude as text, so no telemetry) rejects the missing space.
+#[test]
+fn mic_e_locator_space_is_judged_after_a_lifted_altitude_leaves_telemetry() {
+    let has_missing_space = |p: &Packet| p.diagnostics.iter().any(|d| d.code == Code::MissingSpaceAfterLocator);
+    for (line, comment) in [
+        (&b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0hl!Y[/>\"4e}='p| DG2MM"[..], "DG2MM"),
+        (&b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0hl!Y[/>\"4e}='p| hello"[..], "hello"),
+        (&b"N0CALL>S32UVT:`(_fn\"Oj/`IO91SX/G|!:&0hl!Y[/>\"4e}='p| DG2MM"[..], "DG2MM"),
+    ] {
+        let lenient = Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+        assert!(!has_missing_space(&lenient), "{}", String::from_utf8_lossy(line));
+        assert!(lenient.diagnostics.iter().any(|d| d.code == Code::MicEAltitudeNotFirst));
+        let Data::MicE(report) = &lenient.data else { panic!("not Mic-E") };
+        assert!(report.fields.telemetry.is_some());
+        assert_eq!(report.fields.comment, comment);
+        let strict = Packet::decode_tnc2(line, ParseOptions::STRICT).unwrap();
+        assert!(strict.diagnostics.iter().any(|d| d.code == Code::MissingSpaceAfterLocator && d.severity == Severity::Error));
+    }
+    // Text straight after the locator, with no telemetry, still has no space.
+    let line = b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G\"4e}DG2MM";
+    assert!(has_missing_space(&Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap()));
+}
+
 /// A garbled timestamp whose seven bytes end in a time indicator and are followed by an uncompressed
 /// position: the position after the seven bytes wins, even where the bytes after the DTI would read
 /// as a compressed position (vectors README, "Timestamps that are not there").

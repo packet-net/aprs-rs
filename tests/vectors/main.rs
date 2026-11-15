@@ -21,10 +21,16 @@ use compare::differences;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libtest_mimic::{Arguments, Failed, Trial};
 use pdn_aprs::{Address, Code, Data, HeaderError, Packet, ParseOptions, PathEntry, Severity, Unrecognized};
 use serde_json::Value;
+
+/// How many cases the tolerance check runs on, and which it skips (see `tolerance_skipped`).
+static CHECKED: AtomicUsize = AtomicUsize::new(0);
+static SKIPPED: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors")
@@ -47,6 +53,10 @@ fn main() {
             add_trials(&mut trials, case.clone(), &known);
         }
     }
+    let skipped = SKIPPED.lock().unwrap();
+    eprintln!("tolerance check: runs on {} cases, skipped for {}: {:?}", CHECKED.load(Ordering::Relaxed), skipped.len(), *skipped);
+    // The vectors' RULED.md: only one case leaves the check; a mistake that skips more would show here.
+    assert!(skipped.len() <= 1, "the tolerance check skipped more cases than the vectors allow: {skipped:?}");
     libtest_mimic::run(&args, trials).exit();
 }
 
@@ -84,7 +94,12 @@ fn add_trials(trials: &mut Vec<Trial>, case: Value, known: &BTreeMap<String, Str
     add("lenient", lenient);
     add("strict", strict);
     if case["strict"].is_object() && tolerance_for(&case).is_some() {
-        add("tolerance", tolerance);
+        if tolerance_skipped(&case) {
+            SKIPPED.lock().unwrap().push(id.clone());
+        } else {
+            CHECKED.fetch_add(1, Ordering::Relaxed);
+            add("tolerance", tolerance);
+        }
     }
     if case.get("reencode").is_some() {
         add("reencode", reencode);
@@ -238,6 +253,13 @@ fn tolerance_for(case: &Value) -> Option<Code> {
     codes.sort();
     codes.dedup();
     (codes.len() == 1).then(|| codes[0])
+}
+
+/// The tolerance check is skipped for a case whose `strict` is rejected by a code other than the one
+/// tolerable code (turning that tolerance off can then bring out another defect; README, "Checking a case").
+fn tolerance_skipped(case: &Value) -> bool {
+    let Some(code) = tolerance_for(case) else { return false };
+    case["strict"].get("rejected_by").and_then(Value::as_str).is_some_and(|x| Code::from_id(x) != Some(code))
 }
 
 // ------------------------------------------------------------------ the checks

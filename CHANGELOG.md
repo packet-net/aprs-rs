@@ -3,8 +3,9 @@
 ## Unreleased
 
 - A `/` or `@` report whose timestamp is not valid, whose seventh byte after the DTI is `z`, `/` or `h`, and which has an uncompressed position after those seven bytes, now reads the position after them with `malformed-timestamp` (`@R30549z2831.07N/08142.92W_...` was read as a compressed position straight after the `@`). A compressed position after the seven bytes does not win; anything else is as before.
+- A Mic-E locator's space is judged after a later altitude is lifted too: when what is left between its two `|` is base-91 telemetry, that is lifted first, so `IO91/G|...|` then ` DG2MM` no longer gives `missing-space-after-locator` leniently (strict, which leaves the altitude as text, still rejects). The vectors test runner's tolerance check is skipped for a case whose strict result is a rejection by a different code, and prints how many cases it ran on.
 
-Round 5 of the conformance vectors (pinned at b118424e59fb62194ded6552c1796ad9280f188d).
+Round 5 of the conformance vectors (pinned at 201f7b26182d02894b53ada5493c363a692db889).
 
 ## 1.2.0 (2026-11-14)
 
