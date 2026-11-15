@@ -732,8 +732,11 @@ impl MicEBuilder {
                 && crate::mic_e::whole_feet_in_six_digits(feet)
             {
                 let alternative = Data::MicE(report(Positioned { altitude_feet: Some(feet), ..fields }));
-                if self.station.packet(alternative.clone()).is_ok() {
-                    return Ok(alternative);
+                // A form that reads back but is too long is the one to report: its size is what refuses it.
+                match self.station.packet(alternative.clone()) {
+                    Ok(_) => return Ok(alternative),
+                    Err(e) if e.code() == RefusalCode::InformationFieldTooLong => return Ok(alternative),
+                    Err(_) => {}
                 }
             }
         }

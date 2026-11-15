@@ -23,7 +23,7 @@
 - Writing out a decoded packet: `to_ax25` writes an empty destination as six spaces (it refused before), which reads back empty with its `empty-destination` diagnostic; `to_tnc2` writes it empty as before.
 - A builder's empty message ID is refused `invalid-message-id` (a message built with `message_id("")`, with or without a reply-ack). The data form still treats an empty ID as no ID, with a reply-ack beside it `missing-field`.
 - A weather software type with an empty unit is `missing-field` (it was `text-reads-as-field`), as an absent unit is; an empty unit with no software type is no unit. A control character in a weather extra field, software type or unit is `invalid-character` (it was `text-reads-as-field`).
-- A Mic-E builder keeps the altitude as given: the Mic-E bytes first, to the nearest metre, then a `/A=` only when the bytes do not read back (the comment holds a `/A=`) and the `/A=` holds the value exactly; otherwise the refusal. `altitude_feet(1000)` beside the comment `/A=001234 x` is now written `/A=001000//A=001234 x` (it was refused `text-reads-as-field`).
+- A Mic-E builder keeps the altitude as given: the Mic-E bytes first, to the nearest metre, then a `/A=` only when the bytes do not read back (the comment holds a `/A=`) and the `/A=` holds the value exactly; otherwise the refusal. When that `/A=` form reads back but is over 256 bytes, the refusal is `information-field-too-long`, not `text-reads-as-field`. `altitude_feet(1000)` beside the comment `/A=001234 x` is now written `/A=001000//A=001234 x` (it was refused `text-reads-as-field`).
 - The vectors runner checks the decode cases' `pass_through` key against `to_tnc2` and `to_ax25`.
 
 Round 5 of the conformance vectors (pinned at ad132c857f3f0b87c79f4025a50911e73f077337).
