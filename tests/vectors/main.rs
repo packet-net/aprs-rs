@@ -393,7 +393,8 @@ fn encode(case: &Value) -> Result<(), String> {
 
 fn build_case(case: &Value) -> Result<(), String> {
     let expect = &case["expect"];
-    match build::outcome(&case["input"]["build"]) {
+    let frame = case["input"].get("write").and_then(Value::as_str) == Some("ax25");
+    match build::outcome_writing(&case["input"]["build"], frame) {
         build::Outcome::Unsupported(why) => Err(format!("build: this crate's builder cannot say it: {why}")),
         build::Outcome::Refused(code, why, _) => {
             if expect.get("refused").and_then(Value::as_bool) != Some(true) {
@@ -404,12 +405,17 @@ fn build_case(case: &Value) -> Result<(), String> {
                 _ => Ok(()),
             }
         }
-        build::Outcome::Built(line) => {
+        build::Outcome::Built(written) => {
             if expect.get("refused").and_then(Value::as_bool) == Some(true) {
-                return Err(format!("build: expected a refusal, built {}", show(&line)));
+                return Err(format!("build: expected a refusal, built {}", show(&written)));
             }
-            if String::from_utf8_lossy(&line) != expect["tnc2"].as_str().unwrap() {
-                return Err(format!("build: expected {}, built {}", expect["tnc2"], show(&line)));
+            if frame {
+                let hex: String = written.iter().map(|b| format!("{b:02X}")).collect();
+                if !hex.eq_ignore_ascii_case(expect["ax25_hex"].as_str().unwrap()) {
+                    return Err(format!("build: expected the frame {}, built {hex}", expect["ax25_hex"]));
+                }
+            } else if String::from_utf8_lossy(&written) != expect["tnc2"].as_str().unwrap() {
+                return Err(format!("build: expected {}, built {}", expect["tnc2"], show(&written)));
             }
             Ok(())
         }

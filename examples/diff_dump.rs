@@ -172,7 +172,14 @@ fn api(p: &Packet) -> Value {
     o.insert("third_party".into(), json!(p.third_party));
     o.insert("has_errors".into(), json!(p.has_errors()));
     o.insert("has_warnings".into(), json!(p.has_warnings()));
-    o.insert("tnc2".into(), json!(hex(&p.to_tnc2())));
+    // A header that does not read back is refused, as the frame's is.
+    match p.to_tnc2() {
+        Ok(line) => o.insert("tnc2".into(), json!(hex(&line))),
+        Err(e) => {
+            o.insert("tnc2_refusal".into(), json!(e.code().id()));
+            o.insert("tnc2".into(), json!("refused"))
+        }
+    };
     match p.to_ax25() {
         Ok(frame) => o.insert("ax25".into(), json!(hex(&frame))),
         Err(e) => {
@@ -256,7 +263,17 @@ fn build_record(input: &Value) -> Value {
     match build::outcome(input) {
         build::Outcome::Built(line) => {
             let (decoded, _) = result(&line, ParseOptions::LENIENT);
-            json!({"n": n, "result": "built", "tnc2": hex(&line), "again": decoded})
+            let mut record = json!({"n": n, "result": "built", "tnc2": hex(&line), "again": decoded});
+            // The same recipe written as an AX.25 frame; a frame that cannot be written is said so.
+            match build::outcome_writing(input, true) {
+                build::Outcome::Built(frame) => record["ax25"] = json!(hex(&frame)),
+                build::Outcome::Refused(code, _, _) => {
+                    record["ax25"] = json!("refused");
+                    record["ax25_refusal"] = json!(code);
+                }
+                build::Outcome::Unsupported(_) => {}
+            }
+            record
         }
         build::Outcome::Unsupported(why) => json!({"n": n, "result": "unsupported", "reason": why}),
         build::Outcome::Refused(code, why, by_tool) => {

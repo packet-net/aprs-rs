@@ -47,7 +47,7 @@ let frame = [
     0xE2, 0xAE, 0x92, 0x88, 0x8A, 0x64, 0x40, 0x63, 0x03, 0xF0, b'>', b'h', b'e', b'l', b'l', b'o',
 ];
 let packet = Packet::decode_ax25(&frame, ParseOptions::default())?;
-assert_eq!(packet.to_tnc2(), b"M0LTE-9>APZ001,M0LTE-1*,WIDE2-1:>hello");
+assert_eq!(packet.to_tnc2()?, b"M0LTE-9>APZ001,M0LTE-1*,WIDE2-1:>hello");
 assert_eq!(packet.to_ax25()?, frame);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -86,10 +86,10 @@ use pdn_aprs::{Station, Symbol, Timestamp, Tone};
 let me = Station::new("M0LTE-9")?.via(&["WIDE1-1", "WIDE2-1"])?;
 
 let beacon = me.position(51.4543, -0.9781).symbol(Symbol::CAR).course_degrees(88.0).speed_knots(36.0).altitude_feet(120.0).comment("Mobile").build()?;
-assert_eq!(beacon.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:!5127.26N/00058.69W>088/036/A=000120Mobile");
+assert_eq!(beacon.to_tnc2()?, b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:!5127.26N/00058.69W>088/036/A=000120Mobile");
 
 let message = me.message("G3NRW", "Hi Ian").message_id("01").build()?;
-assert_eq!(message.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1::G3NRW    :Hi Ian{01");
+assert_eq!(message.to_tnc2()?, b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1::G3NRW    :Hi Ian{01");
 
 let repeater = me
     .object("MYRPTR")
@@ -100,10 +100,10 @@ let repeater = me
     .tone(Tone::Tone, 118)
     .offset_khz(-600)
     .build()?;
-assert_eq!(repeater.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:;MYRPTR   *251830z5127.00N/00058.80Wr145.725MHz T118 -060");
+assert_eq!(repeater.to_tnc2()?, b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:;MYRPTR   *251830z5127.00N/00058.80Wr145.725MHz T118 -060");
 
 let weather = me.weather().at(51.45, -0.98).wind_direction_degrees(220.0).wind_speed_mph(4.0).wind_gust_mph(5.0).temperature_f(77.0).build()?;
-assert_eq!(weather.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:!5127.00N/00058.80W_220/004g005t077");
+assert_eq!(weather.to_tnc2()?, b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:!5127.00N/00058.80W_220/004g005t077");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -135,7 +135,7 @@ let packet = Packet::create(
     vec![PathEntry::new(Address::new("WIDE1-1")?)],
     Data::Position(report),
 )?;
-assert_eq!(packet.to_tnc2(), b"N0CALL-9>APZ001,WIDE1-1:=5130.00N/00007.00W>088/036/A=000120Mobile");
+assert_eq!(packet.to_tnc2()?, b"N0CALL-9>APZ001,WIDE1-1:=5130.00N/00007.00W>088/036/A=000120Mobile");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 

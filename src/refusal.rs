@@ -207,7 +207,7 @@ impl RefusalCode {
 /// above, so the refusal does not depend on which check happens to run first. The encoder goes on
 /// after a fault, writing bytes that are thrown away, and gives the result at the end.
 #[derive(Default)]
-pub(crate) struct Pending(Option<crate::EncodeError>, Option<usize>);
+pub(crate) struct Pending(Option<crate::EncodeError>);
 
 impl Pending {
     pub(crate) fn note(&mut self, e: crate::EncodeError) {
@@ -227,21 +227,7 @@ impl Pending {
         }
     }
 
-    /// Remembers the size of the information field, `bytes` long. It is judged last, on the bytes
-    /// written: only when nothing else is wrong does `finish` name `information-field-too-long` for it.
-    pub(crate) fn size(&mut self, bytes: usize) {
-        self.1 = Some(bytes);
-    }
-
-    /// The first fault in the order; failing that, `information-field-too-long` when the size remembered is over 256 bytes.
-    pub(crate) fn finish(self) -> Result<(), crate::EncodeError> {
-        match self.0 {
-            Some(e) => Err(e),
-            None => self.1.map_or(Ok(()), check_size),
-        }
-    }
-
-    /// The faults only, for a caller that judges the size itself after a later check.
+    /// The first fault in the order. The read-back and the size are judged after it, on the bytes written.
     pub(crate) fn finish_faults(self) -> Result<(), crate::EncodeError> {
         self.0.map_or(Ok(()), Err)
     }

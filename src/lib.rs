@@ -22,6 +22,7 @@ mod options;
 mod other;
 mod packet;
 mod position;
+mod readback;
 mod refusal;
 mod status;
 mod steps;

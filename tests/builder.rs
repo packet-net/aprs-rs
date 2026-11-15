@@ -13,7 +13,7 @@ fn me() -> Station {
 /// The packet as TNC2 text, after checking it reads back under strict parsing with no warning or error
 /// (a positionless weather report still gets its "not recommended" note).
 fn sent(packet: Packet) -> String {
-    let line = String::from_utf8(packet.to_tnc2()).unwrap();
+    let line = String::from_utf8(packet.to_tnc2().unwrap()).unwrap();
     let heard = Packet::decode_tnc2(line.as_bytes(), ParseOptions::STRICT).unwrap();
     let complaints: Vec<_> = heard.diagnostics.iter().filter(|d| d.severity != Severity::Info).collect();
     assert!(complaints.is_empty(), "{line}: {complaints:?}");

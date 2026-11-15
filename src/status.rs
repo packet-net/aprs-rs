@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 
 use crate::RefusalCode;
 use crate::context::Context;
+use crate::readback::Forms;
 use crate::refusal::Pending;
 use crate::{BeamHeading, Code, Data, EncodeError, ParseOptions, Status, Symbol, Timestamp, position, text};
 
@@ -79,7 +80,7 @@ pub(crate) fn is_locator(b: &[u8]) -> bool {
     }
 }
 
-pub(crate) fn encode(s: &Status) -> Result<Vec<u8>, EncodeError> {
+pub(crate) fn encode(s: &Status) -> Result<Forms, EncodeError> {
     let mut out = Vec::from(&b">"[..]);
     let mut p = Pending::default();
     if let Some(t) = &s.timestamp {
@@ -130,23 +131,5 @@ pub(crate) fn encode(s: &Status) -> Result<Vec<u8>, EncodeError> {
         out.extend_from_slice(&[b'^', h, pw]);
     }
     p.finish_faults()?;
-    // The text must read back as itself: status text that looks like a timestamp or a grid
-    // locator would not.
-    let mut ctx = Context::new(ParseOptions::LENIENT);
-    match decode(&mut ctx, &out) {
-        Some(Data::Status(back))
-            if back == *s
-                || (back.locator.as_deref().map(str::to_ascii_uppercase) == s.locator.as_deref().map(str::to_ascii_uppercase)
-                    && back.text == s.text
-                    && back.beam == s.beam
-                    && back.timestamp == s.timestamp) =>
-        {
-            crate::refusal::check_size(out.len())?;
-            Ok(out)
-        }
-        _ => Err(EncodeError::new(
-            RefusalCode::TextReadsAsField,
-            "status text that would read back as a timestamp, grid locator or beam heading",
-        )),
-    }
+    Ok(Forms::new(out))
 }

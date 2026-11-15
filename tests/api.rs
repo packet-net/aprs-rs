@@ -15,7 +15,7 @@ fn info(data: Data) -> String {
 
 #[test]
 fn metadata_can_describe_another_station() {
-    let line = |packet: Packet| String::from_utf8(packet.to_tnc2()).unwrap();
+    let line = |packet: Packet| String::from_utf8(packet.to_tnc2().unwrap()).unwrap();
     assert_eq!(line(me().telemetry_names(&["Battery"]).addressee("G3NRW-5").build().unwrap()), "M0LTE-11>APZ001::G3NRW-5  :PARM.Battery");
     assert_eq!(line(me().telemetry_units(&["V"]).addressee("G3NRW-5").build().unwrap()), "M0LTE-11>APZ001::G3NRW-5  :UNIT.V");
     assert_eq!(
@@ -37,7 +37,7 @@ fn metadata_can_describe_another_station() {
 fn a_tone_has_a_kind_and_a_value_as_sent() {
     let base = || me().position(51.45, -0.98).symbol(Symbol::REPEATER).frequency(145.725);
     let tail = |tone: Tone, value: u16| {
-        let line = String::from_utf8(base().tone(tone, value).build().unwrap().to_tnc2()).unwrap();
+        let line = String::from_utf8(base().tone(tone, value).build().unwrap().to_tnc2().unwrap()).unwrap();
         line.split_once("MHz").unwrap().1.to_string()
     };
     assert_eq!(tail(Tone::Tone, 118), " T118");
@@ -46,7 +46,8 @@ fn a_tone_has_a_kind_and_a_value_as_sent() {
     assert_eq!(tail(Tone::Off, 0), " Toff");
     // A frequency is rounded to its step, not refused for extra decimals.
     let line =
-        String::from_utf8(me().position(51.45, -0.98).symbol(Symbol::REPEATER).frequency(145.7251).build().unwrap().to_tnc2()).unwrap();
+        String::from_utf8(me().position(51.45, -0.98).symbol(Symbol::REPEATER).frequency(145.7251).build().unwrap().to_tnc2().unwrap())
+            .unwrap();
     assert!(line.ends_with("145.725MHz"), "{line}");
 }
 
@@ -76,7 +77,7 @@ fn a_mic_e_altitude_goes_in_the_bytes_unless_it_came_from_a_slash_a() {
     for altitude in [9176.0, 100.0, 1000.0] {
         let packet = built(&|b| if altitude == 9176.0 { b.altitude_m(altitude) } else { b.altitude_feet(altitude) }).unwrap();
         assert!(!String::from_utf8_lossy(&packet.information).contains("/A="), "{}", String::from_utf8_lossy(&packet.information));
-        let heard = decode(&packet.to_tnc2());
+        let heard = decode(&packet.to_tnc2().unwrap());
         let Data::MicE(report) = &heard.data else { panic!("a Mic-E report") };
         assert!(!report.altitude_in_comment);
         assert_eq!(written(&heard), (packet.information.clone(), packet.destination.clone()));
@@ -239,7 +240,8 @@ fn comment_telemetry_is_one_value() {
             .telemetry(CommentTelemetry { sequence: 1, analog: vec![100, 200, 300, 400, 500], digital: Some(5) })
             .build()
             .unwrap()
-            .to_tnc2(),
+            .to_tnc2()
+            .unwrap(),
     )
     .unwrap();
     assert!(line.contains('|'), "{line}");
@@ -284,7 +286,7 @@ fn what_create_accepts_reads_back() {
                 let path: Vec<PathEntry> = entry.into_iter().map(|a| PathEntry { address: a, used: true }).collect();
                 if let Ok(packet) = Packet::create(source.clone(), destination.clone(), path, data.clone()) {
                     accepted += 1;
-                    let line = packet.to_tnc2();
+                    let line = packet.to_tnc2().unwrap();
                     assert!(Packet::decode_tnc2(&line, ParseOptions::LENIENT).is_ok(), "{}", String::from_utf8_lossy(&line));
                     assert!(Packet::decode_tnc2(&line, ParseOptions::STRICT).is_ok(), "{}", String::from_utf8_lossy(&line));
                 }

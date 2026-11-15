@@ -25,7 +25,7 @@ pub const DEFAULT_DESTINATION: &str = "APZ001";
 ///
 /// let me = Station::new("M0LTE-9")?.via(&["WIDE1-1", "WIDE2-1"])?;
 /// let packet = me.position(51.4543, -0.9781).symbol(Symbol::CAR).course_degrees(88.0).speed_knots(36.0).comment("Mobile").build()?;
-/// assert_eq!(packet.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:!5127.26N/00058.69W>088/036Mobile");
+/// assert_eq!(packet.to_tnc2()?, b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:!5127.26N/00058.69W>088/036Mobile");
 /// # Ok::<(), Box<dyn std::error::Error>>(())
 /// ```
 ///
@@ -57,8 +57,18 @@ impl Station {
     }
 
     /// This station with a digipeater path, e.g. `via(&["WIDE1-1", "WIDE2-1"])`, replacing any set before.
+    ///
+    /// An entry ending in `*` is a used entry, as in a TNC2 header (`"WIDE1-1*"`): the `*` is not part of
+    /// the address. A path whose entry not marked used comes before one that is cannot be written (the
+    /// packet's `to_tnc2` and `to_ax25` refuse it).
     pub fn via(&self, path: &[&str]) -> Result<Station, InvalidAddress> {
-        let path = path.iter().map(|p| Address::new(p).map(PathEntry::new)).collect::<Result<Vec<_>, _>>()?;
+        let path = path
+            .iter()
+            .map(|p| match p.strip_suffix('*') {
+                Some(address) => Address::new(address).map(|address| PathEntry { address, used: true }),
+                None => Address::new(p).map(PathEntry::new),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(Station { path, ..self.clone() })
     }
 
@@ -373,10 +383,7 @@ impl Common {
             let mut raw = fields.clone();
             raw.position = Position { ambiguity: self.ambiguity, ..position };
             let data = wrap(raw);
-            let tried = match &data {
-                Data::MicE(r) => crate::mic_e::encode(r).map(|_| ()),
-                other => other.encode().map(|_| ()),
-            };
+            let tried = data.seal().map(|_| ());
             return Err(tried.err().unwrap_or_else(|| {
                 EncodeError::new(
                     RefusalCode::ValueHasNoForm,
@@ -1083,7 +1090,7 @@ impl TelemetryBuilder {
             if let Err(e) = data.encode() {
                 pending.note(e);
             }
-            pending.finish()?;
+            pending.finish_faults()?;
         }
         Ok(data)
     }

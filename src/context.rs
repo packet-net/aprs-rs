@@ -55,10 +55,6 @@ impl Context {
         }
     }
 
-    pub(crate) fn has_errors(&self) -> bool {
-        self.diagnostics.iter().any(|d| d.severity == Severity::Error)
-    }
-
     pub(crate) fn header_error(&self) -> HeaderError {
         HeaderError { diagnostics: self.diagnostics.clone() }
     }

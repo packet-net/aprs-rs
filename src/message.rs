@@ -7,6 +7,7 @@ use alloc::vec::Vec;
 
 use crate::RefusalCode;
 use crate::context::Context;
+use crate::readback::Forms;
 use crate::refusal::Pending;
 use crate::{
     Ack, Address, Bulletin, Code, Data, DirectedQuery, EncodeError, Message, ParseOptions, Reject, TelemetryBits, TelemetryCoefficients,
@@ -380,28 +381,25 @@ fn query_type_ok(t: &str) -> bool {
 
 // ------------------------------------------------------------------ encoding
 
-pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
+pub(crate) fn encode(data: &Data) -> Result<Forms, EncodeError> {
     let mut out = Vec::new();
     let mut p = Pending::default();
     match data {
         Data::Message(m) => {
             addressee(&mut out, &m.addressee, &mut p);
             // An addressee that makes a bulletin of it is not the form a message needs.
-            if matches!(bulletin_kind(&mut Context::new(ParseOptions::LENIENT), &m.addressee), Some(Some(_))) {
-                p.note(EncodeError::new(
-                    RefusalCode::InvalidAddressee,
-                    "an addressee of NWS-, NWS_ or BLN and a bulletin form makes a bulletin, not a message",
-                ));
-            }
+            not_a_bulletin(&m.addressee, &mut p);
             message_text(&mut out, &m.text, true, &mut p);
             id_and_reply(&mut out, &m.message_id, &m.reply_ack, &mut p);
         }
         Data::Ack(a) => {
             addressee(&mut out, &a.addressee, &mut p);
+            not_a_bulletin(&a.addressee, &mut p);
             ack_or_reject(&mut out, b"ack", &a.acked_id, &a.message_id, &a.reply_ack, &mut p);
         }
         Data::Reject(r) => {
             addressee(&mut out, &r.addressee, &mut p);
+            not_a_bulletin(&r.addressee, &mut p);
             ack_or_reject(&mut out, b"rej", &r.rejected_id, &r.message_id, &r.reply_ack, &mut p);
         }
         Data::Bulletin(b) | Data::NwsBulletin(b) => {
@@ -497,7 +495,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             addressee(&mut out, &q.addressee, &mut p);
             out.push(b'?');
             out.extend_from_slice(q.query_type.as_bytes());
-            if let Some(t) = &q.target {
+            if let Some(t) = q.target.as_ref().filter(|t| !t.is_empty()) {
                 if !Address::is_valid(t) {
                     p.note(EncodeError::new(
                         RefusalCode::InvalidAddressee,
@@ -519,31 +517,17 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
         _ => return Err(EncodeError::new(RefusalCode::NotEncodable, "not a message")),
     }
     p.finish_faults()?;
-    // What was written must read back as what was given: a message whose text looks like an ack,
-    // telemetry metadata or a query, or whose addressee makes it a bulletin, would not.
-    let mut ctx = Context::new(ParseOptions::LENIENT);
-    if decode(&mut ctx, &out).as_ref() != Some(data) {
-        // An addressee that makes a bulletin of it is not the form this report needs.
-        let to = match data {
-            Data::Message(m) => Some(&m.addressee),
-            Data::Ack(a) => Some(&a.addressee),
-            Data::Reject(r) => Some(&r.addressee),
-            _ => None,
-        };
-        if to.is_some_and(|a| matches!(bulletin_kind(&mut Context::new(ParseOptions::LENIENT), a), Some(Some(_)))) {
-            return Err(EncodeError::new(
-                RefusalCode::InvalidAddressee,
-                "an addressee of NWS-, NWS_ or BLN and a bulletin form makes a bulletin, not this report",
-            ));
-        }
-        return Err(EncodeError::new(
-            RefusalCode::TextReadsAsField,
-            "it would read back as something else: text that reads as an ack, telemetry metadata or a query, or an addressee that makes it a bulletin",
+    Ok(Forms::new(out))
+}
+
+/// An addressee of `NWS-`, `NWS_` or `BLN` and a bulletin form makes a bulletin, not this report.
+fn not_a_bulletin(addressee: &str, p: &mut Pending) {
+    if matches!(bulletin_kind(&mut Context::new(ParseOptions::LENIENT), addressee), Some(Some(_))) {
+        p.note(EncodeError::new(
+            RefusalCode::InvalidAddressee,
+            "an addressee of NWS-, NWS_ or BLN and a bulletin form makes a bulletin, not this report",
         ));
     }
-    // The size is the last check, on the bytes written.
-    crate::refusal::check_size(out.len())?;
-    Ok(out)
 }
 
 /// An addressee, which is nine characters with no space or `:`.
@@ -582,6 +566,8 @@ fn id_ok(id: &str) -> bool {
 }
 
 fn id_and_reply(out: &mut Vec<u8>, id: &Option<String>, reply_ack: &Option<String>, p: &mut Pending) {
+    // An empty message ID is no message ID: the data form leaves an empty string out.
+    let id = id.as_ref().filter(|id| !id.is_empty());
     match (id, reply_ack) {
         (None, None) => {}
         (None, Some(r)) => {
@@ -609,7 +595,7 @@ fn id_and_reply(out: &mut Vec<u8>, id: &Option<String>, reply_ack: &Option<Strin
 }
 
 fn ack_or_reject(out: &mut Vec<u8>, kind: &[u8], id: &str, message_id: &Option<String>, reply_ack: &Option<String>, p: &mut Pending) {
-    if message_id.is_some() {
+    if message_id.as_ref().is_some_and(|id| !id.is_empty()) {
         p.note(EncodeError::new(RefusalCode::FieldNotAllowed, "an ack or rej carries no message ID of its own (UAP 5.32)"));
     }
     if !id_ok(id) {

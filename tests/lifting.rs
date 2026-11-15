@@ -182,6 +182,6 @@ fn a_later_mic_e_altitude_clear_of_a_whole_altitude_is_still_taken() {
 fn a_comment_after_an_altitude_is_written_straight_on() {
     let packet = Packet::decode_tnc2(format!("{MIC_E}x/A=000100}}").as_bytes(), ParseOptions::LENIENT).unwrap();
     let out = Packet::create(packet.source, packet.destination, Vec::new(), packet.data).unwrap();
-    let line = out.to_tnc2();
+    let line = out.to_tnc2().unwrap();
     assert!(line.ends_with(b"/A=000100x}"), "{}", String::from_utf8_lossy(&line));
 }

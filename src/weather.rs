@@ -335,13 +335,6 @@ pub(crate) fn software_and_unit(rest: &[u8], weather: &mut Weather) -> bool {
     true
 }
 
-/// The parts of weather that are text rather than numbers: the software type, the unit and the
-/// extra fields. Written back, they must read back the same, and not as fields (`h89b1` as a
-/// software type and unit would read back as humidity).
-pub(crate) fn text_parts(w: &Weather) -> (Option<char>, Option<&str>, &[WeatherField]) {
-    (w.software, w.unit.as_deref(), &w.extra)
-}
-
 /// Writes the fields after the wind (gust, temperature, rain, humidity, pressure, luminosity, snow,
 /// raw rain, extra fields), then software and unit. Gust and temperature are mandatory, written as
 /// dots when unknown.
@@ -417,6 +410,11 @@ pub(crate) fn write_fields(out: &mut Vec<u8>, w: &Weather, p: &mut Pending) {
             out.extend_from_slice(u.as_bytes());
         }
         (None, None) => {}
+        // The software type and its unit are one thing (the Weather rule): one without the other is a field needed only because the other is there.
+        (Some(_), None) | (None, Some(_)) => p.note(EncodeError::new(
+            RefusalCode::MissingField,
+            "a weather software type goes with its unit, and a unit with its software type",
+        )),
         _ => p.note(EncodeError::new(
             RefusalCode::TextReadsAsField,
             "weather software is a letter, and the unit 2-4 letters, digits, - or _, not all digits",

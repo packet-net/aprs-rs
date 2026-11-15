@@ -92,7 +92,7 @@ fn writing_out_a_held_packet_does_not_check_the_size() {
     let mut line = b"N0CALL>APZ001:>".to_vec();
     line.extend(core::iter::repeat_n(b'x', 300));
     let packet = Packet::decode_tnc2(&line, ParseOptions::LENIENT).unwrap();
-    assert_eq!(packet.to_tnc2(), line);
+    assert_eq!(packet.to_tnc2().unwrap(), line);
     assert!(packet.to_ax25().is_ok());
     let refused = packet.data.encode().unwrap_err();
     assert_eq!(refused.code(), pdn_aprs::RefusalCode::InformationFieldTooLong);

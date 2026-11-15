@@ -10,10 +10,9 @@ use crate::RefusalCode;
 use crate::comment::{self, METRES_TO_FEET};
 use crate::context::Context;
 use crate::encode;
+use crate::readback::Forms;
 use crate::refusal::Pending;
-use crate::{
-    Address, Code, DaoPrecision, Data, EncodeError, MicEMessage, MicEReport, ParseOptions, Position, Positioned, base91, deviceid, position,
-};
+use crate::{Address, Code, DaoPrecision, Data, EncodeError, MicEMessage, MicEReport, Position, Positioned, base91, deviceid, position};
 
 /// A destination character's meaning: a latitude digit (or a blank for ambiguity), and its flag bit.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -313,7 +312,7 @@ fn locator_len(s: &[u8]) -> Option<usize> {
 /// The destination address and information field for a Mic-E report. An altitude goes in the
 /// Mic-E altitude bytes (whole metres) unless the report says it is in the comment, as `/A=` feet
 /// (vectors README, Builder rules).
-pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> {
+pub(crate) fn forms(r: &MicEReport, altitude_text: bool) -> Result<Forms, EncodeError> {
     let f = &r.fields;
     let mut pend = Pending::default();
     pend.run(position::check_symbol(f.symbol));
@@ -506,7 +505,7 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     // six digits that the bytes do not hold exactly (vectors README, Encoding).
     let mut altitude_in_text = None;
     if let Some(feet) = f.altitude_feet {
-        if r.altitude_in_comment || only_a_text_altitude_holds(feet) {
+        if r.altitude_in_comment || altitude_text || only_a_text_altitude_holds(feet) {
             altitude_in_text = Some(feet);
         } else {
             let metres = crate::steps::round(feet / METRES_TO_FEET);
@@ -672,18 +671,16 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         // Mic-E altitude (`1{5}`), where `/` would join them too (vectors README, Encoding).
         &[b"", b"/", b" "]
     };
-    // The size and the read-back are judged on the bytes written, so they come before the fault is
-    // named.
+    // A CR or LF at the end (the last byte of Rev 0 telemetry, say) reads back as a trailing line
+    // break, a warning.
     let mut late = None;
-    let mut read_back = false;
+    let mut candidates: Vec<Vec<u8>> = Vec::with_capacity(separators.len());
     for separator in separators {
         out.truncate(text_at);
         out.extend_from_slice(separator);
         out.extend_from_slice(text);
         out.extend_from_slice(&trailer);
         out.extend_from_slice(suffix);
-        // A CR or LF at the end (the last byte of Rev 0 telemetry, say) reads back as a
-        // trailing line break, a warning.
         if matches!(out.last(), Some(b'\r' | b'\n')) {
             late = Some(EncodeError::new(
                 RefusalCode::InvalidCharacter,
@@ -691,33 +688,22 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
             ));
             break;
         }
-        if reads_back(r, &out[status_start..]) {
-            read_back = true;
-            break;
-        }
-    }
-    if !read_back && late.is_none() {
-        // Nothing reads back: the size is of the first form written.
-        out.truncate(text_at);
-        out.extend_from_slice(separators[0]);
-        out.extend_from_slice(text);
-        out.extend_from_slice(&trailer);
-        out.extend_from_slice(suffix);
+        candidates.push(out.clone());
     }
     pend.finish_faults()?;
     if let Some(e) = late {
         return Err(e);
     }
-    if !read_back {
-        return Err(EncodeError::new(
-            RefusalCode::TextReadsAsField,
-            "the status text does not read back as given: a device suffix the database does not know, or text that decodes as a structured element; set the property instead",
-        ));
-    }
     let destination =
         Address::new(&dest).map_err(|_| EncodeError::new(RefusalCode::InvalidAddress, "the Mic-E destination is not an address"))?;
-    crate::refusal::check_size(out.len())?;
-    Ok((destination, out))
+    let mut candidates = candidates.into_iter();
+    let first = candidates.next().unwrap_or_default();
+    Ok(candidates.fold(Forms::new(first), Forms::then).to(destination))
+}
+
+/// Whether an altitude in the Mic-E bytes could also be written as a `/A=`, the form to try when the bytes do not read back.
+pub(crate) fn altitude_has_text_form(r: &MicEReport) -> bool {
+    !r.altitude_in_comment && r.fields.altitude_feet.is_some_and(|feet| !only_a_text_altitude_holds(feet) && whole_feet_in_six_digits(feet))
 }
 
 /// A whole number of feet (within 1e-6) that a `/A=` can write: six digits, or `-` and five.
@@ -733,37 +719,4 @@ fn only_a_text_altitude_holds(feet: f64) -> bool {
     let n = crate::steps::round(metres);
     let in_bytes = (metres - n).abs() <= 1e-6 && (-10_000.0..=743_570.0).contains(&n);
     whole_feet_in_six_digits(feet) && !in_bytes
-}
-
-fn reads_back(r: &MicEReport, status_bytes: &[u8]) -> bool {
-    let mut ctx = Context::new(ParseOptions::LENIENT);
-    let mut back = MicEReport { fields: Positioned { symbol: r.fields.symbol, ..Positioned::default() }, ..MicEReport::default() };
-    if !status(&mut ctx, &mut back, status_bytes, 0) || ctx.has_errors() {
-        return false;
-    }
-    let (a, b) = (&back.fields, &r.fields);
-    let close = |x: Option<f64>, y: Option<f64>| match (x, y) {
-        (None, None) => true,
-        (Some(x), Some(y)) => crate::steps::same_number(x, y),
-        _ => false,
-    };
-    let freq = |v: &Option<crate::VoiceFrequency>| v.as_ref().map(|x| (x.tone, x.tone_value, x.offset_khz, x.range, x.range_km, x.narrow));
-    back.type_code == r.type_code
-        && back.legacy_telemetry == r.legacy_telemetry
-        && back.device_suffix == r.device_suffix
-        && back.locator.as_deref().map(str::to_ascii_uppercase) == r.locator.as_deref().map(str::to_ascii_uppercase)
-        && a.comment == b.comment
-        && a.phg == b.phg
-        && a.dfs == b.dfs
-        && a.telemetry == b.telemetry
-        && a.dao.map(|d| d.datum) == b.dao.map(|d| d.datum)
-        && freq(&a.frequency) == freq(&b.frequency)
-        // A /A= altitude is whole feet, rounded as a position's is; one in the Mic-E bytes is whole metres.
-        && if back.altitude_in_comment {
-            close(a.altitude_feet, b.altitude_feet) || a.altitude_feet.map(crate::steps::round) == b.altitude_feet.map(crate::steps::round)
-        } else {
-            let metres = |v: Option<f64>| v.map(|f| crate::steps::round(f / METRES_TO_FEET));
-            metres(a.altitude_feet) == metres(b.altitude_feet)
-        }
-        && a.range_miles.map(crate::steps::round) == b.range_miles.map(crate::steps::round)
 }
