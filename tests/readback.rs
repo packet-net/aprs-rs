@@ -159,9 +159,17 @@ fn an_ax25_frame_sets_the_h_bit_of_every_used_entry() {
 
 #[test]
 fn a_path_entry_not_used_before_a_used_one_cannot_be_carried() {
-    let p = packet(&[("WIDE1-1", false), ("N0CALL-1", true)]);
-    assert_eq!(p.to_tnc2().unwrap_err().code(), RefusalCode::Tnc2CannotCarry);
-    assert_eq!(p.to_ax25().unwrap_err().code(), RefusalCode::Ax25CannotCarry);
+    // Building knows it already, in the form to be written, and before any fault in the data.
+    let unwritable = path(&[("WIDE1-1", false), ("N0CALL-1", true)]);
+    assert_eq!(Packet::create(me(), to(), unwritable.clone(), status("hi")).unwrap_err().code(), RefusalCode::Tnc2CannotCarry);
+    assert_eq!(Packet::create_for_ax25(me(), to(), unwritable.clone(), status("hi")).unwrap_err().code(), RefusalCode::Ax25CannotCarry);
+    let bad_name = Data::Item(pdn_aprs::ItemReport { name: "TOOLONGNAMEX".into(), ..Default::default() });
+    assert_eq!(Packet::create(me(), to(), unwritable.clone(), bad_name.clone()).unwrap_err().code(), RefusalCode::Tnc2CannotCarry);
+    assert_eq!(Packet::create_for_ax25(me(), to(), unwritable, bad_name).unwrap_err().code(), RefusalCode::Ax25CannotCarry);
+    // A call a frame cannot carry is refused first when the frame is the form written, and written in a line.
+    let nine = Address::new("N0CALLXYZ").unwrap();
+    assert_eq!(Packet::create_for_ax25(nine.clone(), to(), Vec::new(), status("hi")).unwrap_err().code(), RefusalCode::Ax25CannotCarry);
+    assert_eq!(Packet::create(nine, to(), Vec::new(), status("hi")).unwrap().to_tnc2().unwrap(), b"N0CALLXYZ>APZ001:>hi");
     // A path with no used entry, and one with a used first entry, are written.
     assert_eq!(packet(&[("WIDE1-1", false), ("WIDE2-1", false)]).to_tnc2().unwrap(), b"N0CALL>APZ001,WIDE1-1,WIDE2-1:>hi");
     assert_eq!(packet(&[("N0CALL-1", true), ("WIDE2-1", false)]).to_tnc2().unwrap(), b"N0CALL>APZ001,N0CALL-1*,WIDE2-1:>hi");
@@ -193,4 +201,32 @@ fn a_station_path_entry_ending_in_a_star_is_a_used_entry() {
     assert_eq!(built.to_tnc2().unwrap(), b"N0CALL>APZ001,WIDE1-1,N0CALL-1*,WIDE2-1:>hi");
     assert!(Station::new("N0CALL").unwrap().via(&["*"]).is_err());
     assert!(Station::new("N0CALL").unwrap().via(&["WIDE1-1**"]).is_err());
+}
+
+#[test]
+fn an_ax25_h_bit_marks_every_entry_before_it_used() {
+    let heard =
+        Packet::decode_ax25(&hex("82A0B4606062E09C608682989860AE92888A6240629C6086829898E303F03E78"), ParseOptions::LENIENT).unwrap();
+    assert!(heard.diagnostics.is_empty());
+    assert_eq!(heard.path.iter().map(|e| e.used).collect::<Vec<_>>(), [true, true]);
+    assert_eq!(heard.to_tnc2().unwrap(), b"N0CALL>APZ001,WIDE1-1,N0CALL-1*:>x");
+}
+
+#[test]
+fn an_empty_destination_is_six_spaces_in_a_frame() {
+    let line = Packet::decode_tnc2(b"N0CALL>:>x", ParseOptions::LENIENT).unwrap();
+    let frame = line.to_ax25().unwrap();
+    assert_eq!(&frame[..7], &[0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0xE0]);
+    assert_eq!(Packet::decode_ax25(&frame, ParseOptions::LENIENT).unwrap().to_tnc2().unwrap(), b"N0CALL>:>x");
+}
+
+#[test]
+fn a_builders_empty_message_id_is_refused() {
+    let station = pdn_aprs::Station::new("N0CALL").unwrap();
+    assert_eq!(station.message("N0CALL", "hi").message_id("").build().unwrap_err().code(), RefusalCode::InvalidMessageId);
+    assert_eq!(station.message("N0CALL", "hi").message_id("").reply_ack("1").build().unwrap_err().code(), RefusalCode::InvalidMessageId);
+}
+
+fn hex(text: &str) -> Vec<u8> {
+    (0..text.len()).step_by(2).map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap()).collect()
 }

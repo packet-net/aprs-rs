@@ -43,12 +43,13 @@ pub struct Station {
     source: Address,
     destination: Address,
     path: Vec<PathEntry>,
+    frame: bool,
 }
 
 impl Station {
     /// The station sending the packets, e.g. `M0LTE-9`.
     pub fn new(source: &str) -> Result<Station, InvalidAddress> {
-        Ok(Station { source: Address::new(source)?, destination: Address::new(DEFAULT_DESTINATION)?, path: Vec::new() })
+        Ok(Station { source: Address::new(source)?, destination: Address::new(DEFAULT_DESTINATION)?, path: Vec::new(), frame: false })
     }
 
     /// This station with another destination address, usually the application's allocated tocall.
@@ -70,6 +71,14 @@ impl Station {
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Station { path, ..self.clone() })
+    }
+
+    /// This station for packets that will be written as AX.25 frames: a header a frame cannot carry (a
+    /// call of more than six characters, a q-construct) is refused when the packet is built, ahead of
+    /// any fault in the data, as `to_ax25` would refuse it. Without this, the header is checked as a
+    /// TNC2 line carries it.
+    pub fn for_ax25(&self) -> Station {
+        Station { frame: true, ..self.clone() }
     }
 
     /// The source address.
@@ -221,7 +230,11 @@ impl Station {
     }
 
     fn packet(&self, data: Data) -> Result<Packet, EncodeError> {
-        Packet::create(self.source.clone(), self.destination.clone(), self.path.clone(), data)
+        if self.frame {
+            Packet::create_for_ax25(self.source.clone(), self.destination.clone(), self.path.clone(), data)
+        } else {
+            Packet::create(self.source.clone(), self.destination.clone(), self.path.clone(), data)
+        }
     }
 }
 
@@ -723,7 +736,21 @@ impl MicEBuilder {
                 ));
             }
         }
-        settle(&self.station, Data::MicE(report(fields)), no_symbol.into_iter().collect())
+        // The Mic-E bytes first. When they do not read back (the comment holds a /A= that would be read as the
+        // altitude), a /A= is the next form, but only if it holds the altitude as given exactly.
+        let given = self.common.altitude_m.map(|m| m * crate::comment::METRES_TO_FEET).or(self.common.fields.altitude_feet);
+        let data = settle(&self.station, Data::MicE(report(fields.clone())), no_symbol.into_iter().collect())?;
+        if let (Err(e), Some(feet)) = (self.station.packet(data.clone()), given) {
+            if matches!(e.code(), RefusalCode::TextReadsAsField | RefusalCode::DoesNotReadBack)
+                && crate::mic_e::whole_feet_in_six_digits(feet)
+            {
+                let alternative = Data::MicE(report(Positioned { altitude_feet: Some(feet), ..fields }));
+                if self.station.packet(alternative.clone()).is_ok() {
+                    return Ok(alternative);
+                }
+            }
+        }
+        Ok(data)
     }
 
     /// The packet: the station's source and path, the destination this report computes, and the report.
@@ -946,7 +973,17 @@ impl MessageBuilder {
 
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
-        Ok(Data::Message(self.message.clone()))
+        // A builder's message ID that is empty is refused, not left out as the data form would (out of range is refused, never clamped).
+        let empty_id = self.message.message_id.as_ref().is_some_and(String::is_empty);
+        let missing = if empty_id {
+            alloc::vec![EncodeError::new(
+                RefusalCode::InvalidMessageId,
+                "a message ID is 1-5 letters or digits, and is not empty (APRS12c ch. 14)"
+            )]
+        } else {
+            Vec::new()
+        };
+        settle(&self.station, Data::Message(self.message.clone()), missing)
     }
 
     /// The packet: the station's header and this message, encoded.

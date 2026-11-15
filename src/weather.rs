@@ -389,6 +389,10 @@ pub(crate) fn write_fields(out: &mut Vec<u8>, w: &Weather, p: &mut Pending) {
         // As they are read: a letter the spec does not define, then two or more digits, dots or
         // '-', ending in a digit.
         let v = extra.value.as_bytes();
+        if extra.letter.is_ascii_control() || crate::text::has_control_character(v) {
+            p.note(EncodeError::new(RefusalCode::InvalidCharacter, "an extra weather field cannot contain a control character"));
+            continue;
+        }
         if !extra.letter.is_ascii_alphabetic()
             || is_known(extra.letter as u8)
             || v.len() < 2
@@ -404,7 +408,13 @@ pub(crate) fn write_fields(out: &mut Vec<u8>, w: &Weather, p: &mut Pending) {
         out.push(extra.letter as u8);
         out.extend_from_slice(extra.value.as_bytes());
     }
-    match (w.software, &w.unit) {
+    if w.software.is_some_and(|s| s.is_ascii_control()) || w.unit.as_ref().is_some_and(|u| crate::text::has_control_character(u.as_bytes()))
+    {
+        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "weather software and unit cannot contain a control character"));
+        return;
+    }
+    // An empty unit is no unit (empty and absent are one value).
+    match (w.software, &w.unit.as_ref().filter(|u| !u.is_empty())) {
         (Some(s), Some(u)) if s.is_ascii() && is_software_and_unit(alloc::format!("{s}{u}").as_bytes()) => {
             out.push(s as u8);
             out.extend_from_slice(u.as_bytes());

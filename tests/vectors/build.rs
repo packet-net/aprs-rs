@@ -47,6 +47,11 @@ fn unsupported<T>(why: impl Into<String>) -> Built<T> {
 
 use crate::neutral::{is_size, rank};
 
+thread_local! {
+    /// Whether the recipe being built is to be written as an AX.25 frame, so its station checks the header as a frame carries it.
+    static FRAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The pairs of keys that give one quantity in two units. A recipe holding both is one input with
 /// the quantity given twice.
 const UNIT_PAIRS: [(&str, &str); 6] = [
@@ -422,10 +427,14 @@ fn station(v: &Value) -> Built<Station> {
     // A recipe with no `station` is from N0CALL (vectors README, Build records); the destination and path are
     // the builder's own defaults.
     if v.is_null() {
-        return Station::new("N0CALL").map_err(|e| NotBuilt::Refused(RefusalCode::InvalidAddress, e.to_string()));
+        let station = Station::new("N0CALL").map_err(|e| NotBuilt::Refused(RefusalCode::InvalidAddress, e.to_string()))?;
+        return Ok(if FRAME.with(std::cell::Cell::get) { station.for_ax25() } else { station });
     }
     let refused = |e: pdn_aprs::InvalidAddress| NotBuilt::Refused(RefusalCode::InvalidAddress, e.to_string());
     let mut station = Station::new(text("source").unwrap_or("")).map_err(refused)?;
+    if FRAME.with(std::cell::Cell::get) {
+        station = station.for_ax25();
+    }
     if let Some(d) = text("destination") {
         station = station.to(d).map_err(refused)?;
     }
@@ -691,6 +700,7 @@ pub fn outcome(input: &Value) -> Outcome {
 /// Builds a recipe and writes it as a TNC2 line, or as an AX.25 frame when `frame` is set; a refusal of the
 /// write is the recipe's.
 pub fn outcome_writing(input: &Value, frame: bool) -> Outcome {
+    FRAME.with(|f| f.set(frame));
     let both: Vec<(&str, &str)> = UNIT_PAIRS
         .iter()
         .copied()

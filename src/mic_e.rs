@@ -707,7 +707,7 @@ pub(crate) fn altitude_has_text_form(r: &MicEReport) -> bool {
 }
 
 /// A whole number of feet (within 1e-6) that a `/A=` can write: six digits, or `-` and five.
-fn whole_feet_in_six_digits(feet: f64) -> bool {
+pub(crate) fn whole_feet_in_six_digits(feet: f64) -> bool {
     let n = crate::steps::round(feet);
     (feet - n).abs() <= 1e-6 && (-99_999.0..=999_999.0).contains(&n)
 }

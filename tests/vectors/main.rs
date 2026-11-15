@@ -104,6 +104,9 @@ fn add_trials(trials: &mut Vec<Trial>, case: Value, known: &BTreeMap<String, Str
         add("reencode", reencode);
     }
     add("readback", readback);
+    if case.get("pass_through").is_some() {
+        add("pass_through", pass_through);
+    }
 }
 
 // ------------------------------------------------------------------ decoding
@@ -420,6 +423,47 @@ fn build_case(case: &Value) -> Result<(), String> {
             Ok(())
         }
     }
+}
+
+/// The lenient packet written back as the program holds it: its TNC2 line and AX.25 frame, or the
+/// refusal each gives.
+fn pass_through(case: &Value) -> Result<(), String> {
+    let packet =
+        decode(&case["input"], ParseOptions::LENIENT).map_err(|e| format!("header error {:?}", neutral::diagnostics(&e.diagnostics)))?;
+    let want = &case["pass_through"];
+    let mut out = Vec::new();
+    let mut one = |what: &str,
+                   written: Result<Vec<u8>, pdn_aprs::EncodeError>,
+                   bytes: Option<&str>,
+                   refusal: Option<&str>,
+                   hex_form: bool| match (written, bytes, refusal) {
+        (Ok(w), Some(expected), _) => {
+            let got =
+                if hex_form { w.iter().map(|b| format!("{b:02X}")).collect::<String>() } else { String::from_utf8_lossy(&w).into_owned() };
+            let same = if hex_form { got.eq_ignore_ascii_case(expected) } else { got == expected };
+            if !same {
+                out.push(format!("pass_through {what}: expected {expected}, wrote {got}"));
+            }
+        }
+        (Ok(w), None, Some(code)) => out.push(format!("pass_through {what}: expected the refusal {code}, wrote {}", show(&w))),
+        (Err(e), _, Some(code)) => {
+            if e.code().id() != code {
+                out.push(format!("pass_through {what}: expected the refusal {code}, got {}: {e}", e.code()));
+            }
+        }
+        (Err(e), Some(expected), _) => {
+            out.push(format!("pass_through {what}: expected {expected}, but the writer refused: {}: {e}", e.code()))
+        }
+        _ => {}
+    };
+    let text = |k: &str| want.get(k).and_then(Value::as_str);
+    if text("tnc2").is_some() || text("tnc2_refusal").is_some() {
+        one("tnc2", packet.to_tnc2(), text("tnc2"), text("tnc2_refusal"), false);
+    }
+    if text("ax25_hex").is_some() || text("ax25_refusal").is_some() {
+        one("ax25", packet.to_ax25(), text("ax25_hex"), text("ax25_refusal"), true);
+    }
+    result(out)
 }
 
 fn readback(case: &Value) -> Result<(), String> {

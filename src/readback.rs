@@ -480,6 +480,7 @@ fn weather(g: &Weather, cs: bool) -> Weather {
     e.pressure_mbar = g.pressure_mbar.map(|v| round(v * 10.0) / 10.0);
     e.luminosity_w_m2 = g.luminosity_w_m2.map(round);
     e.snow_24h_in = g.snow_24h_in.map(snowfall);
+    e.unit = absent(&g.unit);
     e
 }
 
@@ -663,7 +664,13 @@ pub(crate) fn ax25_header(
         return Err(EncodeError::new(RefusalCode::Ax25CannotCarry, "an AX.25 frame has room for at most 8 digipeaters"));
     }
     let mut out = Vec::with_capacity(16 + 7 * path.len());
-    write(&mut out, destination, 0xE0)?;
+    if destination.as_str().is_empty() {
+        // An empty destination a held packet carries is six spaces, and reads back empty with its diagnostic.
+        out.extend_from_slice(&[0x40; 6]);
+        out.push(0xE0);
+    } else {
+        write(&mut out, destination, 0xE0)?;
+    }
     write(&mut out, source, 0x60)?;
     for entry in path {
         write(&mut out, &entry.address, if entry.used { 0xE0 } else { 0x60 })?;
@@ -676,7 +683,8 @@ pub(crate) fn ax25_header(
     let reads_back = match crate::packet::ax25_header(&mut ctx, &out) {
         Ok(((s, d, p), _)) => {
             // An entry is used when its H bit is set or it comes before one that is.
-            ctx.diagnostics.is_empty() && header_read(&s, &d, &p) == header_given(source, destination, path)
+            let own = |c: Code| c == Code::EmptyDestination && destination.as_str().is_empty();
+            ctx.diagnostics.iter().all(|d| own(d.code)) && header_read(&s, &d, &p) == header_given(source, destination, path)
         }
         Err(_) => false,
     };
