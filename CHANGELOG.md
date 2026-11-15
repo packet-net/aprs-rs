@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- A `/` or `@` report whose timestamp is not valid, whose seventh byte after the DTI is `z`, `/` or `h`, and which has an uncompressed position after those seven bytes, now reads the position after them with `malformed-timestamp` (`@R30549z2831.07N/08142.92W_...` was read as a compressed position straight after the `@`). A compressed position after the seven bytes does not win; anything else is as before.
+
+Round 5 of the conformance vectors (pinned at b118424e59fb62194ded6552c1796ad9280f188d).
+
 ## 1.2.0 (2026-11-14)
 
 - `Packet::create` (and so every builder's `build`) refuses with `invalid-address` a header that a TNC2 line cannot carry: an address that is not 1-9 letters, digits or `-` (a third-party source such as `PY2SP_R-R` used as an outer source, or an empty address). Before, it built the packet and `to_tnc2()` wrote a line that `decode_tnc2` rejected. This matches the C library, which refuses the same header with the same code. A Mic-E destination is worked out from the report, so it is not checked.

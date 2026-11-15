@@ -303,3 +303,54 @@ fn mic_e_locator_then_telemetry_then_a_spaced_comment_has_its_space() {
     assert_eq!(report.locator.as_deref(), Some("IO91"));
     assert_eq!(report.fields.comment, "DG2MM");
 }
+
+/// A garbled timestamp whose seven bytes end in a time indicator and are followed by an uncompressed
+/// position: the position after the seven bytes wins, even where the bytes after the DTI would read
+/// as a compressed position (vectors README, "Timestamps that are not there").
+#[test]
+fn a_garbled_timestamp_before_an_uncompressed_position() {
+    let lenient = |info: &str| Packet::decode_tnc2(format!("N0CALL>APZ001:{info}").as_bytes(), ParseOptions::LENIENT).unwrap();
+    // Strict does not tolerate the timestamp: an error, and no position report.
+    let rejected = |info: &str| {
+        let packet = Packet::decode_tnc2(format!("N0CALL>APZ001:{info}").as_bytes(), ParseOptions::STRICT).unwrap();
+        !matches!(packet.data, Data::Position(_))
+            && packet.diagnostics.iter().any(|d| d.code == Code::MalformedTimestamp && d.severity == Severity::Error)
+    };
+    let report = |packet: &Packet| match &packet.data {
+        Data::Position(r) => {
+            (r.timestamp.is_none(), r.messaging, r.fields.compressed, r.fields.position.latitude, r.fields.position.ambiguity)
+        }
+        other => panic!("not a position report: {other:?}"),
+    };
+    for dti in ['@', '/'] {
+        for seventh in ['z', '/', 'h'] {
+            let line = format!("{dti}R30549{seventh}2831.07N/08142.92W_015/001g006t058r000p000P000h-5b10170");
+            let packet = lenient(&line);
+            let (no_timestamp, messaging, compressed, lat, _) = report(&packet);
+            assert!(no_timestamp && !compressed && (lat - 28.517833).abs() < 1e-4, "{line}");
+            assert_eq!(messaging, dti == '@');
+            let warned: Vec<_> = packet.diagnostics.iter().filter(|d| d.code == Code::MalformedTimestamp).collect();
+            assert_eq!(warned.len(), 1, "{line}");
+            assert_eq!(warned[0].severity, Severity::Warning);
+            assert!(rejected(&line), "{line}");
+        }
+    }
+    // A lower-case hemisphere letter: the position decodes leniently, so it wins; strict rejects either way.
+    let line = "@R30549z2831.07n/08142.92w_015/001g006";
+    let (_, _, compressed, lat, _) = report(&lenient(line));
+    assert!(!compressed && (lat - 28.517833).abs() < 1e-4);
+    assert!(rejected(line));
+    // Ambiguity in the following position.
+    let (_, _, compressed, _, ambiguity) = report(&lenient("/R30549h2831.  N/08142.  W>"));
+    assert!(!compressed);
+    assert_eq!(ambiguity, 2);
+    // A seventh byte that is not a time indicator: the reading straight after the DTI stands.
+    let (_, _, compressed, _, _) = report(&lenient("@R30549x2831.07N/08142.92W_015/001"));
+    assert!(compressed);
+    // A compressed position after the seven bytes does not win over a compressed one straight after the DTI.
+    let (_, _, compressed, lat, _) = report(&lenient("@R30549z/5L!!<*e7>7P["));
+    assert!(compressed);
+    assert!((lat - 28.517833).abs() > 1.0);
+    // Too short for the new branch: nothing panics.
+    assert!(!matches!(lenient("@R30549z").data, Data::Position(_)));
+}
