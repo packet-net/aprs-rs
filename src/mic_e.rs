@@ -310,9 +310,10 @@ fn locator_len(s: &[u8]) -> Option<usize> {
 // ------------------------------------------------------------------ encoding
 
 /// The destination address and information field for a Mic-E report. An altitude goes in the
-/// Mic-E altitude bytes (whole metres) unless the report says it is in the comment, as `/A=` feet
-/// (vectors README, Builder rules).
-pub(crate) fn forms(r: &MicEReport, altitude_text: bool) -> Result<Forms, EncodeError> {
+/// Mic-E altitude bytes (whole metres) unless the report says it is in the comment, as `/A=` feet,
+/// or `altitude_text` asks for the `/A=` form, or (not `bytes_first`) only a `/A=` holds it exactly
+/// (vectors README, Read-back and Encoding). `bytes_first` is a builder's say-so, not a mark on the data.
+pub(crate) fn forms(r: &MicEReport, altitude_text: bool, bytes_first: bool) -> Result<Forms, EncodeError> {
     let f = &r.fields;
     let mut pend = Pending::default();
     pend.run(position::check_symbol(f.symbol));
@@ -505,7 +506,7 @@ pub(crate) fn forms(r: &MicEReport, altitude_text: bool) -> Result<Forms, Encode
     // six digits that the bytes do not hold exactly (vectors README, Encoding).
     let mut altitude_in_text = None;
     if let Some(feet) = f.altitude_feet {
-        if r.altitude_in_comment || altitude_text || only_a_text_altitude_holds(feet) {
+        if r.altitude_in_comment || altitude_text || (!bytes_first && only_a_text_altitude_holds(feet)) {
             altitude_in_text = Some(feet);
         } else {
             let metres = crate::steps::round(feet / METRES_TO_FEET);
@@ -701,9 +702,12 @@ pub(crate) fn forms(r: &MicEReport, altitude_text: bool) -> Result<Forms, Encode
     Ok(candidates.fold(Forms::new(first), Forms::then).to(destination))
 }
 
-/// Whether an altitude in the Mic-E bytes could also be written as a `/A=`, the form to try when the bytes do not read back.
-pub(crate) fn altitude_has_text_form(r: &MicEReport) -> bool {
-    !r.altitude_in_comment && r.fields.altitude_feet.is_some_and(|feet| !only_a_text_altitude_holds(feet) && whole_feet_in_six_digits(feet))
+/// Whether an altitude in the Mic-E bytes could also be written as a `/A=` that holds it exactly, the form
+/// to try when the bytes do not read back. Neutral data whose altitude only a `/A=` holds has had it first;
+/// a builder (`bytes_first`) has had the bytes first whatever the value.
+pub(crate) fn altitude_has_text_form(r: &MicEReport, bytes_first: bool) -> bool {
+    !r.altitude_in_comment
+        && r.fields.altitude_feet.is_some_and(|feet| (bytes_first || !only_a_text_altitude_holds(feet)) && whole_feet_in_six_digits(feet))
 }
 
 /// A whole number of feet (within 1e-6) that a `/A=` can write: six digits, or `-` and five.

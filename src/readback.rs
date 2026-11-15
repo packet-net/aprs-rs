@@ -84,6 +84,9 @@ impl Sealed {
 struct Mismatch {
     /// Free text read back changed, or free text is what the data has to be changed by.
     text: bool,
+    /// Only a third-party inner packet's warnings and errors differ: the data gives some the bytes
+    /// do not carry, and no form of the inner packet does.
+    no_form: bool,
     what: &'static str,
 }
 
@@ -107,11 +110,15 @@ pub(crate) fn seal(given: &Data, forms: Forms) -> Result<Sealed, EncodeError> {
         return Err(named);
     }
     Err(match first {
-        Some(Mismatch { text: true, what }) => EncodeError::new(
+        Some(Mismatch { no_form: true, .. }) => EncodeError::new(
+            RefusalCode::ValueHasNoForm,
+            "an inner packet gives a warning or error that its written bytes do not read back with: no form carries it",
+        ),
+        Some(Mismatch { text: true, what, .. }) => EncodeError::new(
             RefusalCode::TextReadsAsField,
             format!("the text would read back as something else: the {what} reads back differently; set the property instead"),
         ),
-        Some(Mismatch { text: false, what }) => {
+        Some(Mismatch { text: false, what, .. }) => {
             EncodeError::new(RefusalCode::DoesNotReadBack, format!("the data does not read back as given: its {what} differs"))
         }
         None => EncodeError::new(RefusalCode::NotEncodable, "there is no form to write"),
@@ -131,23 +138,51 @@ fn matches(given: &Data, destination: Option<&Address>, bytes: &[u8]) -> Result<
     let (source, destination) = well_formed_header(destination);
     let mut ctx = Context::new(ParseOptions::LENIENT);
     let back = crate::decode::information(&mut ctx, &source, &destination, &[], bytes);
-    let clean = diagnostics_ok(&ctx.diagnostics);
+    let clean = diagnostics_ok(given, &ctx.diagnostics);
     let want = expected(given, &back);
     if clean && want == back {
         return Ok(());
     }
-    let text = text_changed(given, &back, !clean);
-    Err(Mismatch { text, what: if clean { first_difference(&want, &back) } else { "diagnostics" } })
+    // Only the inner packets' warnings and errors differ: the data gives some that no form carries.
+    let no_form = clean && without_inner_diagnostics(&want) == without_inner_diagnostics(&back);
+    let text = !no_form && text_changed(given, &back, !clean);
+    Err(Mismatch { text, no_form, what: if clean { first_difference(&want, &back) } else { "diagnostics" } })
 }
 
-/// No warning, no error, and an info only where the rules attach it to the form the data itself asks for.
-fn diagnostics_ok(diagnostics: &[crate::Diagnostic]) -> bool {
-    diagnostics.iter().all(|d| match d.severity {
-        Severity::Info => {
-            matches!(d.code, Code::ObsoleteFormat | Code::MicEMissingDeviceType | Code::InvalidQuery | Code::InvalidTelemetryMetadata)
+/// The data with every third-party inner packet's diagnostics left out, at every depth.
+fn without_inner_diagnostics(data: &Data) -> Data {
+    match data {
+        Data::ThirdParty(p) => {
+            let mut inner = (**p).clone();
+            inner.diagnostics.clear();
+            inner.data = without_inner_diagnostics(&p.data);
+            Data::ThirdParty(Box::new(inner))
         }
+        other => other.clone(),
+    }
+}
+
+/// No warning, no error, and an info only where the rules attach it to the form the data itself asks for:
+/// `obsolete-format` on a positionless weather report, raw weather, raw NMEA, a Maidenhead beacon and
+/// Mic-E Rev 0 telemetry; `mic-e-missing-device-type` on Mic-E status text with no type code;
+/// `invalid-query` or `invalid-telemetry-metadata` on a message whose text the rules read as a plain message.
+fn diagnostics_ok(given: &Data, diagnostics: &[crate::Diagnostic]) -> bool {
+    diagnostics.iter().all(|d| match d.severity {
+        Severity::Info => info_belongs_to(d.code, given),
         Severity::Warning | Severity::Error => false,
     })
+}
+
+/// Whether the rules attach this info to the form `given` is.
+fn info_belongs_to(code: Code, given: &Data) -> bool {
+    match code {
+        Code::ObsoleteFormat => {
+            matches!(given, Data::Weather(_) | Data::RawWeather(_) | Data::Nmea(_) | Data::MaidenheadBeacon(_) | Data::MicE(_))
+        }
+        Code::MicEMissingDeviceType => matches!(given, Data::MicE(_)),
+        Code::InvalidQuery | Code::InvalidTelemetryMetadata => matches!(given, Data::Message(_)),
+        _ => false,
+    }
 }
 
 /// Whether two packets' diagnostics are the same warnings and errors, as a multiset: a third-party
@@ -605,14 +640,42 @@ fn used_after_unused(path: &[crate::PathEntry]) -> bool {
     path.iter().rposition(|e| e.used).is_some_and(|last| path[..last].iter().any(|e| !e.used))
 }
 
-/// The TNC2 header `SOURCE>DEST,PATH:`, with `*` on the last used entry only, once it has been read
-/// back: the same source, destination and path with each used entry used, and no diagnostic.
-pub(crate) fn tnc2_header(
+/// The faults a header given has, in the Refusal reasons order: `invalid-address` (a source, destination
+/// or path entry that is not 1-9 letters, digits or `-`, as a user's decode of a TNC2 header reads it, whatever
+/// the packet's origin), then `invalid-path` (an entry not marked used before one that is). The destination
+/// is not looked at when the report computes it (Mic-E); `empty_destination_ok` lets one that was decoded
+/// (a tolerated defect) stand, for the writers of a packet held.
+pub(crate) fn check_header(
     source: &Address,
-    destination: &Address,
+    destination: Option<&Address>,
     path: &[crate::PathEntry],
-    third_party: bool,
-) -> Result<Vec<u8>, EncodeError> {
+    empty_destination_ok: bool,
+) -> Result<(), EncodeError> {
+    let destination_ok = destination.is_none_or(|d| Address::is_valid(d.as_str()) || (empty_destination_ok && d.as_str().is_empty()));
+    if !Address::is_valid(source.as_str()) || !destination_ok || path.iter().any(|e| !Address::is_valid(e.address.as_str())) {
+        return Err(EncodeError::new(RefusalCode::InvalidAddress, "a header address is not 1-9 letters, digits or -"));
+    }
+    if used_after_unused(path) {
+        return Err(EncodeError::new(
+            RefusalCode::InvalidPath,
+            "a path entry not marked used comes before one that is: every entry before a used one has been used, so it would read back used",
+        ));
+    }
+    Ok(())
+}
+
+/// Whether a CR or LF is inside an information field written as a line: before the run of them at its
+/// very end, which a decoder takes off and a line carries.
+pub(crate) fn line_break_inside(information: &[u8]) -> bool {
+    let end = information.iter().rposition(|b| !matches!(b, b'\r' | b'\n')).map_or(0, |i| i + 1);
+    information[..end].iter().any(|b| matches!(b, b'\r' | b'\n'))
+}
+
+/// The TNC2 header `SOURCE>DEST,PATH:`, with `*` on the last used entry only, once it has been read
+/// back as a user's decode of a line reads it (the outer header rules, whatever the packet's origin): the
+/// same source, destination and path with each used entry used, and no diagnostic.
+pub(crate) fn tnc2_header(source: &Address, destination: &Address, path: &[crate::PathEntry]) -> Result<Vec<u8>, EncodeError> {
+    check_header(source, Some(destination), path, true)?;
     let mut out = Vec::with_capacity(24 + 11 * path.len());
     out.extend_from_slice(source.as_str().as_bytes());
     out.push(b'>');
@@ -627,8 +690,7 @@ pub(crate) fn tnc2_header(
     }
     out.push(b':');
     let mut ctx = Context::new(ParseOptions::LENIENT);
-    let read = crate::packet::tnc2_header(&mut ctx, &out, third_party);
-    let reads_back = match read {
+    let reads_back = match crate::packet::tnc2_header(&mut ctx, &out, false) {
         // No diagnostic, but the one an empty destination in the header given (a decoded packet's, tolerated on the way in) has again.
         Ok(((s, d, p), _)) => {
             let own = |c: Code| c == Code::EmptyDestination && destination.as_str().is_empty();
@@ -639,38 +701,30 @@ pub(crate) fn tnc2_header(
     if reads_back {
         return Ok(out);
     }
-    Err(if used_after_unused(path) {
-        EncodeError::new(
-            RefusalCode::Tnc2CannotCarry,
-            "a path entry not marked used before one that is cannot be written in a TNC2 line: it reads back used",
-        )
-    } else {
-        EncodeError::new(
-            RefusalCode::InvalidAddress,
-            "the header does not read back as given: a header address is not 1-9 letters, digits or -",
-        )
-    })
+    Err(EncodeError::new(
+        RefusalCode::InvalidAddress,
+        "the header does not read back as given: a header address is not 1-9 letters, digits or -",
+    ))
 }
 
 /// The AX.25 addresses, destination first, with the H bit on every used entry, once they have been
-/// read back: the same source, destination and path with each used entry used, and no diagnostic.
+/// read back: the same source, destination and path with each used entry used, and no diagnostic. A frame
+/// never carries what AX.25 forbids: an empty destination is refused, not written as spaces.
 pub(crate) fn ax25_header(
     source: &Address,
     destination: &Address,
     path: &[crate::PathEntry],
     write: impl Fn(&mut Vec<u8>, &Address, u8) -> Result<(), EncodeError>,
 ) -> Result<Vec<u8>, EncodeError> {
+    check_header(source, Some(destination), path, true)?;
+    if destination.as_str().is_empty() {
+        return Err(EncodeError::new(RefusalCode::Ax25CannotCarry, "an AX.25 frame cannot carry an empty destination address"));
+    }
     if path.len() > 8 {
         return Err(EncodeError::new(RefusalCode::Ax25CannotCarry, "an AX.25 frame has room for at most 8 digipeaters"));
     }
     let mut out = Vec::with_capacity(16 + 7 * path.len());
-    if destination.as_str().is_empty() {
-        // An empty destination a held packet carries is six spaces, and reads back empty with its diagnostic.
-        out.extend_from_slice(&[0x40; 6]);
-        out.push(0xE0);
-    } else {
-        write(&mut out, destination, 0xE0)?;
-    }
+    write(&mut out, destination, 0xE0)?;
     write(&mut out, source, 0x60)?;
     for entry in path {
         write(&mut out, &entry.address, if entry.used { 0xE0 } else { 0x60 })?;
@@ -681,24 +735,14 @@ pub(crate) fn ax25_header(
     out.push(0xF0);
     let mut ctx = Context::new(ParseOptions::LENIENT);
     let reads_back = match crate::packet::ax25_header(&mut ctx, &out) {
-        Ok(((s, d, p), _)) => {
-            // An entry is used when its H bit is set or it comes before one that is.
-            let own = |c: Code| c == Code::EmptyDestination && destination.as_str().is_empty();
-            ctx.diagnostics.iter().all(|d| own(d.code)) && header_read(&s, &d, &p) == header_given(source, destination, path)
-        }
+        // An entry is used when its H bit is set or it comes before one that is.
+        Ok(((s, d, p), _)) => ctx.diagnostics.is_empty() && header_read(&s, &d, &p) == header_given(source, destination, path),
         Err(_) => false,
     };
     if reads_back {
         return Ok(out);
     }
-    Err(if used_after_unused(path) {
-        EncodeError::new(
-            RefusalCode::Ax25CannotCarry,
-            "a path entry not marked used before one that is cannot be written in an AX.25 frame: it reads back used",
-        )
-    } else {
-        EncodeError::new(RefusalCode::Ax25CannotCarry, "the addresses do not read back as given")
-    })
+    Err(EncodeError::new(RefusalCode::Ax25CannotCarry, "the addresses do not read back as given"))
 }
 
 #[cfg(test)]
@@ -798,6 +842,112 @@ mod tests {
         assert_eq!(sealed.into_bytes(), b">hello");
         let none = seal(&packet.data, Forms::new(b">hellp".to_vec()).then(b">hellq".to_vec()));
         assert!(none.is_err());
+    }
+
+    fn data(line: &str) -> Data {
+        Packet::decode_tnc2(line.as_bytes(), ParseOptions::LENIENT).unwrap().data
+    }
+
+    fn diagnostic(severity: crate::Severity, code: crate::Code) -> crate::Diagnostic {
+        crate::Diagnostic { severity, code, message: alloc::string::String::new(), offset: None }
+    }
+
+    #[test]
+    fn a_decode_that_sees_only_a_warning_refuses() {
+        // The text is what the data gives, byte for byte; the only difference is the warning the control character raises.
+        let given = Data::Status(crate::Status { text: "a\x07b".into(), ..Default::default() });
+        let decoded = Packet::decode_tnc2(b"N0CALL>APZ001:>a\x07b", ParseOptions::LENIENT).unwrap();
+        assert_eq!(decoded.data, given, "the decode holds the same data");
+        assert!(decoded.has_warnings());
+        let refused = seal(&given, Forms::new(b">a\x07b".to_vec())).err().expect("a warning is not a match");
+        assert!(matches!(refused.code(), RefusalCode::TextReadsAsField | RefusalCode::DoesNotReadBack));
+    }
+
+    #[test]
+    fn an_info_that_is_not_listed_refuses() {
+        // Undecoded data reads back as itself, with an info (`not-aprs`) that no form of data is given.
+        let given = Data::Unrecognized(crate::Unrecognized::NotAprs);
+        let decoded = Packet::decode_tnc2(b"N0CALL>APZ001:\x01x", ParseOptions::LENIENT).unwrap();
+        assert_eq!(decoded.data, given);
+        assert!(decoded.diagnostics.iter().any(|d| d.severity == crate::Severity::Info && d.code == crate::Code::NotAprs));
+        assert!(seal(&given, Forms::new(b"\x01x".to_vec())).is_err());
+        // A listed info on its own form is accepted: positionless weather is obsolete-format.
+        let weather = data("N0CALL>APZ001:_10090556c220s004g005t077r001p002P003h50b09720");
+        assert!(seal(&weather, Forms::new(b"_10090556c220s004g005t077r001p002P003h50b09720".to_vec())).is_ok());
+    }
+
+    #[test]
+    fn an_info_listed_for_one_form_is_not_accepted_on_another() {
+        use crate::{Code, Severity};
+        let info = |code| [diagnostic(Severity::Info, code)];
+        let status = Data::Status(crate::Status::default());
+        let weather = data("N0CALL>APZ001:_10090556c220s004g005t077r001p002P003h50b09720");
+        let message = data("N0CALL>APZ001::G3NRW    :Hi Ian{01");
+        let mic_e = mic_e().0;
+        for (code, accepted) in [
+            (Code::ObsoleteFormat, [&weather, &mic_e]),
+            (Code::MicEMissingDeviceType, [&mic_e, &mic_e]),
+            (Code::InvalidQuery, [&message, &message]),
+            (Code::InvalidTelemetryMetadata, [&message, &message]),
+        ] {
+            for on in accepted {
+                assert!(super::diagnostics_ok(on, &info(code)), "{code} on its own form");
+            }
+            for elsewhere in [&status, &message, &weather, &mic_e] {
+                if !accepted.contains(&elsewhere) {
+                    assert!(!super::diagnostics_ok(elsewhere, &info(code)), "{code} on another form");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_decode_with_a_field_the_data_does_not_give_refuses() {
+        // The bytes carry an altitude the position report was not given.
+        let given = data("N0CALL>APZ001:!5127.26N/00058.69W>");
+        assert!(seal(&given, Forms::new(b"!5127.26N/00058.69W>".to_vec())).is_ok());
+        assert!(seal(&given, Forms::new(b"!5127.26N/00058.69W>/A=000100".to_vec())).is_err());
+        // The same for a field of another kind: a comment, and a message ID.
+        assert!(seal(&given, Forms::new(b"!5127.26N/00058.69W>hi".to_vec())).is_err());
+        let message = data("N0CALL>APZ001::G3NRW    :Hi Ian");
+        assert!(seal(&message, Forms::new(b":G3NRW    :Hi Ian{01".to_vec())).is_err());
+    }
+
+    #[test]
+    fn a_third_party_packets_inner_warnings_and_errors_are_a_multiset() {
+        let warned = Packet::decode_tnc2(b"N0CALL>APZ001:}G4ABC>APZ001:>a\x07b", ParseOptions::LENIENT).unwrap();
+        let bytes = b"}G4ABC>APZ001:>a\x07b".to_vec();
+        // As decoded, the warning is once in the data and once in the decode.
+        assert!(seal(&warned.data, Forms::new(bytes.clone())).is_ok());
+        // Given twice, it is not what the bytes read back with, though the set of codes is the same.
+        let Data::ThirdParty(mut twice) = warned.data.clone() else { panic!() };
+        let again = twice.diagnostics.clone();
+        twice.diagnostics.extend(again);
+        let refused = seal(&Data::ThirdParty(twice), Forms::new(bytes.clone())).err().expect("two warnings are not one");
+        assert_eq!(refused.code(), RefusalCode::ValueHasNoForm);
+        // Given none, the decode has one the data does not give.
+        let Data::ThirdParty(mut none) = warned.data.clone() else { panic!() };
+        none.diagnostics.clear();
+        assert!(seal(&Data::ThirdParty(none), Forms::new(bytes)).is_err());
+    }
+
+    #[test]
+    fn a_header_that_reads_back_with_a_diagnostic_is_refused() {
+        // The same address reads back, but a lower-case call is a defect the decoder tolerates with a
+        // warning, and a frame that does is not the header given.
+        let lower = Address::unchecked("n0call".into());
+        let raw = |out: &mut Vec<u8>, a: &Address, flags: u8| {
+            let mut call = [b' '; 6];
+            call[..a.as_str().len()].copy_from_slice(a.as_str().as_bytes());
+            out.extend(call.iter().map(|b| b << 1));
+            out.push(flags);
+            Ok(())
+        };
+        let to = Address::new("APZ001").unwrap();
+        let refused = super::ax25_header(&lower, &to, &[], raw).expect_err("a header with a warning is refused");
+        assert_eq!(refused.code(), RefusalCode::Ax25CannotCarry);
+        let upper = Address::new("N0CALL").unwrap();
+        assert!(super::ax25_header(&upper, &to, &[], raw).is_ok());
     }
 
     #[test]

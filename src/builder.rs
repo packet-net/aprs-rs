@@ -59,8 +59,8 @@ impl Station {
     /// This station with a digipeater path, e.g. `via(&["WIDE1-1", "WIDE2-1"])`, replacing any set before.
     ///
     /// An entry ending in `*` is a used entry, as in a TNC2 header (`"WIDE1-1*"`): the `*` is not part of
-    /// the address. A path whose entry not marked used comes before one that is cannot be written (the
-    /// packet's `to_tnc2` and `to_ax25` refuse it).
+    /// the address. A path whose entry not marked used comes before one that is is refused when the
+    /// packet is built (`invalid-path`): every entry before a used one has been used.
     pub fn via(&self, path: &[&str]) -> Result<Station, InvalidAddress> {
         let path = path
             .iter()
@@ -221,7 +221,12 @@ impl Station {
     }
 
     fn packet(&self, data: Data) -> Result<Packet, EncodeError> {
-        Packet::create(self.source.clone(), self.destination.clone(), self.path.clone(), data)
+        self.packet_for(data, false)
+    }
+
+    /// `bytes_first` is the Mic-E builder telling the encoder its altitude goes in the Mic-E bytes first.
+    fn packet_for(&self, data: Data, bytes_first: bool) -> Result<Packet, EncodeError> {
+        Packet::create_for(self.source.clone(), self.destination.clone(), self.path.clone(), data, bytes_first)
     }
 }
 
@@ -319,18 +324,10 @@ impl Common {
             Position { ambiguity: self.ambiguity, ..position }
         };
         fields.symbol = symbol;
+        // The altitude is kept as given (metres converted to feet): the encoder rounds it once, to the metre
+        // for the Mic-E altitude bytes and to the foot for a /A=.
         if let Some(metres) = self.altitude_m {
-            // Mic-E carries its altitude in whole metres (APRS12c ch. 10); a /A= is in feet.
-            fields.altitude_feet = Some(if mic_e {
-                crate::steps::round(metres) * crate::comment::METRES_TO_FEET
-            } else {
-                metres * crate::comment::METRES_TO_FEET
-            });
-        } else if mic_e {
-            // An altitude in feet goes in the Mic-E altitude bytes too, rounded once to the nearest metre.
-            if let Some(feet) = fields.altitude_feet {
-                fields.altitude_feet = Some(crate::steps::round(feet / crate::comment::METRES_TO_FEET) * crate::comment::METRES_TO_FEET);
-            }
+            fields.altitude_feet = Some(metres * crate::comment::METRES_TO_FEET);
         }
         // A course that rounds to 0 is the spec's unknown course, which Mic-E sends as 0 (APRS12c ch. 10).
         if mic_e && fields.course_degrees.is_some_and(|c| crate::steps::round(c) == 0.0) {
@@ -356,11 +353,11 @@ impl Common {
 /// What a builder was not given that its report needs is the refusal only when nothing ranked before it
 /// is wrong: the data, made with placeholders for what is missing, is tried first, and a fault of an
 /// earlier code is named instead (vectors README, Refusal reasons).
-fn settle(station: &Station, data: Data, missing: Vec<EncodeError>) -> Result<Data, EncodeError> {
+fn settle(station: &Station, data: Data, missing: Vec<EncodeError>, bytes_first: bool) -> Result<Data, EncodeError> {
     let Some(first) = missing.into_iter().reduce(|a, b| if b.code().precedes(a.code()) { b } else { a }) else {
         return Ok(data);
     };
-    match station.packet(data) {
+    match station.packet_for(data, bytes_first) {
         Err(e) if e.code().precedes(first.code()) => Err(e),
         _ => Err(first),
     }
@@ -373,7 +370,7 @@ impl Common {
     /// A builder names its refusal in the encoder's order, so a fault ranked before this one (a value
     /// out of range, say) is named first: the report is tried with the position as given, whose
     /// ambiguity the encoder judges itself.
-    fn box_fault(&self, fields: &Positioned, wrap: impl Fn(Positioned) -> Data) -> Result<(), EncodeError> {
+    fn box_fault(&self, fields: &Positioned, bytes_first: bool, wrap: impl Fn(Positioned) -> Data) -> Result<(), EncodeError> {
         let Some(position) = self.position else { return Ok(()) };
         if fields.compressed || !(1..=4).contains(&self.ambiguity) {
             return Ok(());
@@ -383,7 +380,7 @@ impl Common {
             let mut raw = fields.clone();
             raw.position = Position { ambiguity: self.ambiguity, ..position };
             let data = wrap(raw);
-            let tried = data.seal().map(|_| ());
+            let tried = data.seal_for(bytes_first).map(|_| ());
             return Err(tried.err().unwrap_or_else(|| {
                 EncodeError::new(
                     RefusalCode::ValueHasNoForm,
@@ -564,12 +561,14 @@ impl PositionBuilder {
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
         let (fields, no_symbol) = self.common.positioned("a position report", false)?;
-        self.common
-            .box_fault(&fields, |fields| Data::Position(PositionReport { timestamp: self.timestamp, messaging: self.messaging, fields }))?;
+        self.common.box_fault(&fields, false, |fields| {
+            Data::Position(PositionReport { timestamp: self.timestamp, messaging: self.messaging, fields })
+        })?;
         settle(
             &self.station,
             Data::Position(PositionReport { timestamp: self.timestamp, messaging: self.messaging, fields }),
             no_symbol.into_iter().collect(),
+            false,
         )
     }
 
@@ -620,12 +619,14 @@ impl ObjectBuilder {
             .is_none()
             .then(|| EncodeError::new(RefusalCode::MissingField, "an object needs a timestamp: call timestamp(...) or permanent()"));
         let timestamp = Some(self.timestamp.unwrap_or(Timestamp::dhm(1, 0, 0)));
-        self.common
-            .box_fault(&fields, |fields| Data::Object(ObjectReport { name: self.name.clone(), killed: self.killed, timestamp, fields }))?;
+        self.common.box_fault(&fields, false, |fields| {
+            Data::Object(ObjectReport { name: self.name.clone(), killed: self.killed, timestamp, fields })
+        })?;
         settle(
             &self.station,
             Data::Object(ObjectReport { name: self.name.clone(), killed: self.killed, timestamp, fields }),
             no_symbol.into_iter().chain(no_timestamp).collect(),
+            false,
         )
     }
 
@@ -656,11 +657,12 @@ impl ItemBuilder {
     /// The data, without a header.
     pub fn to_data(&self) -> Result<Data, EncodeError> {
         let (fields, no_symbol) = self.common.positioned("an item", false)?;
-        self.common.box_fault(&fields, |fields| Data::Item(ItemReport { name: self.name.clone(), killed: self.killed, fields }))?;
+        self.common.box_fault(&fields, false, |fields| Data::Item(ItemReport { name: self.name.clone(), killed: self.killed, fields }))?;
         settle(
             &self.station,
             Data::Item(ItemReport { name: self.name.clone(), killed: self.killed, fields }),
             no_symbol.into_iter().collect(),
+            false,
         )
     }
 
@@ -706,13 +708,13 @@ impl MicEBuilder {
             fields,
             ..MicEReport::default()
         };
-        self.common.box_fault(&fields, |fields| Data::MicE(report(fields)))?;
+        self.common.box_fault(&fields, true, |fields| Data::MicE(report(fields)))?;
         // The altitude goes in the Mic-E altitude bytes, so it must fit them. A fault ranked before
         // this one is named first: the report is tried without the altitude.
         if let Some(feet) = fields.altitude_feet {
             if !(-10_000.0..=743_570.0).contains(&crate::steps::round(feet / crate::comment::METRES_TO_FEET)) {
                 let without = Positioned { altitude_feet: None, ..fields.clone() };
-                if let Err(e) = self.station.packet(Data::MicE(report(without))) {
+                if let Err(e) = self.station.packet_for(Data::MicE(report(without)), true) {
                     if e.code().precedes(RefusalCode::ValueOutOfRange) {
                         return Err(e);
                     }
@@ -723,30 +725,18 @@ impl MicEBuilder {
                 ));
             }
         }
-        // The Mic-E bytes first. When they do not read back (the comment holds a /A= that would be read as the
-        // altitude), a /A= is the next form, but only if it holds the altitude as given exactly.
-        let given = self.common.altitude_m.map(|m| m * crate::comment::METRES_TO_FEET).or(self.common.fields.altitude_feet);
-        let data = settle(&self.station, Data::MicE(report(fields.clone())), no_symbol.into_iter().collect())?;
-        if let (Err(e), Some(feet)) = (self.station.packet(data.clone()), given) {
-            if matches!(e.code(), RefusalCode::TextReadsAsField | RefusalCode::DoesNotReadBack)
-                && crate::mic_e::whole_feet_in_six_digits(feet)
-            {
-                let alternative = Data::MicE(report(Positioned { altitude_feet: Some(feet), ..fields }));
-                // A form that reads back but is too long is the one to report: its size is what refuses it.
-                match self.station.packet(alternative.clone()) {
-                    Ok(_) => return Ok(alternative),
-                    Err(e) if e.code() == RefusalCode::InformationFieldTooLong => return Ok(alternative),
-                    Err(_) => {}
-                }
-            }
-        }
-        Ok(data)
+        // The data holds the altitude as given. `build` has the encoder write the Mic-E bytes first, and a
+        // `/A=` that holds it exactly next if the bytes do not read back.
+        settle(&self.station, Data::MicE(report(fields)), no_symbol.into_iter().collect(), true)
     }
 
     /// The packet: the station's source and path, the destination this report computes, and the report.
-    /// An altitude, in feet or metres, goes in the Mic-E altitude bytes, rounded once to the nearest metre.
+    /// An altitude, in feet or metres, goes in the Mic-E altitude bytes, rounded once to the nearest metre;
+    /// when those bytes do not read back, a `/A=` that holds it exactly is next, else the report is refused.
+    /// ([`to_data`](Self::to_data) keeps the altitude as given, so data sent with [`Station::data`] is
+    /// written by the rule for any data: a whole number of feet that the bytes do not hold goes in a `/A=` first.)
     pub fn build(&self) -> Result<Packet, EncodeError> {
-        self.station.packet(self.to_data()?)
+        self.station.packet_for(self.to_data()?, true)
     }
 }
 
@@ -930,7 +920,7 @@ impl WeatherBuilder {
             ));
         }
         let timestamp = Some(self.timestamp.unwrap_or(Timestamp::mdhm(1, 1, 0, 0)));
-        settle(&self.station, Data::Weather(WeatherReport { timestamp, weather, comment: String::new() }), missing)
+        settle(&self.station, Data::Weather(WeatherReport { timestamp, weather, comment: String::new() }), missing, false)
     }
 
     /// The packet: the station's header and this report, encoded.
@@ -973,7 +963,7 @@ impl MessageBuilder {
         } else {
             Vec::new()
         };
-        settle(&self.station, Data::Message(self.message.clone()), missing)
+        settle(&self.station, Data::Message(self.message.clone()), missing, false)
     }
 
     /// The packet: the station's header and this message, encoded.

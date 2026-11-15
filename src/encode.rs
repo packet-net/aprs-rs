@@ -39,16 +39,25 @@ impl Data {
     /// Writes this data and reads it back: the one way bytes leave an encoder. A Mic-E report is
     /// written too, for [`crate::Packet::create`], with the destination it computes.
     pub(crate) fn seal(&self) -> Result<Sealed, EncodeError> {
+        self.seal_for(false)
+    }
+
+    /// As [`Data::seal`]. `bytes_first` is what a builder says of a Mic-E altitude it was given: the
+    /// Mic-E altitude bytes are the first form, whatever the value (neutral data puts a whole number
+    /// of feet that the bytes do not hold exactly in a `/A=` first). It is an argument, not a mark on the data.
+    pub(crate) fn seal_for(&self, bytes_first: bool) -> Result<Sealed, EncodeError> {
         match self {
             Data::MicE(r) => {
-                let sealed = crate::readback::seal(self, crate::mic_e::forms(r, false)?);
+                let sealed = crate::readback::seal(self, crate::mic_e::forms(r, false, bytes_first)?);
                 match sealed {
                     // The next form the Encoding rule names: an altitude in a `/A=` where the Mic-E bytes do not read back.
                     Err(e)
                         if matches!(e.code(), RefusalCode::TextReadsAsField | RefusalCode::DoesNotReadBack)
-                            && crate::mic_e::altitude_has_text_form(r) =>
+                            && crate::mic_e::altitude_has_text_form(r, bytes_first) =>
                     {
-                        crate::readback::seal(self, crate::mic_e::forms(r, true)?).map_err(|_| e)
+                        // A form that reads back but is too long is refused for its size; any other fault is the first form's.
+                        crate::readback::seal(self, crate::mic_e::forms(r, true, bytes_first)?)
+                            .map_err(|second| if second.code() == RefusalCode::InformationFieldTooLong { second } else { e })
                     }
                     other => other,
                 }

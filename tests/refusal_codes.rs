@@ -60,7 +60,7 @@ fn builder_refusals_and_ids() {
     );
     assert_eq!(RefusalCode::ValueHasNoForm.id(), "value-has-no-form");
     assert_eq!(RefusalCode::from_id("does-not-read-back"), Some(RefusalCode::DoesNotReadBack));
-    assert_eq!(RefusalCode::ALL.len(), 27);
+    assert_eq!(RefusalCode::ALL.len(), 28);
     for c in RefusalCode::ALL {
         assert_eq!(RefusalCode::from_id(c.id()), Some(c));
     }

@@ -380,11 +380,10 @@ impl std::fmt::Display for Unreadable {
 type Read<T> = Result<T, Unreadable>;
 
 /// The Refusal reasons order (vectors README): the first code that applies is the one named.
-pub const ORDER: [&str; 27] = [
+pub const ORDER: [&str; 28] = [
     "not-encodable",
     "invalid-address",
-    "ax25-cannot-carry",
-    "tnc2-cannot-carry",
+    "invalid-path",
     "invalid-third-party-header",
     "invalid-addressee",
     "invalid-name",
@@ -408,6 +407,8 @@ pub const ORDER: [&str; 27] = [
     "text-reads-as-field",
     "does-not-read-back",
     "information-field-too-long",
+    "ax25-cannot-carry",
+    "tnc2-cannot-carry",
 ];
 
 /// Where a refusal code comes in the order.
@@ -470,6 +471,29 @@ fn out_of_type(v: &Value, name: &str) -> Option<(pdn_aprs::RefusalCode, String)>
         return Some((pdn_aprs::RefusalCode::NotANumber, format!("{name}: not a number")));
     }
     Some((pdn_aprs::RefusalCode::ValueOutOfRange, format!("{name}: outside what this crate's data holds")))
+}
+
+/// A whole number that fits `T`; a number that does not (a fraction, a negative count, an infinity) is noted
+/// as the refusal its value decides (`value-out-of-range`, `not-a-number`) and 0 stands in, for the encoder to
+/// find any earlier code. A fraction is never rounded in a whole-unit or code field. Text is not read.
+fn whole_or_defer<T: TryFrom<i128>>(v: &Value, name: &str) -> Read<T> {
+    if let Some(t) = whole(v).and_then(|n| T::try_from(n).ok()) {
+        return Ok(t);
+    }
+    let stand_in = || T::try_from(0).ok().expect("0 fits");
+    match num(v) {
+        Some(x) if x.is_finite() && x.fract() != 0.0 && x.abs() < 1e30 => {
+            defer(pdn_aprs::RefusalCode::ValueOutOfRange, format!("{name}: not a whole number"));
+            Ok(stand_in())
+        }
+        _ => match out_of_type(v, name) {
+            Some((code, why)) => {
+                defer(code, why);
+                Ok(stand_in())
+            }
+            None => unsupported(format!("{name}: not a whole number in the range this crate holds")),
+        },
+    }
 }
 
 fn unsupported<T>(why: String) -> Read<T> {
@@ -542,13 +566,11 @@ impl<'a> Keys<'a> {
             .ok_or_else(|| Unreadable::Unsupported(format!("{}: missing, and this crate has no value for its absence", self.name(k))))
     }
 
-    /// A whole number that fits `T`.
+    /// A whole number that fits `T`; a number that does not (a fraction, a negative count, an infinity)
+    /// is noted as the refusal its value decides (`value-out-of-range`, `not-a-number`) and 0 stands in,
+    /// for the encoder to find any earlier code. Text is not read.
     fn int<T: TryFrom<i128>>(&self, k: &str) -> Read<Option<T>> {
-        let Some(v) = self.get(k) else { return Ok(None) };
-        whole(v)
-            .and_then(|n| T::try_from(n).ok())
-            .map(Some)
-            .ok_or_else(|| Unreadable::Unsupported(format!("{}: not a whole number in the range this crate holds", self.name(k))))
+        self.int_or_defer(k)
     }
 
     /// A number this crate holds in whole steps (a course, a humidity), rounded to the nearest as
@@ -584,21 +606,11 @@ impl<'a> Keys<'a> {
         }))
     }
 
-    /// A whole number that fits `T`; a number that does not (a negative count, an infinity) is noted as the
-    /// refusal its value decides, and 0 stands in. A fraction or text is not read.
+    /// As [`Keys::int`].
     fn int_or_defer<T: TryFrom<i128>>(&self, k: &str) -> Read<Option<T>> {
-        let Some(v) = self.get(k) else { return Ok(None) };
-        if let Some(t) = whole(v).and_then(|n| T::try_from(n).ok()) {
-            return Ok(Some(t));
-        }
-        let name = self.name(k);
-        let fraction = num(v).is_some_and(|x| x.is_finite() && x.fract() != 0.0 && x.abs() < 1e30);
-        match out_of_type(v, &name).filter(|_| !fraction) {
-            Some((code, why)) => {
-                defer(code, why);
-                Ok(Some(T::try_from(0).ok().expect("0 fits")))
-            }
-            None => unsupported(format!("{name}: not a whole number in the range this crate holds")),
+        match self.get(k) {
+            None => Ok(None),
+            Some(v) => whole_or_defer(v, &self.name(k)).map(Some),
         }
     }
 
@@ -1350,11 +1362,10 @@ fn read_positioned(o: &Keys) -> Read<Positioned> {
             None => None,
             Some(t) => Some(CommentTelemetry {
                 sequence: t.required_int("sequence")?,
-                analog: t
-                    .array("analog")?
-                    .map(|a| a.iter().map(|x| whole(x).and_then(|n| u16::try_from(n).ok())).collect::<Option<Vec<u16>>>())
-                    .unwrap_or(Some(Vec::new()))
-                    .ok_or_else(|| Unreadable::Unsupported("telemetry.analog: each is a whole number, 0-65535".into()))?,
+                analog: match t.array("analog")? {
+                    None => Vec::new(),
+                    Some(a) => a.iter().map(|x| whole_or_defer::<u16>(x, "telemetry.analog")).collect::<Read<Vec<u16>>>()?,
+                },
                 digital: t.int("digital")?,
             }),
         },

@@ -79,6 +79,8 @@ impl Address {
     }
 }
 
+/// The address as held, for display. This is not a writer: it never refuses and is not read back (a
+/// header is written, and read back, by [`Packet::to_tnc2`] and [`Packet::to_ax25`]).
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -262,19 +264,30 @@ impl Packet {
     /// address is worked out from the report (it carries the latitude, message code and digipeat
     /// path, APRS12c ch. 10), and `destination` is not used.
     ///
-    /// Refuses with `invalid-address` a header that a TNC2 line cannot carry: every address must be
-    /// 1-9 letters, digits or `-`, so a third-party source such as `PY2SP_R-R` cannot head a packet
-    /// of its own, and no address may be empty. The header is checked before the data, and the
-    /// destination of Mic-E data is not checked because it is worked out from the report.
+    /// The header is judged before the data: `invalid-address` for a header a TNC2 line cannot carry
+    /// (every address must be 1-9 letters, digits or `-`, so a third-party source such as `PY2SP_R-R`
+    /// cannot head a packet of its own, and no address may be empty), then `invalid-path` for a path with
+    /// an entry not marked used before one that is. The destination of Mic-E data is not checked because
+    /// it is worked out from the report.
     pub fn create(source: Address, destination: Address, path: Vec<PathEntry>, data: Data) -> Result<Packet, EncodeError> {
-        let mic_e = matches!(data, Data::MicE(_));
-        if !Address::is_valid(source.as_str())
-            || (!mic_e && !Address::is_valid(destination.as_str()))
-            || path.iter().any(|e| !Address::is_valid(e.address.as_str()))
-        {
-            return Err(EncodeError::new(RefusalCode::InvalidAddress, "a header address is not 1-9 letters, digits or -"));
+        Packet::create_for(source, destination, path, data, false)
+    }
+
+    /// As [`Packet::create`]. `bytes_first` is the Mic-E builder saying the altitude goes in the Mic-E
+    /// bytes first, whatever its value.
+    pub(crate) fn create_for(
+        source: Address,
+        destination: Address,
+        path: Vec<PathEntry>,
+        data: Data,
+        bytes_first: bool,
+    ) -> Result<Packet, EncodeError> {
+        if matches!(data, Data::Unrecognized(_)) {
+            return Err(EncodeError::new(RefusalCode::NotEncodable, "undecoded data has nothing to encode"));
         }
-        let (computed, information) = data.seal()?.into_parts();
+        let mic_e = matches!(data, Data::MicE(_));
+        crate::readback::check_header(&source, (!mic_e).then_some(&destination), &path, false)?;
+        let (computed, information) = data.seal_for(bytes_first)?.into_parts();
         let destination = computed.unwrap_or(destination);
         let decoded = Packet::decode(source.clone(), destination.clone(), path.clone(), &information, ParseOptions::STRICT);
         Ok(Packet { source, destination, path, information, data, diagnostics: decoded.diagnostics, third_party: false })
@@ -303,16 +316,25 @@ impl Packet {
 
     /// The packet as a TNC2 text line (without a line ending). The last used path entry is marked `*`.
     ///
-    /// The header is read back before it is returned, and must read back as the one the packet has:
-    /// a path with an entry not marked used before one that is would read back with that entry used,
-    /// so it is refused (`tnc2-cannot-carry`), as is an address a TNC2 header cannot carry
-    /// (`invalid-address`).
+    /// The header is read back before it is returned, as a user's decode of a line reads it, whatever
+    /// the packet's origin: an address a TNC2 header cannot carry (a third-party inner packet's source
+    /// such as `PY2SP_R-R`, say) is `invalid-address`, and a path with an entry not marked used before
+    /// one that is would read back with that entry used, `invalid-path`. A CR or LF inside the
+    /// information field would end the line there, so it is refused (`tnc2-cannot-carry`); one at the
+    /// very end is carried.
     ///
-    /// This writes out a packet the program already holds, so it is not an encoder: the information
-    /// field is passed through as it stands and no size check is made (a decoded packet over 256
-    /// bytes is written as received). `Data::encode` and the builders are the encoders that refuse one.
+    /// This writes out a packet the program already holds, so it is not an encoder: `information` is
+    /// passed through as it stands (the public field, as held) and no size check is made (a decoded
+    /// packet over 256 bytes is written as received). `Data::encode` and the builders are the encoders
+    /// that refuse one.
     pub fn to_tnc2(&self) -> Result<Vec<u8>, EncodeError> {
-        let mut out = crate::readback::tnc2_header(&self.source, &self.destination, &self.path, self.third_party)?;
+        let mut out = crate::readback::tnc2_header(&self.source, &self.destination, &self.path)?;
+        if crate::readback::line_break_inside(&self.information) {
+            return Err(EncodeError::new(
+                RefusalCode::Tnc2CannotCarry,
+                "a CR or LF inside the information field would end the line there: a TNC2 line cannot carry it",
+            ));
+        }
         out.reserve(self.information.len());
         out.extend_from_slice(&self.information);
         Ok(out)
@@ -338,13 +360,14 @@ impl Packet {
         out
     }
 
-    /// The packet as an AX.25 UI frame in KISS form (no flags, no FCS). Fails if an address
-    /// cannot be sent over the air, or the path is longer than 8 entries, or has an entry not marked
-    /// used before one that is (`ax25-cannot-carry`: the frame would read back with that entry used).
+    /// The packet as an AX.25 UI frame in KISS form (no flags, no FCS). The header is judged as for
+    /// [`to_tnc2`](Packet::to_tnc2) (`invalid-address`, `invalid-path`), then a frame refuses
+    /// (`ax25-cannot-carry`) an address it cannot send (a call over 6 characters, in lower case or empty,
+    /// an SSID over 15) and a path of more than 8 entries; an empty destination is never written as spaces.
     ///
     /// Like [`to_tnc2`](Packet::to_tnc2), this writes out a packet the program already holds and is
-    /// not an encoder: the information field is passed through as it stands, with no size check, and
-    /// the addresses are read back before the frame is returned.
+    /// not an encoder: `information` is passed through as it stands, with no size check, and the
+    /// addresses are read back before the frame is returned.
     pub fn to_ax25(&self) -> Result<Vec<u8>, EncodeError> {
         let mut out = crate::readback::ax25_header(&self.source, &self.destination, &self.path, write_ax25_address)?;
         out.reserve(self.information.len());

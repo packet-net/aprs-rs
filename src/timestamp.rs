@@ -105,7 +105,8 @@ fn pair(b: &[u8]) -> u8 {
 }
 
 impl core::fmt::Display for Timestamp {
-    /// The timestamp as sent on air: `092345z`, `092345/`, `234517h` or `10090556`.
+    /// The timestamp as held, in the form it takes on air: `092345z`, `092345/`, `234517h` or `10090556`.
+    /// This is for display, not for sending: it never refuses, even for a field out of range, and is not read back.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         self.to_bytes().iter().try_for_each(|&b| core::fmt::Write::write_char(f, char::from(b)))
     }

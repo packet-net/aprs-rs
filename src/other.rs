@@ -582,6 +582,12 @@ pub(crate) fn encode(data: &Data) -> Result<Forms, EncodeError> {
                     "a third-party packet's information field cannot end with a line break",
                 ));
             }
+            // The inner data is held to every rule, at every depth, as top-level data is: where the
+            // bytes written do not read back as it, the rule it breaks is the refusal.
+            return Ok(match inner_fault(&p.data) {
+                Some(fault) => Forms::new(out).unless_read_back(fault),
+                None => Forms::new(out),
+            });
         }
         Data::UserDefined(u) => {
             // APRS12c ch. 19 puts no restriction on user-defined data, these two characters
@@ -692,6 +698,17 @@ fn encode_nmea(n: &Nmea) -> Result<Forms, EncodeError> {
     out.extend_from_slice(sentence);
     out.extend_from_slice(n.comment.as_bytes());
     Ok(Forms::new(out))
+}
+
+/// The first rule an inner packet's data breaks, as the encoder would refuse it on its own: none for
+/// undecoded data, which has no neutral form and is written as received.
+fn inner_fault(data: &Data) -> Option<EncodeError> {
+    match data {
+        Data::Unrecognized(_) => None,
+        Data::MicE(r) => crate::mic_e::forms(r, false, false).err(),
+        Data::ThirdParty(p) => inner_fault(&p.data),
+        other => other.forms().err(),
+    }
 }
 
 /// Checks that a third-party packet's header can be written so that it reads back the same: the
