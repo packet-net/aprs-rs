@@ -6,7 +6,7 @@
 - A Mic-E locator's space is judged on the decoder's own result: the status text left after the locator once the later altitude, base-91 telemetry and `!DAO!` are lifted exactly as they are for the data, with the same refusals. A `!DAO!` that exists only by joining the text either side of a lifted altitude is not lifted, so `IO91/G!W1"4e}2! hi` keeps `missing-space-after-locator`; a later altitude or telemetry straight after the locator, then a spaced comment, no longer warns. The space is the separator, not comment, so two spaces after the locator give the comment `x` (before, ` x`).
 - The vectors test runner's tolerance check has its exact form and skips no case: when `strict` is rejected by a different code, turning off the one tolerance must give a reading with that code as a warning. The runner asserts the check ran on every case whose lenient diagnostics name exactly one tolerable code (731).
 
-Round 5 of the conformance vectors (pinned at 0253b516e7d761f8bd7a62ecbcb0c901a75f713a).
+Round 5 of the conformance vectors (pinned at 6a47e5ea8d8dc6e5e20e35dc3c39015366047c22).
 
 ## 1.2.0 (2026-11-14)
 
