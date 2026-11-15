@@ -872,14 +872,14 @@ pub(crate) fn frequency(out: &mut Vec<u8>, f: &crate::VoiceFrequency, p: &mut Pe
         p.note(EncodeError::new(RefusalCode::MissingField, "narrow band is written with the tone field, so it needs a tone"));
     }
     if let Some(offset) = f.offset_khz {
-        if offset.abs() > 9990 {
+        if offset.unsigned_abs() > 9990 {
             p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "the offset is up to 9.99 MHz"));
         } else if offset % 10 != 0 {
             p.note(EncodeError::new(RefusalCode::ValueHasNoForm, "the offset is in 10 kHz steps"));
         } else {
             out.push(b' ');
             out.push(if offset < 0 { b'-' } else { b'+' });
-            push_digits(out, (offset.abs() / 10) as u32, 3);
+            push_digits(out, offset.unsigned_abs() / 10, 3);
         }
     }
     if let Some(range) = f.range {
