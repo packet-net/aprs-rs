@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-Round 5 of the conformance vectors (pinned at 2f1ad6a484d9929432a1a69563d6da980b20247f).
+Round 5 of the conformance vectors (pinned at 030e3bee44ba6356bc1ae10a1351d44cb8eb9aa7).
 
 Writing and reading back:
 
@@ -21,7 +21,7 @@ Writing and reading back:
 
 Reading:
 
-- Base-91 comment telemetry is the last valid block, not whatever sits between the last two bars (packet-net/aprs-vectors#32, from live traffic). Bars are taken in pairs from the start: two bars that enclose 4 to 14 characters, an even number, each `!` to `{`, make a block (and both bars are used), and the last block is the telemetry; with none, the bars are text and nothing is reported. So `|!a!'!#|| IGate PCBUnit 2 LoRa |144.190| BW10.4` has the telemetry `|!a!'!#|` and the comment `| IGate PCBUnit 2 LoRa |144.190| BW10.4`, where before it had none and read a `!DAO!` from inside the telemetry bytes. The `!DAO!` is still looked for outside the block, and every lifting order and never-join rule is as before. The encoder is unchanged: data without telemetry whose comment holds a valid block is `text-reads-as-field` whatever bars follow it. Decoding stays linear in the comment on thousands of bars.
+- Base-91 comment telemetry is the last valid block, not whatever sits between the last two bars (packet-net/aprs-vectors#32, from live traffic). The pairs of neighbouring bars slide (each bar closes one pair and opens the next, so `x|!!!!|!W12!y|a b|` has the pairs `!!!!`, `!W12!y` and `a b`); the last pair that encloses 4 to 14 characters, an even number, each `!` to `{`, is the telemetry, and its bytes are the block's whatever they look like; with none, the bars are text and nothing is reported. So `|!a!'!#|| IGate PCBUnit 2 LoRa |144.190| BW10.4` has the telemetry `|!a!'!#|` and the comment `| IGate PCBUnit 2 LoRa |144.190| BW10.4`, where before it had none and read a `!DAO!` from inside the telemetry bytes. A `!DAO!` is still looked for outside the block, and every lifting order and never-join rule is as before. The encoder is unchanged: data without telemetry whose comment holds a valid block is `text-reads-as-field` whatever bars follow it. Decoding stays linear in the comment on thousands of bars.
 
 - A `/` or `@` report whose timestamp is not valid, whose seventh byte after the DTI is `z`, `/` or `h`, and which has an uncompressed position after those seven bytes, now reads the position after them with `malformed-timestamp` (`@R30549z2831.07N/08142.92W_...` was read as a compressed position straight after the `@`). A compressed position after the seven bytes does not win; anything else is as before.
 - A Mic-E locator's space is judged on the decoder's own result: the status text left after the locator once the later altitude, base-91 telemetry and `!DAO!` are lifted exactly as they are for the data, with the same refusals. A `!DAO!` that exists only by joining the text either side of a lifted altitude is not lifted, so `IO91/G!W1"4e}2! hi` keeps `missing-space-after-locator`; a later altitude or telemetry straight after the locator, then a spaced comment, no longer warns. The space is the separator, not comment, so two spaces after the locator give the comment `x` (before, ` x`).

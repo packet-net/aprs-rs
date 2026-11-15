@@ -713,32 +713,22 @@ pub(crate) fn is_whole_altitude_text(w: Option<&[u8]>) -> bool {
     w.and_then(altitude_text).is_some()
 }
 
-/// Base-91 comment telemetry `|ss11...|`: 2-7 pairs between bars. The bars are taken in pairs from
-/// the start: a bar and the next one that enclose a valid block (4 to 14 characters, an even number,
-/// each 0x21 to 0x7B, whole as sent) make a block and both bars are used; otherwise the bar is text and
-/// the next one is looked at. The LAST block found is the telemetry (packet-net/aprs-vectors#32), and no
-/// block means the bars are text. One pass over the bars, each pair looked at for at most 14 bytes, so it
+/// Base-91 comment telemetry `|ss11...|`: 2-7 pairs between bars. The pairs slide: each bar closes one
+/// pair and opens the next, so `x|!!!!|!W12!y|a b|` has the pairs `!!!!`, `!W12!y` and `a b`. The LAST
+/// pair whose contents are 4 to 14 characters, an even number, each 0x21 to 0x7B, whole as sent, is
+/// the telemetry (packet-net/aprs-vectors#32), and its bytes are the block's whatever they look like;
+/// with none the bars are text. One pass from the end, each pair looked at for at most 14 bytes, so it
 /// is linear in the comment.
 fn find_telemetry(text: &Text) -> Option<(core::ops::Range<usize>, CommentTelemetry)> {
     let c = &text.b[..];
     let bars: Vec<usize> = c.iter().enumerate().filter(|(_, b)| **b == b'|').map(|(i, _)| i).collect();
-    let mut last = None;
-    let mut i = 0;
-    while i + 1 < bars.len() {
-        let (start, end) = (bars[i], bars[i + 1]);
+    let (start, end) = bars.windows(2).rev().map(|w| (w[0], w[1])).find(|&(start, end)| {
         let inner = &c[start + 1..end];
-        if (4..=14).contains(&inner.len())
+        (4..=14).contains(&inner.len())
             && inner.len() % 2 == 0
             && inner.iter().all(|&b| base91::is_digit(b))
             && !text.splits(start, end + 1)
-        {
-            last = Some((start, end));
-            i += 2;
-        } else {
-            i += 1;
-        }
-    }
-    let (start, end) = last?;
+    })?;
     let values: Vec<u16> = c[start + 1..end].chunks(2).map(|p| base91::decode(p).unwrap_or(0) as u16).collect();
     let (sequence, rest) = values.split_first()?;
     let (analog, digital) = if rest.len() == 6 { (&rest[..5], Some(rest[5] as u8)) } else { (rest, None) };
