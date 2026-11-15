@@ -9,7 +9,7 @@
 - Behaviour change: lifting an element never joins the text either side of it. An element (base-91 telemetry, a `!DAO!`, a PHG, RNG or DFS, a `/A=` or Mic-E altitude, signpost or corridor braces, a voice frequency and its fields, a weather field or software type, a Mic-E locator) is read only where its bytes stand whole as sent, so `PH!W12!G3330` has a `!DAO!` and the comment `PHG3330`, not a PHG, and a report whose comment is such text re-encodes `refused`, `text-reads-as-field`. A `/A=` standing before a voice frequency, between it and its fields or between two of them does not cut them off (`146.520MHz/A=000100 T100` keeps its tone); a `!DAO!` or telemetry there does. Internally the comment's lifting records a boundary at each lifted place instead of splicing the text together.
 - Behaviour change: a strict Mic-E decoder reads a later altitude as text and never rejects by `mic-e-altitude-not-first` (it used to when lifting telemetry or a `!DAO!` made one); a later altitude between two telemetry bars now splits them, so that telemetry is text.
 
-Round 5 of the conformance vectors (pinned at 8ce4dacf6ee2d1f1882752411b93ecd11336020d).
+Round 5 of the conformance vectors (pinned at 0445b8ce7f79c6c424f27c57696587101289250c).
 
 ## 1.2.0 (2026-11-14)
 
