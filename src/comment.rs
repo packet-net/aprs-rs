@@ -165,47 +165,42 @@ pub(crate) fn decode(ctx: &mut Context, fields: &mut Positioned, cs: Option<Cs>,
 /// Where the weather text of a positioned report ends in `bytes`: the start of the trailing base-91
 /// telemetry or `!DAO!` that is lifted out first, or the end of the bytes.
 fn weather_end(bytes: &[u8]) -> usize {
-    telemetry_and_dao_spans(bytes).last().map_or(bytes.len(), |r| r.start)
+    let (telemetry, dao) = plan_lift(&Text::new(bytes.to_vec(), None));
+    telemetry.map(|t| t.0.start).into_iter().chain(dao.map(|d| d.0.start)).min().unwrap_or(bytes.len())
 }
 
 /// After a position's weather data: base-91 telemetry and a `!DAO!` are lifted out first, and
 /// what is left is the software type and unit, or else text that a weather report should not have.
 fn weather_tail(ctx: &mut Context, fields: &mut Positioned, bytes: &[u8], offset: usize) -> bool {
-    let mut c: Vec<u8> = bytes.to_vec();
-    if !lift_telemetry_and_dao(ctx, fields, &mut c, offset, None, false) {
+    let mut c = Text::new(bytes.to_vec(), None);
+    if !lift_telemetry_and_dao(ctx, fields, &mut c, offset, false) {
         return false;
     }
-    if c.is_empty() || weather::software_and_unit(&c, fields.weather.get_or_insert_with(Weather::default)) {
+    // The software type and unit are one run of bytes as sent: one with an element lifted from
+    // inside it is text.
+    if c.b.is_empty() || (c.cuts.is_empty() && weather::software_and_unit(&c.b, fields.weather.get_or_insert_with(Weather::default))) {
         return true;
     }
     if !ctx.tolerate(Code::WeatherComment, "text after the weather data; a weather report has no comment (UAP 2.7.1)", Some(offset)) {
         return false;
     }
-    finish(ctx, fields, c, offset)
+    finish(ctx, fields, c.b, offset)
 }
 
 /// Lifts base-91 telemetry and a `!DAO!` out of `c`. The telemetry block is located first, so a
-/// DAO-shaped run inside it is not taken for a DAO. A `!DAO!` is five bytes as sent, so one that
-/// spans `joined` (where bytes were taken out before, bringing the bytes on either side together)
-/// is not one.
+/// DAO-shaped run inside it is not taken for a DAO. Both are bytes as sent: neither is read across
+/// a place where something was lifted before.
 ///
 /// `after_locator`: `c` follows a Mic-E locator, whose space is judged on what is left once the
 /// elements are out ([`locator_space`]), before the `!DAO!`'s own checks.
-fn lift_telemetry_and_dao(
-    ctx: &mut Context,
-    fields: &mut Positioned,
-    c: &mut Vec<u8>,
-    offset: usize,
-    joined: Option<usize>,
-    after_locator: bool,
-) -> bool {
-    let (telemetry, dao) = plan_lift(c, joined);
+fn lift_telemetry_and_dao(ctx: &mut Context, fields: &mut Positioned, c: &mut Text, offset: usize, after_locator: bool) -> bool {
+    let (telemetry, dao) = plan_lift(c);
     let mut removals: Vec<core::ops::Range<usize>> = Vec::new();
     removals.extend(telemetry.as_ref().map(|t| t.0.clone()));
     removals.extend(dao.as_ref().map(|d| d.0.clone()));
     removals.sort_by_key(|r| core::cmp::Reverse(r.start));
     for r in removals {
-        c.drain(r);
+        c.lift(r, false);
     }
     if after_locator && !locator_space(ctx, c, offset) {
         return false;
@@ -224,30 +219,96 @@ fn lift_telemetry_and_dao(
 type Lifted<T> = Option<(core::ops::Range<usize>, T)>;
 
 /// The telemetry block and the `!DAO!` that lifting takes out of `c`. The telemetry block is
-/// located first, and a `!DAO!` does not span `joined`.
-fn plan_lift(c: &[u8], joined: Option<usize>) -> (Lifted<CommentTelemetry>, Lifted<FoundDao>) {
+/// located first.
+fn plan_lift(c: &Text) -> (Lifted<CommentTelemetry>, Lifted<FoundDao>) {
     let telemetry = find_telemetry(c);
-    let dao = find_dao(c, telemetry.as_ref().map(|t| t.0.clone()), joined);
+    let dao = find_dao(c, telemetry.as_ref().map(|t| t.0.clone()));
     (telemetry, dao)
 }
 
-/// `c` with the telemetry and `!DAO!` that [`tail`] lifts out of it taken out, from the same plan.
-pub(crate) fn without_telemetry_and_dao(c: &[u8]) -> Vec<u8> {
-    let mut rest = c.to_vec();
-    for r in telemetry_and_dao_spans(c) {
-        rest.drain(r);
+/// The text of a comment while elements are lifted out of it, and where they were. Taking an
+/// element out leaves a boundary at its place, which no element is read across (vectors
+/// interpretations.md, "Lifting an element never joins the text either side of it"); the comment is
+/// what is left, the boundaries ignored.
+pub(crate) struct Text {
+    b: Vec<u8>,
+    cuts: Vec<Cut>,
+}
+
+/// A boundary before byte `at`. `altitude` when only `/A=` altitudes were lifted from it, which a
+/// voice frequency's fields are read across.
+#[derive(Clone, Copy)]
+struct Cut {
+    at: usize,
+    altitude: bool,
+}
+
+impl Text {
+    /// `bytes`, with a boundary at `lifted` when something was already taken out of them there.
+    pub(crate) fn new(bytes: Vec<u8>, lifted: Option<usize>) -> Self {
+        let mut t = Text { b: bytes, cuts: Vec::new() };
+        if let Some(at) = lifted {
+            t.cut(at, false);
+        }
+        t
     }
-    rest
+
+    fn cut(&mut self, at: usize, altitude: bool) {
+        if at == 0 || at >= self.b.len() {
+            return;
+        }
+        match self.cuts.iter_mut().find(|c| c.at == at) {
+            Some(c) => c.altitude &= altitude,
+            None => self.cuts.push(Cut { at, altitude }),
+        }
+    }
+
+    /// Takes `range` out, leaving a boundary. `altitude`: it is a `/A=` altitude.
+    fn lift(&mut self, range: core::ops::Range<usize>, altitude: bool) {
+        let n = range.len();
+        self.b.drain(range.clone());
+        self.shift(range.start, n);
+        self.cut(range.start, altitude);
+    }
+
+    /// Takes `n` bytes out at `start` for good (a leading delimiter), with no boundary left.
+    fn remove(&mut self, start: usize, n: usize) {
+        self.b.drain(start..start + n);
+        self.shift(start, n);
+    }
+
+    /// Moves the boundaries after `start` back by `n`, merging any that meet.
+    fn shift(&mut self, start: usize, n: usize) {
+        let cuts = core::mem::take(&mut self.cuts);
+        for c in cuts {
+            let at = if c.at >= start + n { c.at - n } else { c.at.min(start) };
+            self.cut(at, c.altitude);
+        }
+    }
+
+    /// Whether a boundary falls inside `start..end`, so bytes there are not one run as sent.
+    fn splits(&self, start: usize, end: usize) -> bool {
+        self.cuts.iter().any(|c| start < c.at && c.at < end)
+    }
+
+    /// Where the piece that holds byte `i` ends: the next boundary after it, or the end.
+    fn piece_end(&self, i: usize) -> usize {
+        self.cuts.iter().map(|c| c.at).filter(|&at| at > i).min().unwrap_or(self.b.len())
+    }
+
+    fn cut_at(&self, at: usize) -> Option<Cut> {
+        self.cuts.iter().copied().find(|c| c.at == at)
+    }
 }
 
 /// The space after a Mic-E locator, judged on `c`, the text after it with every lifted element
 /// out: nothing left is fine, a space first is the separator and is taken off, and anything else
 /// is a tolerated `missing-space-after-locator`.
-pub(crate) fn locator_space(ctx: &mut Context, c: &mut Vec<u8>, offset: usize) -> bool {
-    match c.first() {
+fn locator_space(ctx: &mut Context, c: &mut Text, offset: usize) -> bool {
+    match c.b.first() {
         None => true,
         Some(b' ') => {
-            c.remove(0);
+            c.remove(0, 1);
             true
         }
         Some(_) => ctx.tolerate(
@@ -258,36 +319,29 @@ pub(crate) fn locator_space(ctx: &mut Context, c: &mut Vec<u8>, offset: usize) -
     }
 }
 
-/// Where the base-91 telemetry and `!DAO!` [`tail`] would lift out of `c` are, last first.
-pub(crate) fn telemetry_and_dao_spans(c: &[u8]) -> Vec<core::ops::Range<usize>> {
-    let (telemetry, dao) = plan_lift(c, None);
-    let mut spans: Vec<core::ops::Range<usize>> = telemetry.map(|t| t.0).into_iter().chain(dao.map(|d| d.0)).collect();
-    spans.sort_by_key(|r| core::cmp::Reverse(r.start));
-    spans
-}
-
 /// The comment after any data extension: lifts out telemetry and a `!DAO!` (from the end), then an
 /// altitude, signpost or corridor braces, a data extension found later in the text, and a voice
 /// frequency at the start, in the order that keeps one from being taken for another; the rest,
-/// less one leading delimiter, is the comment. `joined`: where bytes were already taken out of
-/// the text (a Mic-E altitude), which a `!DAO!` does not span.
+/// less one leading delimiter, is the comment. Each element is read only where its bytes stand
+/// whole as sent: `lifted` is where bytes were already taken out of the text (a Mic-E altitude),
+/// and no element is read across it or across any place lifted here.
 pub(crate) fn tail(
     ctx: &mut Context,
     fields: &mut Positioned,
     bytes: &[u8],
     offset: usize,
-    joined: Option<usize>,
+    lifted: Option<usize>,
     after_locator: bool,
 ) -> bool {
-    let mut c: Vec<u8> = bytes.to_vec();
-    if !lift_telemetry_and_dao(ctx, fields, &mut c, offset, joined, after_locator) {
+    let mut c = Text::new(bytes.to_vec(), lifted);
+    if !lift_telemetry_and_dao(ctx, fields, &mut c, offset, after_locator) {
         return false;
     }
 
     // A /A= altitude is read wherever it is, and wins over a compressed or Mic-E one.
     if let Some((i, feet)) = find_altitude(&c) {
         fields.altitude_feet = Some(f64::from(feet));
-        c.drain(i..i + 9);
+        c.lift(i..i + 9, true);
     }
 
     braces(fields, &mut c);
@@ -297,17 +351,17 @@ pub(crate) fn tail(
     }
 
     // A voice frequency at the start, after at most one delimiter, and one space after it.
-    let start = usize::from(matches!(c.first(), Some(b' ' | b'/')));
-    if let Some((f, len)) = frequency(&c[start..]) {
+    let start = usize::from(matches!(c.b.first(), Some(b' ' | b'/')));
+    if let Some((f, len)) = frequency(&c, start) {
         fields.frequency = Some(f);
         let mut end = start + len;
-        if c.get(end) == Some(&b' ') {
+        if c.b.get(end) == Some(&b' ') {
             end += 1;
         }
-        c.drain(..end);
+        c.remove(0, end);
     }
 
-    finish(ctx, fields, c, offset)
+    finish(ctx, fields, c.b, offset)
 }
 
 /// One leading delimiter, a space or `/`, is not part of the text (APRS12c ch. 18); the rest is the comment.
@@ -330,7 +384,7 @@ fn finish(ctx: &mut Context, fields: &mut Positioned, mut c: Vec<u8>, offset: us
 /// not braces, and `}`, the characters printable ASCII for a signpost or digits for a corridor;
 /// braces that are not are comment text and do not stop the search, so `{5Wm{55}` and `{{5}`
 /// hold `55` and `5`.
-fn braces(fields: &mut Positioned, c: &mut Vec<u8>) {
+fn braces(fields: &mut Positioned, c: &mut Text) {
     let signpost = is_signpost_symbol(fields);
     let corridor = fields.area.is_some_and(|a| matches!(a.shape, AreaShape::LineDownRight | AreaShape::LineDownLeft));
     if !signpost && !corridor {
@@ -341,18 +395,18 @@ fn braces(fields: &mut Positioned, c: &mut Vec<u8>) {
             && !inner.iter().any(|&b| b == b'{' || b == b'}')
             && if signpost { text::is_printable_ascii(inner) } else { text::all_digits(inner) }
     };
-    let found = (0..c.len()).filter(|&i| c[i] == b'{').find_map(|open| {
-        let close = open + 1 + c[open + 1..].iter().position(|&b| b == b'}')?;
-        well_formed(&c[open + 1..close]).then_some((open, close))
+    let found = (0..c.b.len()).filter(|&i| c.b[i] == b'{').find_map(|open| {
+        let close = open + 1 + c.b[open + 1..].iter().position(|&b| b == b'}')?;
+        (well_formed(&c.b[open + 1..close]) && !c.splits(open, close + 1)).then_some((open, close))
     });
     let Some((open, close)) = found else { return };
-    let inner = &c[open + 1..close];
+    let inner = &c.b[open + 1..close];
     if signpost {
         fields.signpost = Some(String::from(core::str::from_utf8(inner).unwrap_or_default()));
     } else if let Some(area) = fields.area.as_mut() {
         area.corridor_width_miles = Some(text::digits(inner) as u16);
     }
-    c.drain(open..=close);
+    c.lift(open..close + 1, false);
 }
 
 /// A PHG, RNG or DFS extension after other comment text instead of straight after the symbol:
@@ -360,12 +414,12 @@ fn braces(fields: &mut Positioned, c: &mut Vec<u8>) {
 /// `DFS`. A malformed one such as `PHG12` is comment text and does not stop the search (vectors
 /// interpretations.md, "A late data extension is the first well-formed one"). Strictly that is
 /// free text (UAP 5.15); recognising it is an extra reading the options allow.
-fn late_extension(ctx: &mut Context, fields: &mut Positioned, c: &mut Vec<u8>, offset: usize) {
+fn late_extension(ctx: &mut Context, fields: &mut Positioned, c: &mut Text, offset: usize) {
     for tag in [&b"PHG"[..], b"RNG", b"DFS"] {
         let mut found = Positioned::default();
-        let Some((at, len)) = (0..c.len().saturating_sub(2))
-            .filter(|&i| &c[i..i + 3] == tag)
-            .find_map(|i| station_extension(&mut found, &c[i..]).map(|len| (i, len)))
+        let Some((at, len)) = (0..c.b.len().saturating_sub(2))
+            .filter(|&i| &c.b[i..i + 3] == tag)
+            .find_map(|i| station_extension(&mut found, &c.b[i..c.piece_end(i)]).map(|len| (i, len)))
         else {
             continue;
         };
@@ -375,7 +429,7 @@ fn late_extension(ctx: &mut Context, fields: &mut Positioned, c: &mut Vec<u8>, o
             Some(offset + at),
         ) {
             (fields.phg, fields.range_miles, fields.dfs) = (found.phg, found.range_miles, found.dfs);
-            c.drain(at..at + len);
+            c.lift(at..at + len, false);
         }
         return;
     }
@@ -628,9 +682,12 @@ pub(crate) const AREA_COLORS: [AreaColor; 16] = [
 ];
 
 /// `/A=nnnnnn` anywhere in the comment (APRS12c ch. 6), or the de facto `/A=-nnnnn`.
-pub(crate) fn find_altitude(c: &[u8]) -> Option<(usize, i32)> {
-    (0..c.len().saturating_sub(8)).find_map(|i| {
-        let w = &c[i..i + 9];
+fn find_altitude(c: &Text) -> Option<(usize, i32)> {
+    (0..c.b.len().saturating_sub(8)).find_map(|i| {
+        if c.splits(i, i + 9) {
+            return None;
+        }
+        let w = &c.b[i..i + 9];
         if &w[..3] != b"/A=" {
             return None;
         }
@@ -645,12 +702,18 @@ pub(crate) fn find_altitude(c: &[u8]) -> Option<(usize, i32)> {
 }
 
 /// Base-91 comment telemetry `|ss11...|`: 2-7 pairs between bars.
-fn find_telemetry(c: &[u8]) -> Option<(core::ops::Range<usize>, CommentTelemetry)> {
+fn find_telemetry(text: &Text) -> Option<(core::ops::Range<usize>, CommentTelemetry)> {
+    let c = &text.b[..];
     // Only the last two bars are considered: telemetry goes at the end of the comment.
     let bars: Vec<usize> = c.iter().enumerate().filter(|(_, b)| **b == b'|').map(|(i, _)| i).collect();
     if let [.., start, end] = bars[..] {
         let inner = &c[start + 1..end];
-        if inner.len() < 4 || inner.len() > 14 || inner.len() % 2 != 0 || !inner.iter().all(|&b| base91::is_digit(b)) {
+        if text.splits(start, end + 1)
+            || inner.len() < 4
+            || inner.len() > 14
+            || inner.len() % 2 != 0
+            || !inner.iter().all(|&b| base91::is_digit(b))
+        {
             return None;
         }
         let values: Vec<u16> = inner.chunks(2).map(|p| base91::decode(p).unwrap_or(0) as u16).collect();
@@ -669,12 +732,13 @@ struct FoundDao {
     lon: f64,
 }
 
-/// The last `!DAO!` outside the telemetry block, and not across `joined`: `!Wdd!` (an upper-case
+/// The last `!DAO!` outside the telemetry block, whose five bytes stand whole as sent: `!Wdd!` (an upper-case
 /// datum, a digit each: thousandths of a minute), `!wBB!` (a lower-case datum, a base-91
 /// character each: v/91 hundredths of a minute) or `!D  !` (datum only; a letter or a digit).
-fn find_dao(c: &[u8], telemetry: Option<core::ops::Range<usize>>, joined: Option<usize>) -> Option<(core::ops::Range<usize>, FoundDao)> {
+fn find_dao(text: &Text, telemetry: Option<core::ops::Range<usize>>) -> Option<(core::ops::Range<usize>, FoundDao)> {
+    let c = &text.b[..];
     (0..c.len().saturating_sub(4)).rev().find_map(|i| {
-        if telemetry.as_ref().is_some_and(|t| i + 4 >= t.start && i < t.end) || joined.is_some_and(|j| i < j && j < i + 5) {
+        if telemetry.as_ref().is_some_and(|t| i + 4 >= t.start && i < t.end) || text.splits(i, i + 5) {
             return None;
         }
         let w = &c[i..i + 5];
@@ -716,10 +780,16 @@ fn apply_dao(ctx: &mut Context, fields: &mut Positioned, found: FoundDao, offset
     true
 }
 
-/// An APRS 1.2 voice frequency at the start of `c`: `FFF.FFFMHz` or `FFF.FF MHz`, then optional
-/// tone, offset and range fields, each after a space. Its length.
-pub(crate) fn frequency(c: &[u8]) -> Option<(VoiceFrequency, usize)> {
-    let head = c.get(..10)?;
+/// An APRS 1.2 voice frequency at `start` in `text`: `FFF.FFFMHz` or `FFF.FF MHz`, then optional
+/// tone, offset and range fields, each after a space. Its length. The frequency and each field
+/// stand whole as sent, and a field is not read across a place where something other than a `/A=`
+/// altitude was lifted (APRS12c ch. 6 lets an altitude stand anywhere in the comment).
+fn frequency(text: &Text, start: usize) -> Option<(VoiceFrequency, usize)> {
+    let c = &text.b[..];
+    if text.splits(start, start + 10) {
+        return None;
+    }
+    let head = c.get(start..start + 10)?;
     let mhz_ok = |b: &[u8]| b.eq_ignore_ascii_case(b"MHz");
     // Above 999 MHz the first digit is a letter standing for the leading digits (APRS12c ch. 18).
     let whole = if text::all_digits(&head[0..3]) {
@@ -747,11 +817,15 @@ pub(crate) fn frequency(c: &[u8]) -> Option<(VoiceFrequency, usize)> {
         narrow: false,
         ten_khz_resolution: ten_khz,
     };
-    let mut at = 10;
-    // Each field is a space and four characters, then a space or the end of the text.
+    let mut at = start + 10;
+    // Each field is a space and four characters, then a space, the end of the text or a place
+    // something was lifted from.
     let field = |at: usize| -> Option<&[u8]> {
         let b = c.get(at..at + 5)?;
-        (b[0] == b' ' && c.get(at + 5).is_none_or(|&n| n == b' ')).then_some(&b[1..5])
+        let reached = text.cut_at(at).is_none_or(|cut| cut.altitude);
+        let whole = !text.splits(at, at + 5);
+        let ends = c.get(at + 5).is_none_or(|&n| n == b' ') || text.cut_at(at + 5).is_some();
+        (reached && whole && b[0] == b' ' && ends).then_some(&b[1..5])
     };
 
     if let Some(b) = field(at) {
@@ -789,7 +863,7 @@ pub(crate) fn frequency(c: &[u8]) -> Option<(VoiceFrequency, usize)> {
             at += 5;
         }
     }
-    Some((f, at))
+    Some((f, at - start))
 }
 
 /// The letters that stand for the leading digits of frequencies above 999 MHz (APRS12c ch. 18).

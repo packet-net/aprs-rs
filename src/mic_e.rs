@@ -245,8 +245,8 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
     }
 
     // An altitude later in the text, when none came first: a tolerated reading. Taking it out
-    // brings the bytes either side of it together, and a !DAO! across that join is not one.
-    let mut joined = None;
+    // leaves a boundary, which no other element is read across.
+    let mut lifted = None;
     if altitude_first.is_none() {
         if let Some(i) = (0..s.len().saturating_sub(3)).find(|&i| altitude(&s[i..]).is_some()) {
             if ctx.allows(
@@ -256,22 +256,7 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
             ) {
                 report.fields.altitude_feet = altitude(&s[i..]);
                 s.drain(i..i + 4);
-                joined = Some(i);
-            } else if joins_into_altitude(&s) {
-                // The decoder rejects the packet and so lifts nothing; the locator's space, met
-                // first, is judged on the same plan of what would be lifted.
-                if after_locator && !comment::locator_space(ctx, &mut comment::without_telemetry_and_dao(&s), offset) {
-                    return false;
-                }
-                // Strictly the altitude is text and telemetry and the !DAO! are lifted as usual,
-                // unless what is left holds an altitude across a place one was taken from, which
-                // a lenient reader would then take: that reading is rejected (vectors README, Mic-E).
-                ctx.error(
-                    Code::MicEAltitudeNotFirst,
-                    "lifting telemetry and the !DAO! would join the status text into a Mic-E altitude (APRS12c ch. 10)",
-                    Some(offset + i),
-                );
-                return false;
+                lifted = Some(i);
             }
         }
     }
@@ -279,30 +264,12 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
     // A `/A=` in the text wins over the Mic-E bytes, even when it says the same: whether the text
     // gave one is seen by letting it write into an empty field.
     report.fields.altitude_feet = None;
-    let ok = comment::tail(ctx, &mut report.fields, &s, offset, joined, after_locator);
+    let ok = comment::tail(ctx, &mut report.fields, &s, offset, lifted, after_locator);
     report.altitude_in_comment = report.fields.altitude_feet.is_some();
     if !report.altitude_in_comment {
         report.fields.altitude_feet = altitude_before;
     }
     ok
-}
-
-/// Whether the text left once base-91 telemetry and the `!DAO!` are lifted out of `s` holds a
-/// Mic-E altitude, `xxx}`, across a place one was taken from.
-fn joins_into_altitude(s: &[u8]) -> bool {
-    let mut rest = s.to_vec();
-    let mut joins = Vec::new();
-    // Spans come last first, so each join's place in what is left is its span's start less the
-    // lengths of the spans before it, taken out later.
-    let spans = comment::telemetry_and_dao_spans(s);
-    for r in &spans {
-        rest.drain(r.clone());
-    }
-    for r in &spans {
-        let before: usize = spans.iter().filter(|o| o.start < r.start).map(|o| o.len()).sum();
-        joins.push(r.start - before);
-    }
-    joins.iter().any(|&join| (join.saturating_sub(3)..join).any(|j| altitude(&rest[j..]).is_some()))
 }
 
 /// A Mic-E altitude, `xxx}`, at the start of `s`, in feet.

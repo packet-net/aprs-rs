@@ -304,29 +304,29 @@ fn mic_e_locator_then_telemetry_then_a_spaced_comment_has_its_space() {
     assert_eq!(report.fields.comment, "DG2MM");
 }
 
-/// A later Mic-E altitude lifted from between two bars leaves base-91 telemetry, which is lifted
-/// before the locator's space is judged: no `missing-space-after-locator` leniently, and a strict
-/// decoder (which leaves the altitude as text, so no telemetry) rejects the missing space.
+/// A later Mic-E altitude lifted from between two bars splits them: no telemetry is read, the bars
+/// are text straight after the locator, and the locator's space is missing (lenient warns, strict
+/// rejects).
 #[test]
-fn mic_e_locator_space_is_judged_after_a_lifted_altitude_leaves_telemetry() {
-    let has_missing_space = |p: &Packet| p.diagnostics.iter().any(|d| d.code == Code::MissingSpaceAfterLocator);
+fn mic_e_telemetry_split_by_a_later_altitude_is_text_after_the_locator() {
     for (line, comment) in [
-        (&b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0hl!Y[/>\"4e}='p| DG2MM"[..], "DG2MM"),
-        (&b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0hl!Y[/>\"4e}='p| hello"[..], "hello"),
-        (&b"N0CALL>S32UVT:`(_fn\"Oj/`IO91SX/G|!:&0hl!Y[/>\"4e}='p| DG2MM"[..], "DG2MM"),
+        (&b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0hl!Y[/>\"4e}='p| DG2MM"[..], "|!:&0hl!Y[/>='p| DG2MM"),
+        (&b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0hl!Y[/>\"4e}='p| hello"[..], "|!:&0hl!Y[/>='p| hello"),
+        (&b"N0CALL>S32UVT:`(_fn\"Oj/`IO91SX/G|!:&0hl!Y[/>\"4e}='p| DG2MM"[..], "|!:&0hl!Y[/>='p| DG2MM"),
     ] {
         let lenient = Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
-        assert!(!has_missing_space(&lenient), "{}", String::from_utf8_lossy(line));
+        assert!(lenient.diagnostics.iter().any(|d| d.code == Code::MissingSpaceAfterLocator), "{}", String::from_utf8_lossy(line));
         assert!(lenient.diagnostics.iter().any(|d| d.code == Code::MicEAltitudeNotFirst));
         let Data::MicE(report) = &lenient.data else { panic!("not Mic-E") };
-        assert!(report.fields.telemetry.is_some());
+        assert!(report.fields.telemetry.is_none());
         assert_eq!(report.fields.comment, comment);
         let strict = Packet::decode_tnc2(line, ParseOptions::STRICT).unwrap();
         assert!(strict.diagnostics.iter().any(|d| d.code == Code::MissingSpaceAfterLocator && d.severity == Severity::Error));
+        assert!(strict.diagnostics.iter().all(|d| d.code != Code::MicEAltitudeNotFirst));
     }
     // Text straight after the locator, with no telemetry, still has no space.
     let line = b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G\"4e}DG2MM";
-    assert!(has_missing_space(&Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap()));
+    assert!(Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap().diagnostics.iter().any(|d| d.code == Code::MissingSpaceAfterLocator));
 }
 
 /// The locator's space is judged on what the decoder's own lifting leaves (vectors interpretations.md,
@@ -340,14 +340,12 @@ fn mic_e_two_spaces_after_the_locator_give_the_comment_x() {
         let Data::MicE(report) = packet.data else { panic!("not Mic-E") };
         report.fields.comment
     };
-    // A later altitude, telemetry, and both: two variations of each.
+    // A later altitude and telemetry: two variations of each.
     for line in [
         &b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G\"4e}  x"[..],
         &b"N0CALL>S32UVT:`(_fn\"Oj/`IO91SX/G\"4e}  x"[..],
         &b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0'p|  x"[..],
         &b"N0CALL>S32UVT:`(_fn\"Oj/`IO91SX/G|!:&0'p|  x"[..],
-        &b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0hl!Y[/>\"4e}='p|  x"[..],
-        &b"N0CALL>S32UVT:`(_fn\"Oj/`IO91SX/G|!:&0hl!Y[/>\"4e}='p|  x"[..],
     ] {
         assert_eq!(comment(line), "x", "{}", String::from_utf8_lossy(line));
     }
