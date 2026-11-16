@@ -411,6 +411,16 @@ pub const ORDER: [&str; 28] = [
     "tnc2-cannot-carry",
 ];
 
+/// Where a refusal comes in the order: `not-encodable` for a field that reads as other data under its header is
+/// the read-back's finding, so it ranks with `does-not-read-back`, after every rule check.
+pub fn effective_rank(code: pdn_aprs::RefusalCode, why: &str) -> usize {
+    if code == pdn_aprs::RefusalCode::NotEncodable && why.contains("reads as other data") {
+        rank(pdn_aprs::RefusalCode::DoesNotReadBack)
+    } else {
+        rank(code)
+    }
+}
+
 /// Where a refusal code comes in the order.
 pub fn rank(code: pdn_aprs::RefusalCode) -> usize {
     ORDER.iter().position(|x| *x == code.id()).unwrap_or(ORDER.len())
@@ -427,12 +437,18 @@ thread_local! {
     /// code, a sequence of -1, an infinity), each with a valid stand-in put in its place. Vectors README,
     /// "Encode records": the record is then encoded with the stand-ins, and the refusal named is the first in
     /// the order among that result and these, a size refusal losing to every one of them.
-    static DEFERRED: std::cell::RefCell<Vec<(pdn_aprs::RefusalCode, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static DEFERRED: std::cell::RefCell<Vec<(pdn_aprs::RefusalCode, String, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Notes a refusal the reader made on an input it replaced with a stand-in.
 pub fn defer(code: pdn_aprs::RefusalCode, why: String) {
-    DEFERRED.with(|d| d.borrow_mut().push((code, why)));
+    DEFERRED.with(|d| d.borrow_mut().push((code, why, false)));
+}
+
+/// Notes a refusal that is the read-back's finding (an inner Mic-E destination the data does not compute):
+/// it ranks with `does-not-read-back`, after every rule check, whatever its code.
+pub fn defer_late(code: pdn_aprs::RefusalCode, why: String) {
+    DEFERRED.with(|d| d.borrow_mut().push((code, why, true)));
 }
 
 /// Forgets the refusals noted so far.
@@ -443,7 +459,9 @@ pub fn clear_deferred() {
 /// The first in the order of the refusals noted since the last `clear_deferred` or `settle`, taking them all.
 fn take_first() -> Option<(pdn_aprs::RefusalCode, String)> {
     let all = DEFERRED.with(|d| std::mem::take(&mut *d.borrow_mut()));
-    all.into_iter().min_by_key(|(code, _)| rank(*code))
+    all.into_iter()
+        .min_by_key(|(code, _, late)| if *late { rank(pdn_aprs::RefusalCode::DoesNotReadBack) } else { rank(*code) })
+        .map(|(code, why, _)| (code, why))
 }
 
 /// What encoding data read with stand-ins came to, settled against the reader's own refusals: the
@@ -454,7 +472,7 @@ pub fn settle<T>(result: Result<T, (pdn_aprs::RefusalCode, String)>) -> Result<T
     match (take_first(), result) {
         (None, Ok(t)) => Ok(t),
         (None, Err((code, why))) => Err((code, why, false)),
-        (Some((code, why)), Err((c, w))) if rank(c) < rank(code) && !is_size(c, &w) => {
+        (Some((code, why)), Err((c, w))) if effective_rank(c, &w) < rank(code) && !is_size(c, &w) => {
             let _ = (code, why);
             Err((c, w, false))
         }
@@ -991,6 +1009,16 @@ fn read_data(v: &Value) -> Read<Data> {
                     "third-party packets nest at most four deep".into(),
                 ));
             }
+            // Undecoded data within the four levels is `not-encodable`, first in the refusal order, before any
+            // header fault of the levels above it.
+            if let Some(last) = inner.get("packet").and_then(|p| p.get("data")) {
+                if last["type"] == "unrecognized" && last.get("reason").and_then(Value::as_str) != Some("empty") {
+                    return Err(Unreadable::Refused(
+                        pdn_aprs::RefusalCode::NotEncodable,
+                        "the inner packet's data is undecoded, and its bytes are not in the neutral form".into(),
+                    ));
+                }
+            }
             let p = o.required("packet", o.object("packet", &["source", "destination", "path", "data", "diagnostics"])?)?;
             let source = p.text("source")?;
             let source = Address::third_party_source(&source).unwrap_or_else(|_| {
@@ -1050,10 +1078,10 @@ fn read_data(v: &Value) -> Read<Data> {
                     let made = Packet::create(Address::new("N0CALL").expect("an address"), destination.clone(), Vec::new(), data.clone())
                         .map_err(|e| Unreadable::Refused(e.code(), format!("the inner packet's data: {e}")))?;
                     if made.destination != destination {
-                        return Err(Unreadable::Refused(
+                        defer_late(
                             pdn_aprs::RefusalCode::NotEncodable,
                             "the inner Mic-E data is not under the destination it computes".into(),
-                        ));
+                        );
                     }
                     made.information
                 }

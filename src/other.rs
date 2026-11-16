@@ -572,9 +572,6 @@ pub(crate) fn encode(data: &Data) -> Result<Forms, EncodeError> {
                     "third-party packets nest at most four deep, and a decoder reads no more",
                 ));
             }
-            if inner_reads_as_other_data(p) {
-                return Err(crate::readback::reads_as_other_data());
-            }
             third_party_header(p)?;
             out.push(b'}');
             out.extend_from_slice(&p.tnc2_unchecked());
@@ -588,7 +585,13 @@ pub(crate) fn encode(data: &Data) -> Result<Forms, EncodeError> {
             }
             // The inner data is held to every rule, at every depth, as top-level data is: where the
             // bytes written do not read back as it, the rule it breaks is the refusal.
-            return Ok(match inner_fault(&p.data) {
+            let fault = inner_fault(&p.data);
+            // Reading as other data under the inner header is the read-back's finding, so it comes after
+            // every rule check: a fault of the inner header or of its data beside it is named instead.
+            if inner_reads_as_other_data(p) && !fault.as_ref().is_some_and(|f| f.code().precedes(RefusalCode::TextReadsAsField)) {
+                return Err(crate::readback::reads_as_other_data());
+            }
+            return Ok(match fault {
                 Some(fault) => Forms::new(out).unless_read_back(fault),
                 None => Forms::new(out),
             });
@@ -723,10 +726,11 @@ fn inner_fault(data: &Data) -> Option<EncodeError> {
         Data::Unrecognized(_) => None,
         // A deeper inner header is judged here too, where its bytes did not read back.
         Data::ThirdParty(p) => {
-            if inner_reads_as_other_data(p) {
+            let fault = third_party_header(p).err().or_else(|| inner_fault(&p.data));
+            if inner_reads_as_other_data(p) && !fault.as_ref().is_some_and(|f| f.code().precedes(RefusalCode::TextReadsAsField)) {
                 return Some(crate::readback::reads_as_other_data());
             }
-            third_party_header(p).err().or_else(|| inner_fault(&p.data))
+            fault
         }
         // Written on its own, with its own read-back and size: the first thing that refuses it is its fault.
         other => other.seal_for(false).err(),

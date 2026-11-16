@@ -530,3 +530,14 @@ fn a_held_mic_e_report_is_not_written_under_another_mic_e_destination() {
     let built = Station::new("N0CALL").unwrap().mic_e(51.123456789, -0.5).symbol(Symbol::CAR).altitude_feet(1000.0).build().unwrap();
     assert!(built.to_tnc2().is_ok());
 }
+
+#[test]
+fn an_inner_destination_the_data_does_not_compute_is_named_after_every_rule_check() {
+    // An inner Mic-E destination that does not match is the read-back's finding: an inner header fault beside it wins.
+    let outer = Packet::decode_tnc2(b"N0CALL>APZ001:}N0CALL>S32U6T,A,B*:`(_fn\"Oj/", ParseOptions::LENIENT).unwrap();
+    let Data::ThirdParty(mut inner) = outer.data else { panic!() };
+    inner.destination = Address::new("S32U6U").unwrap();
+    assert_eq!(Data::ThirdParty(inner.clone()).encode().unwrap_err().code(), RefusalCode::NotEncodable);
+    inner.path[0].used = false;
+    assert_eq!(Data::ThirdParty(inner).encode().unwrap_err().code(), RefusalCode::InvalidThirdPartyHeader);
+}
