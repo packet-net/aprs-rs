@@ -541,3 +541,18 @@ fn an_inner_destination_the_data_does_not_compute_is_named_after_every_rule_chec
     inner.path[0].used = false;
     assert_eq!(Data::ThirdParty(inner).encode().unwrap_err().code(), RefusalCode::InvalidThirdPartyHeader);
 }
+
+#[test]
+fn a_defect_of_each_entry_is_listed_once_per_occurrence() {
+    let count = |p: &Packet, code: Code| p.diagnostics.iter().filter(|d| d.code == code).count();
+    let outer = Packet::decode_tnc2(b"N0CALL>APZ001,,A,,B:>hi", ParseOptions::LENIENT).unwrap();
+    assert_eq!(count(&outer, Code::EmptyPathEntry), 2);
+    let outer = Packet::decode_tnc2(b"N0CALL>APZ001:}G4ABC>APZ001,,A,,B:>hi", ParseOptions::LENIENT).unwrap();
+    let Data::ThirdParty(inner) = &outer.data else { panic!() };
+    assert_eq!(count(inner, Code::EmptyPathEntry), 2);
+    // A judgement about a whole is listed once: several used markers, a text's control characters.
+    let marks = Packet::decode_tnc2(b"N0CALL>APZ001,A*,B*,C*:>hi", ParseOptions::LENIENT).unwrap();
+    assert_eq!(count(&marks, Code::MultipleUsedMarkers), 1);
+    let text = Packet::decode_tnc2(b"N0CALL>APZ001:>a\x07b\x07c", ParseOptions::LENIENT).unwrap();
+    assert_eq!(count(&text, Code::ControlCharacterInText), 1);
+}
