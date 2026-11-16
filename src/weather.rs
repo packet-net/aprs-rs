@@ -345,13 +345,12 @@ pub(crate) fn write_fields(out: &mut Vec<u8>, w: &Weather, p: &mut Pending) {
     p.run(optional(out, b'p', w.rain_24h_in, 100.0, 3));
     p.run(optional(out, b'P', w.rain_midnight_in, 100.0, 3));
     if let Some(h) = w.humidity_percent {
-        // Rounded once to a whole percent: 99.7 is `h00`, and 0.4, which rounds to 0, is refused
+        // Rounded once to a whole percent: 99.7 is `h00`, and 0.4 and -0.4, which round to 0, are refused
         // since `h00` means 100.
         let original = h;
         let h = crate::steps::round(h);
         if !(1.0..=100.0).contains(&h) {
-            let code =
-                if (0.0..1.0).contains(&h) && original >= 0.0 { RefusalCode::ValueHasNoForm } else { RefusalCode::for_value(original) };
+            let code = if h == 0.0 && original > -0.5 { RefusalCode::ValueHasNoForm } else { RefusalCode::for_value(original) };
             p.note(EncodeError::new(code, "humidity must round to 1-100 percent"));
         } else {
             out.push(b'h');
