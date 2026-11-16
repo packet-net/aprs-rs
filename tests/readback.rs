@@ -343,21 +343,21 @@ fn an_inner_packet_written_on_its_own_is_read_back_by_the_outer_rules() {
 
 #[test]
 fn a_line_is_not_written_with_a_line_break_inside_its_information_field() {
-    let mut p = packet(&[]);
+    let mut p;
     for inside in [&b">bye\r\nN0CALL>APZ001:>evil"[..], b">a\rb", b">a\nb", b"\r>hi"] {
-        p.information = inside.to_vec();
+        // Decoded from those bytes, so that the data agrees with them and only the line break is at fault.
+        p = Packet::decode(me(), to(), vec![], inside, ParseOptions::LENIENT);
         assert_eq!(p.to_tnc2().unwrap_err().code(), RefusalCode::Tnc2CannotCarry, "{inside:?}");
         // A frame carries it.
         assert!(p.to_ax25().is_ok(), "{inside:?}");
     }
     // At the very end, where a decoder takes it off as a trailing line break, it ends the line anyway and is carried.
     for end in [&b">hi\r"[..], b">hi\n", b">hi\r\n"] {
-        p.information = end.to_vec();
+        p = Packet::decode(me(), to(), vec![], end, ParseOptions::LENIENT);
         assert_eq!(p.to_tnc2().unwrap(), [&b"N0CALL>APZ001:"[..], end].concat());
     }
     // A header fault is named before the line break.
-    p.information = b">a\rb".to_vec();
-    p.source = Address::third_party_source("A B").unwrap();
+    p = Packet::decode(Address::third_party_source("A B").unwrap(), to(), vec![], b">a\rb", ParseOptions::LENIENT);
     assert_eq!(p.to_tnc2().unwrap_err().code(), RefusalCode::InvalidAddress);
 }
 
@@ -555,4 +555,42 @@ fn a_defect_of_each_entry_is_listed_once_per_occurrence() {
     assert_eq!(count(&marks, Code::MultipleUsedMarkers), 1);
     let text = Packet::decode_tnc2(b"N0CALL>APZ001:>a\x07b\x07c", ParseOptions::LENIENT).unwrap();
     assert_eq!(count(&text, Code::ControlCharacterInText), 1);
+}
+
+// ------------------------------------------------------------------ a held packet whose parts disagree
+
+#[test]
+fn a_held_packet_whose_data_and_information_field_disagree_is_not_written() {
+    let decoded = |line: &[u8]| Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+    let both = |p: &Packet| (p.to_tnc2().unwrap_err().code(), p.to_ax25().unwrap_err().code());
+    let refused_as = RefusalCode::NotEncodable;
+    // The information field changed in place.
+    let mut p = decoded(b"N0CALL>APZ001:>hello");
+    p.information = b">evil".to_vec();
+    assert_eq!(both(&p), (refused_as, refused_as));
+    // The data changed in place.
+    let mut p = decoded(b"N0CALL>APZ001:>hello");
+    p.data = status("changed");
+    assert_eq!(both(&p), (refused_as, refused_as));
+    // A position's latitude changed.
+    let mut p = decoded(b"N0CALL>APZ001:!5127.26N/00058.69W>");
+    let Data::Position(report) = &mut p.data else { panic!() };
+    report.fields.position.latitude += 0.01;
+    assert_eq!(both(&p), (refused_as, refused_as));
+    // An inner packet's data and destination changed inside a held third-party packet, at depth 1 and 2.
+    let mut p = decoded(b"N0CALL>APZ001:}G4ABC>APZ001:}G4DEF>APZ001:>hi");
+    let Data::ThirdParty(inner) = &mut p.data else { panic!() };
+    inner.destination = Address::new("APZ002").unwrap();
+    assert_eq!(both(&p), (refused_as, refused_as));
+    let mut p = decoded(b"N0CALL>APZ001:}G4ABC>APZ001:}G4DEF>APZ001:>hi");
+    let Data::ThirdParty(inner) = &mut p.data else { panic!() };
+    let Data::ThirdParty(deeper) = &mut inner.data else { panic!() };
+    deeper.data = status("other");
+    assert_eq!(both(&p), (refused_as, refused_as));
+    // Unchanged, each is written as received.
+    for line in [&b"N0CALL>APZ001:>hello"[..], b"N0CALL>APZ001:}G4ABC>APZ001:}G4DEF>APZ001:>hi"] {
+        let p = decoded(line);
+        assert_eq!(p.to_tnc2().unwrap(), line);
+        assert!(p.to_ax25().is_ok());
+    }
 }

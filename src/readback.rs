@@ -125,11 +125,42 @@ pub(crate) fn seal(given: &Data, forms: Forms) -> Result<Sealed, EncodeError> {
     })
 }
 
-/// Whether an information field, read under the header it is written with, is Mic-E data where `held` is
+/// Whether an information field, read under the header it is written with, is other data than `held` (Read-back:
+/// "compared with the held data down to the level the held data reached"). It is decoded leniently under that
+/// header, as a user's decode of the written line or frame is, and compared with the held data: exactly for a
+/// packet that came from a decode (`exact`), with the read-back's rounding allowance for one the library built
+/// from data, which holds its values as given. A packet decoded under strict options is also read that way.
+/// Anything else is `not-encodable`: it would read back as other data (a Mic-E destination with the data type
+/// identifiers `` ` ``, `'`, 0x1C and 0x1D, or data, an inner header or text changed in place).
+pub(crate) fn header_reads_as_other_data(
+    source: &Address,
+    destination: &Address,
+    path: &[crate::PathEntry],
+    information: &[u8],
+    held: &Data,
+    exact: bool,
+    third_party: bool,
+) -> bool {
+    // A number that is not a number is that fault, named by the data's own check, not a destination's.
+    if has_non_finite(held) {
+        return false;
+    }
+    // An inner packet was read at a depth it no longer says: where the nesting limit cut its data off depends on it.
+    let depths = if third_party { 1..=crate::other::MAX_THIRD_PARTY_DEPTH } else { 0..=0 };
+    let reads_as_held = |options: ParseOptions, depth: usize| {
+        let mut ctx = Context::new(options);
+        ctx.depth = depth;
+        let read = crate::decode::information(&mut ctx, source, destination, path, information);
+        if exact { &read == held } else { expected(held, &read) == read }
+    };
+    !depths.into_iter().any(|depth| reads_as_held(ParseOptions::LENIENT, depth) || (exact && reads_as_held(ParseOptions::STRICT, depth)))
+}
+
+/// Where the data was just read back under a well-formed header (a built packet, an inner packet): whether the field read under the header written is Mic-E data where `held` is
 /// not, or is not where `held` is, or is another Mic-E report than `held`: the one way a header changes how bytes read (a Mic-E destination with
 /// the data type identifiers `` ` ``, `'`, 0x1C and 0x1D). Such a field paired with such a header is
 /// `not-encodable`: it would read back as other data.
-pub(crate) fn header_reads_as_other_data(
+pub(crate) fn mic_e_reads_as_other_data(
     source: &Address,
     destination: &Address,
     path: &[crate::PathEntry],
@@ -156,7 +187,7 @@ pub(crate) fn header_reads_as_other_data(
 pub(crate) fn reads_as_other_data() -> EncodeError {
     EncodeError::new(
         RefusalCode::NotEncodable,
-        "under this header the information field reads as other data (a Mic-E destination, or none)",
+        "the data and the information field disagree: under this header the information field reads as other data than the packet holds",
     )
 }
 

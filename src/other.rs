@@ -383,7 +383,7 @@ pub(crate) fn capabilities(ctx: &mut Context, info: &[u8]) -> Option<Data> {
 }
 
 /// How many third-party headers a decoder reads, one inside another.
-const MAX_THIRD_PARTY_DEPTH: usize = 4;
+pub(crate) const MAX_THIRD_PARTY_DEPTH: usize = 4;
 
 /// `}` and a whole TNC2 packet, decoded with the same options. Its source may be any 1-9
 /// printable ASCII characters other than `>` and `:` (APRS12c ch. 17); a defect its header may
@@ -710,7 +710,7 @@ fn encode_nmea(n: &Nmea) -> Result<Forms, EncodeError> {
 /// Whether an inner packet's information field reads as other data under its own header, or its Mic-E
 /// data has an inner destination that is not the one it computes (it is never written under another).
 fn inner_reads_as_other_data(p: &Packet) -> bool {
-    if crate::readback::header_reads_as_other_data(&p.source, &p.destination, &p.path, &p.information, &p.data) {
+    if crate::readback::mic_e_reads_as_other_data(&p.source, &p.destination, &p.path, &p.information, &p.data) {
         return true;
     }
     match &p.data {

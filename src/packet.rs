@@ -200,7 +200,7 @@ impl core::error::Error for EncodeError {}
 
 /// An APRS packet: the header, the information field as received, what it decodes to, and
 /// everything the decoder noticed on the way.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Packet {
     /// Who sent it.
@@ -219,6 +219,20 @@ pub struct Packet {
     /// kept as sent: an APRS-IS q-construct is read only in the outer header, so
     /// [`Packet::q_construct`] finds none here.
     pub third_party: bool,
+    /// Made by [`Packet::create`] or a builder from data it holds as given, not decoded from bytes.
+    pub(crate) built: bool,
+}
+
+impl PartialEq for Packet {
+    fn eq(&self, other: &Packet) -> bool {
+        self.source == other.source
+            && self.destination == other.destination
+            && self.path == other.path
+            && self.information == other.information
+            && self.data == other.data
+            && self.diagnostics == other.diagnostics
+            && self.third_party == other.third_party
+    }
 }
 
 impl Packet {
@@ -257,7 +271,16 @@ impl Packet {
 
     fn decode_with_context(mut ctx: Context, source: Address, destination: Address, path: Vec<PathEntry>, information: &[u8]) -> Packet {
         let data = crate::decode::information(&mut ctx, &source, &destination, &path, information);
-        Packet { source, destination, path, information: information.to_vec(), data, diagnostics: ctx.diagnostics, third_party: false }
+        Packet {
+            source,
+            destination,
+            path,
+            information: information.to_vec(),
+            data,
+            diagnostics: ctx.diagnostics,
+            third_party: false,
+            built: false,
+        }
     }
 
     /// Builds a packet from data, encoding its information field. For Mic-E data the destination
@@ -290,11 +313,11 @@ impl Packet {
         let (computed, information) = data.seal_for(bytes_first)?.into_parts();
         let destination = computed.unwrap_or(destination);
         // The field is read back under the header written, not only under the default one.
-        if crate::readback::header_reads_as_other_data(&source, &destination, &path, &information, &data) {
+        if crate::readback::mic_e_reads_as_other_data(&source, &destination, &path, &information, &data) {
             return Err(crate::readback::reads_as_other_data());
         }
         let decoded = Packet::decode(source.clone(), destination.clone(), path.clone(), &information, ParseOptions::STRICT);
-        Ok(Packet { source, destination, path, information, data, diagnostics: decoded.diagnostics, third_party: false })
+        Ok(Packet { source, destination, path, information, data, diagnostics: decoded.diagnostics, third_party: false, built: true })
     }
 
     /// Whether any diagnostic is a warning.
@@ -320,15 +343,18 @@ impl Packet {
 
     /// The packet as a TNC2 text line (without a line ending). The last used path entry is marked `*`.
     ///
-    /// The information field is read under the header written: bytes that read as other data under it (Mic-E
-    /// bytes under a plain destination, a plain field under a Mic-E destination) are `not-encodable`.
+    /// The information field is decoded under the header written and compared with the data held: when it reads as
+    /// other data (changed in place or by hand: a different latitude, text, or an inner packet's data or header at
+    /// any depth; Mic-E bytes under a plain destination; a plain field under a Mic-E destination) it is
+    /// `not-encodable`. A packet that came from a decode is compared exactly, one the library built from data with
+    /// the read-back's rounding allowance.
     ///
     /// The header is read back before it is returned, as a user's decode of a line reads it, whatever
     /// the packet's origin: an address a TNC2 header cannot carry (a third-party inner packet's source
     /// such as `PY2SP_R-R`, say) is `invalid-address`, and a path with an entry not marked used before
     /// one that is would read back with that entry used, `invalid-path`. A CR or LF inside the
-    /// information field would end the line there, so it is refused (`tnc2-cannot-carry`); one at the
-    /// very end is carried.
+    /// information field would end the line there, so it is refused (`tnc2-cannot-carry`); a trailing run of
+    /// them at the very end is carried.
     ///
     /// This writes out a packet the program already holds, so it is not an encoder: `information` is
     /// passed through as it stands (the public field, as held) and no size check is made (a decoded
@@ -348,11 +374,18 @@ impl Packet {
         Ok(out)
     }
 
-    /// The information field read under the header this packet is written with must be the kind of data the
-    /// packet holds: Mic-E bytes under a plain destination, or a plain field under a Mic-E destination, are
-    /// other data there (`not-encodable`), as when a held packet is re-addressed.
+    /// The information field read under the header this packet is written with must be the data the packet
+    /// holds (`not-encodable` when it is not), as when a held packet is re-addressed or changed in place.
     fn check_reads_as_held(&self) -> Result<(), EncodeError> {
-        if crate::readback::header_reads_as_other_data(&self.source, &self.destination, &self.path, &self.information, &self.data) {
+        if crate::readback::header_reads_as_other_data(
+            &self.source,
+            &self.destination,
+            &self.path,
+            &self.information,
+            &self.data,
+            !self.built,
+            self.third_party,
+        ) {
             return Err(crate::readback::reads_as_other_data());
         }
         Ok(())
