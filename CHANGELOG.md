@@ -1,8 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.3.0 (2026-11-16)
 
-Round 5 of the conformance vectors (pinned at abe1b50).
+Round 5 of the conformance vectors (pinned at 26dd1dd).
 
 Writing and reading back:
 
