@@ -14,7 +14,7 @@ use crate::neutral;
 
 /// What building a recipe came to.
 pub enum Outcome {
-    /// The TNC2 line built.
+    /// The TNC2 line built, or the AX.25 frame in KISS form when the recipe asks for one to be written.
     Built(Vec<u8>),
     /// The builder declined: the reason code's id, the message, and whether it was this reader that
     /// declined an input the builder cannot take (a bulletin id of two characters) rather than the builder.
@@ -683,7 +683,14 @@ fn settled(input: &Value) -> Built<Packet> {
 
 /// Builds a recipe. A quantity given in two units is built once with each, and refused with the first code
 /// in the order among those results and `value-given-twice`: never a line from one unit.
+#[allow(dead_code)] // the vectors runner writes either form itself; the dump tool builds the line first
 pub fn outcome(input: &Value) -> Outcome {
+    outcome_writing(input, false)
+}
+
+/// Builds a recipe and writes it as a TNC2 line, or as an AX.25 frame when `frame` is set; a refusal of the
+/// write is the recipe's.
+pub fn outcome_writing(input: &Value, frame: bool) -> Outcome {
     let both: Vec<(&str, &str)> = UNIT_PAIRS
         .iter()
         .copied()
@@ -708,7 +715,10 @@ pub fn outcome(input: &Value) -> Outcome {
         return Outcome::Refused(best.id().to_string(), why, by_tool);
     }
     match settled(input) {
-        Ok(p) => Outcome::Built(p.to_tnc2()),
+        Ok(p) => match if frame { p.to_ax25() } else { p.to_tnc2() } {
+            Ok(written) => Outcome::Built(written),
+            Err(e) => Outcome::Refused(e.code().id().to_string(), e.message().to_string(), false),
+        },
         Err(NotBuilt::Unsupported(why)) => Outcome::Unsupported(why),
         Err(NotBuilt::Refused(code, why)) => Outcome::Refused(code.id().to_string(), why, false),
         Err(NotBuilt::Tool(code, why)) => Outcome::Refused(code.id().to_string(), why, true),

@@ -103,7 +103,11 @@ pub(crate) fn position_report(ctx: &mut Context, info: &[u8], offset: usize) -> 
 /// the position is is judged on the position itself, under the options in force, not on anything
 /// after it (vectors README, "Timestamps that are not there").
 fn bad_timestamp(ctx: &mut Context, info: &[u8], offset: usize, messaging: bool) -> Option<Data> {
-    for at in [1, 8] {
+    // Seven bytes ending in a time indicator and an uncompressed position after them: the
+    // timestamp is garbled, whatever the bytes after the DTI would read as. A compressed
+    // position is weak evidence at either offset, so it does not take this branch.
+    let order: &[usize] = if garbled_before_uncompressed(ctx, info, offset) { &[8] } else { &[1, 8] };
+    for &at in order {
         let mut probe = Context::new(ctx.options);
         if position::decode(&mut probe, info.get(at..).unwrap_or_default(), offset + at).is_none() {
             continue;
@@ -121,6 +125,14 @@ fn bad_timestamp(ctx: &mut Context, info: &[u8], offset: usize, messaging: bool)
     }
     ctx.error(Code::MalformedTimestamp, "the timestamp is not timestamp-shaped and no position follows it (UAP 5.8)", Some(offset + 1));
     None
+}
+
+fn garbled_before_uncompressed(ctx: &Context, info: &[u8], offset: usize) -> bool {
+    if !matches!(info.get(7), Some(b'z' | b'/' | b'h')) || !info.get(8).is_some_and(u8::is_ascii_digit) {
+        return false;
+    }
+    let mut probe = Context::new(ctx.options);
+    position::decode(&mut probe, &info[8..], offset + 8).is_some()
 }
 
 /// The position body shared by position reports, objects and items: the position and symbol,

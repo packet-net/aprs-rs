@@ -10,10 +10,9 @@ use crate::RefusalCode;
 use crate::comment::{self, METRES_TO_FEET};
 use crate::context::Context;
 use crate::encode;
+use crate::readback::Forms;
 use crate::refusal::Pending;
-use crate::{
-    Address, Code, DaoPrecision, Data, EncodeError, MicEMessage, MicEReport, ParseOptions, Position, Positioned, base91, deviceid, position,
-};
+use crate::{Address, Code, DaoPrecision, Data, EncodeError, MicEMessage, MicEReport, Position, Positioned, base91, deviceid, position};
 
 /// A destination character's meaning: a latitude digit (or a blank for ambiguity), and its flag bit.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -215,43 +214,42 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
         s.drain(..4);
     }
 
-    // A grid locator and the /G symbol, then a space before any text.
+    // A grid locator and the /G symbol, then a space before any text. The space is judged on the
+    // text left once every element lifted from it is out, by the comment's own lifting (vectors
+    // interpretations.md, "Where a Mic-E locator is read"), so it stays in `s` until then.
+    let mut after_locator = false;
     if let Some(len) = locator_len(&s) {
         report.locator = Some(String::from_utf8_lossy(&s[..len]).to_ascii_uppercase());
         s.drain(..len + 2);
-        // Base-91 telemetry and a !DAO! are lifted out before the locator is read, so a locator
-        // followed straight by them alone has nothing after it (vectors interpretations.md,
-        // "Where a Mic-E locator is read").
-        let lifted = comment::without_telemetry_and_dao(&s);
-        if !lifted.is_empty() {
-            if lifted[0] == b' ' {
-                // Its space is the locator's, even with telemetry between them in the bytes; one
-                // at the very start is dropped here, the other is the comment's own delimiter.
-                if s[0] == b' ' {
-                    s.remove(0);
-                }
-            } else if !ctx.tolerate(
+        after_locator = true;
+    }
+
+    // A data extension at the start of the text (after the locator's space, which it needs), lifted
+    // before an altitude is looked for later on, so its bytes are never read as one (`0PH}` in
+    // `PHG3330PH}`); one later on is found by the comment's rules.
+    let separator = usize::from(after_locator && s.first() == Some(&b' '));
+    if let Some(len) = comment::mic_e_extension(&mut report.fields, &s[separator..]) {
+        s.drain(..separator + len);
+        if after_locator
+            && separator == 0
+            && !ctx.tolerate(
                 Code::MissingSpaceAfterLocator,
                 "text straight after the grid locator; a space comes first (APRS12c ch. 10)",
                 Some(offset),
-            ) {
-                return false;
-            }
+            )
+        {
+            return false;
         }
-    }
-
-    // A data extension at the start of the text, lifted before an altitude is looked for later
-    // on, so its bytes are never read as one (`0PH}` in `PHG3330PH}`); one later on is found by
-    // the comment's rules.
-    if let Some(len) = comment::mic_e_extension(&mut report.fields, &s) {
-        s.drain(..len);
+        after_locator = false;
     }
 
     // An altitude later in the text, when none came first: a tolerated reading. Taking it out
-    // brings the bytes either side of it together, and a !DAO! across that join is not one.
-    let mut joined = None;
+    // leaves a boundary, which no other element is read across.
+    let mut lifted = None;
     if altitude_first.is_none() {
-        if let Some(i) = (0..s.len().saturating_sub(3)).find(|&i| altitude(&s[i..]).is_some()) {
+        if let Some(i) =
+            (0..s.len().saturating_sub(3)).find(|&i| altitude(&s[i..]).is_some() && !shares_a_byte_with_an_altitude_text(&s, i))
+        {
             if ctx.allows(
                 Code::MicEAltitudeNotFirst,
                 "a Mic-E altitude after other status text instead of first (APRS12c ch. 10)",
@@ -259,17 +257,7 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
             ) {
                 report.fields.altitude_feet = altitude(&s[i..]);
                 s.drain(i..i + 4);
-                joined = Some(i);
-            } else if joins_into_altitude(&s) {
-                // Strictly the altitude is text and telemetry and the !DAO! are lifted as usual,
-                // unless what is left holds an altitude across a place one was taken from, which
-                // a lenient reader would then take: that reading is rejected (vectors README, Mic-E).
-                ctx.error(
-                    Code::MicEAltitudeNotFirst,
-                    "lifting telemetry and the !DAO! would join the status text into a Mic-E altitude (APRS12c ch. 10)",
-                    Some(offset + i),
-                );
-                return false;
+                lifted = Some(i);
             }
         }
     }
@@ -277,7 +265,7 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
     // A `/A=` in the text wins over the Mic-E bytes, even when it says the same: whether the text
     // gave one is seen by letting it write into an empty field.
     report.fields.altitude_feet = None;
-    let ok = comment::tail(ctx, &mut report.fields, &s, offset, joined);
+    let ok = comment::tail(ctx, &mut report.fields, &s, offset, lifted, after_locator);
     report.altitude_in_comment = report.fields.altitude_feet.is_some();
     if !report.altitude_in_comment {
         report.fields.altitude_feet = altitude_before;
@@ -285,22 +273,12 @@ fn status(ctx: &mut Context, report: &mut MicEReport, bytes: &[u8], offset: usiz
     ok
 }
 
-/// Whether the text left once base-91 telemetry and the `!DAO!` are lifted out of `s` holds a
-/// Mic-E altitude, `xxx}`, across a place one was taken from.
-fn joins_into_altitude(s: &[u8]) -> bool {
-    let mut rest = s.to_vec();
-    let mut joins = Vec::new();
-    // Spans come last first, so each join's place in what is left is its span's start less the
-    // lengths of the spans before it, taken out later.
-    let spans = comment::telemetry_and_dao_spans(s);
-    for r in &spans {
-        rest.drain(r.clone());
-    }
-    for r in &spans {
-        let before: usize = spans.iter().filter(|o| o.start < r.start).map(|o| o.len()).sum();
-        joins.push(r.start - before);
-    }
-    joins.iter().any(|&join| (join.saturating_sub(3)..join).any(|j| altitude(&rest[j..]).is_some()))
+/// Whether the four bytes at `i` share a byte with a `/A=` altitude that stands whole in `s`
+/// (`/A=` and six digits, or `-` and five). The search for a later Mic-E altitude never uses such
+/// bytes, as it never uses a locator's or a data extension's (vectors README, Mic-E).
+fn shares_a_byte_with_an_altitude_text(s: &[u8], i: usize) -> bool {
+    // A 9-byte `/A=` that overlaps `i..i + 4` starts between `i - 8` and `i + 3`.
+    (i.saturating_sub(8)..i + 4).any(|j| comment::is_whole_altitude_text(s.get(j..j + 9)))
 }
 
 /// A Mic-E altitude, `xxx}`, at the start of `s`, in feet.
@@ -332,9 +310,10 @@ fn locator_len(s: &[u8]) -> Option<usize> {
 // ------------------------------------------------------------------ encoding
 
 /// The destination address and information field for a Mic-E report. An altitude goes in the
-/// Mic-E altitude bytes (whole metres) unless the report says it is in the comment, as `/A=` feet
-/// (vectors README, Builder rules).
-pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> {
+/// Mic-E altitude bytes (whole metres) unless the report says it is in the comment, as `/A=` feet,
+/// or `altitude_text` asks for the `/A=` form, or (not `bytes_first`) only a `/A=` holds it exactly
+/// (vectors README, Read-back and Encoding). `bytes_first` is a builder's say-so, not a mark on the data.
+pub(crate) fn forms(r: &MicEReport, altitude_text: bool, bytes_first: bool) -> Result<Forms, EncodeError> {
     let f = &r.fields;
     let mut pend = Pending::default();
     pend.run(position::check_symbol(f.symbol));
@@ -527,7 +506,7 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
     // six digits that the bytes do not hold exactly (vectors README, Encoding).
     let mut altitude_in_text = None;
     if let Some(feet) = f.altitude_feet {
-        if r.altitude_in_comment || only_a_text_altitude_holds(feet) {
+        if r.altitude_in_comment || altitude_text || (!bytes_first && only_a_text_altitude_holds(feet)) {
             altitude_in_text = Some(feet);
         } else {
             let metres = crate::steps::round(feet / METRES_TO_FEET);
@@ -693,18 +672,16 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
         // Mic-E altitude (`1{5}`), where `/` would join them too (vectors README, Encoding).
         &[b"", b"/", b" "]
     };
-    // The size and the read-back are judged on the bytes written, so they come before the fault is
-    // named.
+    // A CR or LF at the end (the last byte of Rev 0 telemetry, say) reads back as a trailing line
+    // break, a warning.
     let mut late = None;
-    let mut read_back = false;
+    let mut candidates: Vec<Vec<u8>> = Vec::with_capacity(separators.len());
     for separator in separators {
         out.truncate(text_at);
         out.extend_from_slice(separator);
         out.extend_from_slice(text);
         out.extend_from_slice(&trailer);
         out.extend_from_slice(suffix);
-        // A CR or LF at the end (the last byte of Rev 0 telemetry, say) reads back as a
-        // trailing line break, a warning.
         if matches!(out.last(), Some(b'\r' | b'\n')) {
             late = Some(EncodeError::new(
                 RefusalCode::InvalidCharacter,
@@ -712,37 +689,29 @@ pub(crate) fn encode(r: &MicEReport) -> Result<(Address, Vec<u8>), EncodeError> 
             ));
             break;
         }
-        if reads_back(r, &out[status_start..]) {
-            read_back = true;
-            break;
-        }
-    }
-    if !read_back && late.is_none() {
-        // Nothing reads back: the size is of the first form written.
-        out.truncate(text_at);
-        out.extend_from_slice(separators[0]);
-        out.extend_from_slice(text);
-        out.extend_from_slice(&trailer);
-        out.extend_from_slice(suffix);
+        candidates.push(out.clone());
     }
     pend.finish_faults()?;
     if let Some(e) = late {
         return Err(e);
     }
-    if !read_back {
-        return Err(EncodeError::new(
-            RefusalCode::TextReadsAsField,
-            "the status text does not read back as given: a device suffix the database does not know, or text that decodes as a structured element; set the property instead",
-        ));
-    }
     let destination =
         Address::new(&dest).map_err(|_| EncodeError::new(RefusalCode::InvalidAddress, "the Mic-E destination is not an address"))?;
-    crate::refusal::check_size(out.len())?;
-    Ok((destination, out))
+    let mut candidates = candidates.into_iter();
+    let first = candidates.next().unwrap_or_default();
+    Ok(candidates.fold(Forms::new(first), Forms::then).to(destination))
+}
+
+/// Whether an altitude in the Mic-E bytes could also be written as a `/A=` that holds it exactly, the form
+/// to try when the bytes do not read back. Neutral data whose altitude only a `/A=` holds has had it first;
+/// a builder (`bytes_first`) has had the bytes first whatever the value.
+pub(crate) fn altitude_has_text_form(r: &MicEReport, bytes_first: bool) -> bool {
+    !r.altitude_in_comment
+        && r.fields.altitude_feet.is_some_and(|feet| (bytes_first || !only_a_text_altitude_holds(feet)) && whole_feet_in_six_digits(feet))
 }
 
 /// A whole number of feet (within 1e-6) that a `/A=` can write: six digits, or `-` and five.
-fn whole_feet_in_six_digits(feet: f64) -> bool {
+pub(crate) fn whole_feet_in_six_digits(feet: f64) -> bool {
     let n = crate::steps::round(feet);
     (feet - n).abs() <= 1e-6 && (-99_999.0..=999_999.0).contains(&n)
 }
@@ -754,37 +723,4 @@ fn only_a_text_altitude_holds(feet: f64) -> bool {
     let n = crate::steps::round(metres);
     let in_bytes = (metres - n).abs() <= 1e-6 && (-10_000.0..=743_570.0).contains(&n);
     whole_feet_in_six_digits(feet) && !in_bytes
-}
-
-fn reads_back(r: &MicEReport, status_bytes: &[u8]) -> bool {
-    let mut ctx = Context::new(ParseOptions::LENIENT);
-    let mut back = MicEReport { fields: Positioned { symbol: r.fields.symbol, ..Positioned::default() }, ..MicEReport::default() };
-    if !status(&mut ctx, &mut back, status_bytes, 0) || ctx.has_errors() {
-        return false;
-    }
-    let (a, b) = (&back.fields, &r.fields);
-    let close = |x: Option<f64>, y: Option<f64>| match (x, y) {
-        (None, None) => true,
-        (Some(x), Some(y)) => crate::steps::same_number(x, y),
-        _ => false,
-    };
-    let freq = |v: &Option<crate::VoiceFrequency>| v.as_ref().map(|x| (x.tone, x.tone_value, x.offset_khz, x.range, x.range_km, x.narrow));
-    back.type_code == r.type_code
-        && back.legacy_telemetry == r.legacy_telemetry
-        && back.device_suffix == r.device_suffix
-        && back.locator.as_deref().map(str::to_ascii_uppercase) == r.locator.as_deref().map(str::to_ascii_uppercase)
-        && a.comment == b.comment
-        && a.phg == b.phg
-        && a.dfs == b.dfs
-        && a.telemetry == b.telemetry
-        && a.dao.map(|d| d.datum) == b.dao.map(|d| d.datum)
-        && freq(&a.frequency) == freq(&b.frequency)
-        // A /A= altitude is whole feet, rounded as a position's is; one in the Mic-E bytes is whole metres.
-        && if back.altitude_in_comment {
-            close(a.altitude_feet, b.altitude_feet) || a.altitude_feet.map(crate::steps::round) == b.altitude_feet.map(crate::steps::round)
-        } else {
-            let metres = |v: Option<f64>| v.map(|f| crate::steps::round(f / METRES_TO_FEET));
-            metres(a.altitude_feet) == metres(b.altitude_feet)
-        }
-        && a.range_miles.map(crate::steps::round) == b.range_miles.map(crate::steps::round)
 }

@@ -9,11 +9,12 @@ use alloc::vec::Vec;
 
 use crate::RefusalCode;
 use crate::context::Context;
+use crate::readback::Forms;
 use crate::refusal::Pending;
 use crate::weather;
 use crate::{
-    AgreloDf, Capabilities, Code, Data, EncodeError, Footprint, MaidenheadBeacon, Nmea, Packet, ParseOptions, Query, RawWeather,
-    RawWeatherFormat, TestData, Timestamp, UserDefined, Weather, WeatherReport, status, telemetry, text,
+    AgreloDf, Capabilities, Code, Data, EncodeError, Footprint, MaidenheadBeacon, Nmea, Packet, Query, RawWeather, RawWeatherFormat,
+    TestData, Timestamp, UserDefined, Weather, WeatherReport, status, telemetry, text,
 };
 
 pub(crate) fn raw_weather(ctx: &mut Context, info: &[u8], format: RawWeatherFormat, skip: usize) -> Option<Data> {
@@ -382,7 +383,7 @@ pub(crate) fn capabilities(ctx: &mut Context, info: &[u8]) -> Option<Data> {
 }
 
 /// How many third-party headers a decoder reads, one inside another.
-const MAX_THIRD_PARTY_DEPTH: usize = 4;
+pub(crate) const MAX_THIRD_PARTY_DEPTH: usize = 4;
 
 /// `}` and a whole TNC2 packet, decoded with the same options. Its source may be any 1-9
 /// printable ASCII characters other than `>` and `:` (APRS12c ch. 17); a defect its header may
@@ -425,17 +426,18 @@ pub(crate) fn agrelo(ctx: &mut Context, info: &[u8]) -> Option<Data> {
 
 // ------------------------------------------------------------------ encoding
 
-pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
+pub(crate) fn encode(data: &Data) -> Result<Forms, EncodeError> {
     let printable = |t: &str, what: &str| -> Result<(), EncodeError> {
         if crate::text::has_control_character(t.as_bytes()) {
             return Err(EncodeError::new(RefusalCode::InvalidCharacter, format!("{what} cannot contain a control character")));
         }
         Ok(())
     };
-    // Test data is data, not text: only a line break would not read back.
+    // Test data is data, not text: only a line break at its end would not read back (one inside is
+    // written, and a line carrying it is refused when the line is written).
     let test_data = |t: &str| -> Result<(), EncodeError> {
-        if crate::text::has_line_break(t.as_bytes()) {
-            return Err(EncodeError::new(RefusalCode::InvalidCharacter, "test data cannot contain a line break"));
+        if matches!(t.as_bytes().last(), Some(b'\r' | b'\n')) {
+            return Err(EncodeError::new(RefusalCode::InvalidCharacter, "test data cannot end with a line break"));
         }
         Ok(())
     };
@@ -471,17 +473,6 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             p.run(weather::field(&mut out, b's', w.weather.wind_speed_mph, 3, false));
             weather::write_fields(&mut out, &w.weather, &mut p);
             p.finish_faults()?;
-            // The software type and unit, and the extra fields, must not read back as fields.
-            match positionless_weather(&mut Context::new(ParseOptions::LENIENT), &out) {
-                Some(Data::Weather(back)) if weather::text_parts(&back.weather) == weather::text_parts(&w.weather) => {}
-                _ => {
-                    return Err(EncodeError::new(
-                        RefusalCode::TextReadsAsField,
-                        "the weather does not read back as given: a software type and unit, or an extra field, that would read as weather fields",
-                    ));
-                }
-            }
-            crate::refusal::check_size(out.len())?;
         }
         Data::RawWeather(r) => {
             if !text::is_printable_ascii(r.data.as_bytes()) {
@@ -506,8 +497,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             out.extend_from_slice(m.locator.as_bytes());
             out.push(b']');
             out.extend_from_slice(m.comment.as_bytes());
-            p.size(out.len());
-            p.finish()?;
+            p.finish_faults()?;
         }
         Data::Query(q) => {
             let mut p = Pending::default();
@@ -531,8 +521,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                 let longitude = p.run(footprint_text(f.longitude, &f.longitude_text, 180.0, "longitude")).unwrap_or_default();
                 out.extend_from_slice(format!("{latitude},{longitude},{:04}", radius as u32).as_bytes());
             }
-            p.size(out.len());
-            p.finish()?;
+            p.finish_faults()?;
         }
         Data::Capabilities(c) => {
             if c.capabilities.is_empty() {
@@ -567,8 +556,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                 })
                 .collect();
             out.extend_from_slice(items.join(",").as_bytes());
-            p.size(out.len());
-            p.finish()?;
+            p.finish_faults()?;
         }
         Data::ThirdParty(p) => {
             // Counted by walking the chain, not by recursing: a caller can build one thousands deep.
@@ -586,7 +574,7 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
             }
             third_party_header(p)?;
             out.push(b'}');
-            out.extend_from_slice(&p.to_tnc2());
+            out.extend_from_slice(&p.tnc2_unchecked());
             // The information field is written as received; only a line break at its very end
             // would not read back.
             if matches!(out.last(), Some(b'\r' | b'\n')) {
@@ -595,10 +583,18 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
                     "a third-party packet's information field cannot end with a line break",
                 ));
             }
-            // The limit is on the outermost field: the `}`, the inner header and the inner field.
-            let mut size = Pending::default();
-            size.size(out.len());
-            size.finish()?;
+            // The inner data is held to every rule, at every depth, as top-level data is: where the
+            // bytes written do not read back as it, the rule it breaks is the refusal.
+            let fault = inner_fault(&p.data);
+            // Reading as other data under the inner header is the read-back's finding, so it comes after
+            // every rule check: a fault of the inner header or of its data beside it is named instead.
+            if inner_reads_as_other_data(p) && !fault.as_ref().is_some_and(|f| f.code().precedes(RefusalCode::TextReadsAsField)) {
+                return Err(crate::readback::reads_as_other_data());
+            }
+            return Ok(match fault {
+                Some(fault) => Forms::new(out).unless_read_back(fault),
+                None => Forms::new(out),
+            });
         }
         Data::UserDefined(u) => {
             // APRS12c ch. 19 puts no restriction on user-defined data, these two characters
@@ -635,17 +631,13 @@ pub(crate) fn encode(data: &Data) -> Result<Vec<u8>, EncodeError> {
         Data::Unrecognized(_) => return Err(EncodeError::new(RefusalCode::NotEncodable, "undecoded data has nothing to encode")),
         _ => return Err(EncodeError::new(RefusalCode::NotEncodable, "not one of the other data types")),
     }
-    // Whatever the data, the information field is at most 256 bytes.
-    let mut size = Pending::default();
-    size.size(out.len());
-    size.finish()?;
-    Ok(out)
+    Ok(Forms::new(out))
 }
 
 /// `$`, the sentence and its comment, when they read back as given: the sentence well formed,
 /// its checksum (if any) right and ending it, a comment only after a checksum, and every field
 /// given agreeing with what the sentence says.
-fn encode_nmea(n: &Nmea) -> Result<Vec<u8>, EncodeError> {
+fn encode_nmea(n: &Nmea) -> Result<Forms, EncodeError> {
     let mut p = Pending::default();
     let sentence = n.sentence.as_bytes();
     for value in [n.latitude, n.longitude, n.course_degrees, n.speed_knots, n.altitude_m].into_iter().flatten() {
@@ -707,13 +699,42 @@ fn encode_nmea(n: &Nmea) -> Result<Vec<u8>, EncodeError> {
             }
         }
     }
-    p.size(1 + sentence.len() + n.comment.len());
-    p.finish()?;
+    p.finish_faults()?;
     let mut out = Vec::with_capacity(1 + sentence.len() + n.comment.len());
     out.push(b'$');
     out.extend_from_slice(sentence);
     out.extend_from_slice(n.comment.as_bytes());
-    Ok(out)
+    Ok(Forms::new(out))
+}
+
+/// Whether an inner packet's information field reads as other data under its own header, or its Mic-E
+/// data has an inner destination that is not the one it computes (it is never written under another).
+fn inner_reads_as_other_data(p: &Packet) -> bool {
+    if crate::readback::mic_e_reads_as_other_data(&p.source, &p.destination, &p.path, &p.information, &p.data) {
+        return true;
+    }
+    match &p.data {
+        Data::MicE(_) => p.data.seal_for(false).ok().and_then(|s| s.into_parts().0).is_some_and(|computed| computed != p.destination),
+        _ => false,
+    }
+}
+
+/// The first rule an inner packet's data breaks, as the encoder would refuse it on its own: none for
+/// undecoded data, which has no neutral form and is written as received.
+fn inner_fault(data: &Data) -> Option<EncodeError> {
+    match data {
+        Data::Unrecognized(_) => None,
+        // A deeper inner header is judged here too, where its bytes did not read back.
+        Data::ThirdParty(p) => {
+            let fault = third_party_header(p).err().or_else(|| inner_fault(&p.data));
+            if inner_reads_as_other_data(p) && !fault.as_ref().is_some_and(|f| f.code().precedes(RefusalCode::TextReadsAsField)) {
+                return Some(crate::readback::reads_as_other_data());
+            }
+            fault
+        }
+        // Written on its own, with its own read-back and size: the first thing that refuses it is its fault.
+        other => other.seal_for(false).err(),
+    }
 }
 
 /// Checks that a third-party packet's header can be written so that it reads back the same: the

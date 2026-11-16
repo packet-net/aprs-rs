@@ -1,0 +1,596 @@
+//! The read-back guarantee, through the public API: what an encoder writes reads back as the data it
+//! was given, in an equivalent form where the first does not, or the data is refused; and the header
+//! it writes reads back as the header it was given.
+
+use pdn_aprs::*;
+
+fn position(comment: &str) -> Positioned {
+    Positioned {
+        position: Position { latitude: 51.5, longitude: -0.5, ambiguity: 0 },
+        symbol: Symbol::new('/', '>'),
+        comment: comment.into(),
+        ..Default::default()
+    }
+}
+
+fn written(data: Data) -> String {
+    String::from_utf8(data.encode().unwrap()).unwrap()
+}
+
+fn refused(data: Data) -> RefusalCode {
+    data.encode().unwrap_err().code()
+}
+
+fn status(text: &str) -> Data {
+    Data::Status(Status { text: text.into(), ..Default::default() })
+}
+
+fn me() -> Address {
+    Address::new("N0CALL").unwrap()
+}
+
+fn to() -> Address {
+    Address::new("APZ001").unwrap()
+}
+
+// ------------------------------------------------------------------ the first form that does not read back
+
+#[test]
+fn a_comment_that_reads_as_a_data_extension_is_written_after_a_slash() {
+    // `088/036` straight after the symbol is a course and speed; after a `/` it is text.
+    let text = "088/036";
+    assert_eq!(written(Data::Position(PositionReport { fields: position(text), ..Default::default() })), "!5130.00N/00030.00W>/088/036");
+    let object =
+        ObjectReport { name: "OBJ".into(), timestamp: Some(Timestamp::dhm(1, 2, 3)), fields: position(text), ..Default::default() };
+    assert_eq!(written(Data::Object(object)), ";OBJ      *010203z5130.00N/00030.00W>/088/036");
+    let item = ItemReport { name: "ITEM".into(), fields: position(text), ..Default::default() };
+    assert_eq!(written(Data::Item(item)), ")ITEM!5130.00N/00030.00W>/088/036");
+}
+
+#[test]
+fn a_comment_no_form_holds_is_refused_by_every_positioned_report() {
+    for text in ["/A=000100", "PHG5130", "RNG0050", "hello /A=000100", "|!!!!!!!!!!!!|"] {
+        let object =
+            ObjectReport { name: "OBJ".into(), timestamp: Some(Timestamp::dhm(1, 2, 3)), fields: position(text), ..Default::default() };
+        let item = ItemReport { name: "ITEM".into(), fields: position(text), ..Default::default() };
+        for data in
+            [Data::Position(PositionReport { fields: position(text), ..Default::default() }), Data::Object(object), Data::Item(item)]
+        {
+            assert_eq!(refused(data), RefusalCode::TextReadsAsField, "{text}");
+        }
+    }
+}
+
+#[test]
+fn text_that_reads_as_another_report_is_refused() {
+    let message = |text: &str| Data::Message(Message { addressee: "N0CALL".into(), text: text.into(), ..Default::default() });
+    assert_eq!(refused(message("ack12")), RefusalCode::TextReadsAsField);
+    assert_eq!(refused(message("rej12")), RefusalCode::TextReadsAsField);
+    let bulletin = Data::Bulletin(Bulletin { addressee: "BLN1".into(), text: "ack12".into(), message_id: None });
+    assert_eq!(refused(bulletin), RefusalCode::TextReadsAsField);
+    for text in ["251830z", "IO91SX/G", "hello ^7A"] {
+        assert_eq!(refused(status(text)), RefusalCode::TextReadsAsField, "{text}");
+    }
+}
+
+#[test]
+fn a_mic_e_comment_that_reads_as_an_altitude_is_refused() {
+    let report = |comment: &str| {
+        let fields = Positioned { comment: comment.into(), speed_knots: Some(10.0), course_degrees: Some(90.0), ..position("") };
+        let r = MicEReport { type_code: Some('`'), fields, ..Default::default() };
+        Packet::create(me(), to(), vec![], Data::MicE(r))
+    };
+    for text in ["abc}def", "/A=000100", "PHG5130"] {
+        assert_eq!(report(text).unwrap_err().code(), RefusalCode::TextReadsAsField, "{text}");
+    }
+    assert!(report("hello").is_ok());
+}
+
+#[test]
+fn a_third_party_packet_whose_information_is_not_its_data_is_refused() {
+    // The inner information field is written as received, so data changed after the decode is caught by the read-back.
+    let mut inner = Packet::decode_tnc2(b"G4ABC>APZ001:>hi", ParseOptions::LENIENT).unwrap();
+    inner.information = b">ho".to_vec();
+    let outer = Data::ThirdParty(Box::new(inner));
+    assert_eq!(refused(outer), RefusalCode::TextReadsAsField);
+    // Not text: the inner position written is not the one given.
+    let mut inner = Packet::decode_tnc2(b"G4ABC>APZ001:!5127.26N/00058.69W>", ParseOptions::LENIENT).unwrap();
+    inner.information = b"!5127.27N/00058.69W>".to_vec();
+    assert_eq!(refused(Data::ThirdParty(Box::new(inner))), RefusalCode::DoesNotReadBack);
+}
+
+#[test]
+fn a_third_party_packet_is_checked_whole_and_its_inner_diagnostics_are_data() {
+    // An inner packet that decodes with a warning writes back as received: its warning is in the data given.
+    let line = b"N0CALL>APZ001:}G4ABC>APZ001,TCPIP,N0CALL*:>Net \x07Control";
+    let packet = Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+    assert_eq!(packet.data.encode().unwrap(), &line[line.iter().position(|&b| b == b':').unwrap() + 1..]);
+    // The same data with the warning taken off the inner packet is not what the bytes read back as; its text
+    // holds a control character, which the inner data's own rule names first, as it does for data on its own.
+    let Data::ThirdParty(mut inner) = packet.data else { panic!() };
+    inner.diagnostics.clear();
+    assert_eq!(refused(Data::ThirdParty(inner)), RefusalCode::InvalidCharacter);
+}
+
+#[test]
+fn an_inner_warning_the_written_bytes_do_not_carry_has_no_form() {
+    // Inner text with no control character, given a warning that only a control character raises: the
+    // bytes written read back without it, and no form of the inner packet carries it.
+    let warned = Packet::decode_tnc2(b"G4ABC>APZ001:>Net \x07Control", ParseOptions::LENIENT).unwrap();
+    assert!(warned.has_warnings());
+    let mut inner = Packet::decode_tnc2(b"G4ABC>APZ001:>hi", ParseOptions::LENIENT).unwrap();
+    inner.diagnostics = warned.diagnostics.clone();
+    assert_eq!(refused(Data::ThirdParty(Box::new(inner.clone()))), RefusalCode::ValueHasNoForm);
+    // At every depth.
+    let mut middle = Packet::decode_tnc2(b"G4ABC>APZ001:}G4ABC>APZ001:>hi", ParseOptions::LENIENT).unwrap();
+    let Data::ThirdParty(deepest) = &mut middle.data else { panic!() };
+    deepest.diagnostics = warned.diagnostics;
+    assert_eq!(refused(Data::ThirdParty(Box::new(middle))), RefusalCode::ValueHasNoForm);
+}
+
+#[test]
+fn inner_data_is_held_to_every_rule_at_every_depth() {
+    // A value no rule lets through, in inner data changed after the decode, is that rule's refusal, not a failed read-back.
+    let mut inner = Packet::decode_tnc2(b"G4ABC>APZ001:!5127.26N/00058.69W>", ParseOptions::LENIENT).unwrap();
+    let Data::Position(report) = &mut inner.data else { panic!() };
+    report.fields.position.latitude = f64::NAN;
+    assert_eq!(refused(Data::ThirdParty(Box::new(inner.clone()))), RefusalCode::NotANumber);
+    let Data::Position(report) = &mut inner.data else { panic!() };
+    report.fields.position.latitude = 91.0;
+    assert_eq!(refused(Data::ThirdParty(Box::new(inner.clone()))), RefusalCode::ValueOutOfRange);
+    let mut outer = Packet::decode_tnc2(b"G4ABC>APZ001:}G4ABC>APZ001:!5127.26N/00058.69W>", ParseOptions::LENIENT).unwrap();
+    let Data::ThirdParty(deepest) = &mut outer.data else { panic!() };
+    let Data::Position(report) = &mut deepest.data else { panic!() };
+    report.fields.course_degrees = Some(f64::INFINITY);
+    assert_eq!(refused(Data::ThirdParty(Box::new(outer))), RefusalCode::NotANumber);
+}
+
+#[test]
+fn what_is_written_over_256_bytes_is_read_back_first() {
+    // Text the size would refuse is judged by what it reads back as first.
+    assert_eq!(refused(status(&format!("251830z{}", "x".repeat(300)))), RefusalCode::TextReadsAsField);
+    assert_eq!(refused(status(&"x".repeat(300))), RefusalCode::InformationFieldTooLong);
+}
+
+// ------------------------------------------------------------------ empty is absent
+
+#[test]
+fn an_empty_message_id_and_an_empty_target_are_absent() {
+    let message = Message { addressee: "N0CALL".into(), text: "hi".into(), message_id: Some(String::new()), reply_ack: None };
+    assert_eq!(written(Data::Message(message)), ":N0CALL   :hi");
+    let query = DirectedQuery { addressee: "N0CALL".into(), query_type: "APRSP".into(), target: Some(String::new()) };
+    assert_eq!(written(Data::DirectedQuery(query)), ":N0CALL   :?APRSP");
+    // An empty reply-ack is a value, and goes with a message ID.
+    let reply = Message { addressee: "N0CALL".into(), text: "hi".into(), message_id: Some("12".into()), reply_ack: Some(String::new()) };
+    assert_eq!(written(Data::Message(reply)), ":N0CALL   :hi{12}");
+}
+
+// ------------------------------------------------------------------ the header
+
+fn path(entries: &[(&str, bool)]) -> Vec<PathEntry> {
+    entries.iter().map(|(a, used)| PathEntry { address: Address::new(a).unwrap(), used: *used }).collect()
+}
+
+fn packet(entries: &[(&str, bool)]) -> Packet {
+    Packet::create(me(), to(), path(entries), status("hi")).unwrap()
+}
+
+#[test]
+fn a_tnc2_line_marks_the_last_used_entry_only() {
+    let p = packet(&[("WIDE1-1", true), ("N0CALL-1", true), ("WIDE2-1", false)]);
+    assert_eq!(p.to_tnc2().unwrap(), b"N0CALL>APZ001,WIDE1-1,N0CALL-1*,WIDE2-1:>hi");
+    let read = Packet::decode_tnc2(&p.to_tnc2().unwrap(), ParseOptions::STRICT).unwrap();
+    assert_eq!(read.path, p.path);
+}
+
+#[test]
+fn an_ax25_frame_sets_the_h_bit_of_every_used_entry() {
+    let p = packet(&[("WIDE1-1", true), ("N0CALL-1", true), ("WIDE2-1", false)]);
+    let frame = p.to_ax25().unwrap();
+    let hex: String = frame.iter().map(|b| format!("{b:02X}")).collect();
+    assert_eq!(hex, "82A0B4606062E09C608682989860AE92888A6240E29C6086829898E2AE92888A64406303F03E6869");
+}
+
+#[test]
+fn a_path_entry_not_used_before_a_used_one_cannot_be_carried() {
+    // The header is judged when it is given, in every form, before any fault in the data: `invalid-path`.
+    let unwritable = path(&[("WIDE1-1", false), ("N0CALL-1", true)]);
+    assert_eq!(Packet::create(me(), to(), unwritable.clone(), status("hi")).unwrap_err().code(), RefusalCode::InvalidPath);
+    let bad_name = Data::Item(pdn_aprs::ItemReport { name: "TOOLONGNAMEX".into(), ..Default::default() });
+    assert_eq!(Packet::create(me(), to(), unwritable.clone(), bad_name).unwrap_err().code(), RefusalCode::InvalidPath);
+    // An address no header carries is named before the path.
+    let mut bad = packet(&[]);
+    bad.source = Address::third_party_source("A B").unwrap();
+    bad.path = unwritable;
+    assert_eq!(bad.to_tnc2().unwrap_err().code(), RefusalCode::InvalidAddress);
+    assert_eq!(bad.to_ax25().unwrap_err().code(), RefusalCode::InvalidAddress);
+    // A call a frame cannot carry is built, written in a line, and refused only when the frame is written.
+    let nine = Packet::create(Address::new("N0CALLXYZ").unwrap(), to(), Vec::new(), status("hi")).unwrap();
+    assert_eq!(nine.to_tnc2().unwrap(), b"N0CALLXYZ>APZ001:>hi");
+    assert_eq!(nine.to_ax25().unwrap_err().code(), RefusalCode::Ax25CannotCarry);
+    // A path with no used entry, and one with a used first entry, are written.
+    assert_eq!(packet(&[("WIDE1-1", false), ("WIDE2-1", false)]).to_tnc2().unwrap(), b"N0CALL>APZ001,WIDE1-1,WIDE2-1:>hi");
+    assert_eq!(packet(&[("N0CALL-1", true), ("WIDE2-1", false)]).to_tnc2().unwrap(), b"N0CALL>APZ001,N0CALL-1*,WIDE2-1:>hi");
+}
+
+#[test]
+fn the_header_of_a_decoded_packet_is_checked_when_it_is_written_out() {
+    // The information field passes through as received; the header is read back.
+    let mut p = Packet::decode_tnc2(b"N0CALL>APZ001,WIDE1-1*,WIDE2-1:>hi", ParseOptions::LENIENT).unwrap();
+    assert_eq!(p.to_tnc2().unwrap(), b"N0CALL>APZ001,WIDE1-1*,WIDE2-1:>hi");
+    p.path[0].used = false;
+    p.path[1].used = true;
+    assert_eq!(p.to_tnc2().unwrap_err().code(), RefusalCode::InvalidPath);
+    assert_eq!(p.to_ax25().unwrap_err().code(), RefusalCode::InvalidPath);
+    // An empty destination, tolerated on the way in, is written as it came: the line reads back with the same empty destination.
+    let empty = Packet::decode_tnc2(b"N0CALL>:>hi", ParseOptions::LENIENT).unwrap();
+    assert_eq!(empty.to_tnc2().unwrap(), b"N0CALL>:>hi");
+    // A source that is not an address does not read back as the same header.
+    let mut bad = Packet::decode_tnc2(b"N0CALL>APZ001:>hi", ParseOptions::LENIENT).unwrap();
+    bad.source = Address::third_party_source("A_B").unwrap();
+    assert_eq!(bad.to_tnc2().unwrap_err().code(), RefusalCode::InvalidAddress);
+}
+
+#[test]
+fn a_station_path_entry_ending_in_a_star_is_a_used_entry() {
+    let station = Station::new("N0CALL").unwrap().via(&["WIDE1-1*", "N0CALL-1*", "WIDE2-1"]).unwrap();
+    assert_eq!(station.path(), path(&[("WIDE1-1", true), ("N0CALL-1", true), ("WIDE2-1", false)]).as_slice());
+    let built = station.status("hi").build().unwrap();
+    assert_eq!(built.to_tnc2().unwrap(), b"N0CALL>APZ001,WIDE1-1,N0CALL-1*,WIDE2-1:>hi");
+    assert!(Station::new("N0CALL").unwrap().via(&["*"]).is_err());
+    assert!(Station::new("N0CALL").unwrap().via(&["WIDE1-1**"]).is_err());
+}
+
+#[test]
+fn an_ax25_h_bit_marks_every_entry_before_it_used() {
+    let heard =
+        Packet::decode_ax25(&hex("82A0B4606062E09C608682989860AE92888A6240629C6086829898E303F03E78"), ParseOptions::LENIENT).unwrap();
+    assert!(heard.diagnostics.is_empty());
+    assert_eq!(heard.path.iter().map(|e| e.used).collect::<Vec<_>>(), [true, true]);
+    assert_eq!(heard.to_tnc2().unwrap(), b"N0CALL>APZ001,WIDE1-1,N0CALL-1*:>x");
+}
+
+#[test]
+fn an_empty_destination_is_never_written_to_a_frame() {
+    // A line carries it as received; a frame never carries what AX.25 forbids.
+    let line = Packet::decode_tnc2(b"N0CALL>:>x", ParseOptions::LENIENT).unwrap();
+    assert_eq!(line.to_ax25().unwrap_err().code(), RefusalCode::Ax25CannotCarry);
+    // A frame that came with six spaces is read as an empty destination, which a line carries.
+    let packet = Packet::decode_ax25(&hex("404040404040E09C60868298986103F03E78"), ParseOptions::LENIENT).unwrap();
+    assert_eq!(packet.to_tnc2().unwrap(), b"N0CALL>:>x");
+    assert_eq!(packet.to_ax25().unwrap_err().code(), RefusalCode::Ax25CannotCarry);
+}
+
+#[test]
+fn a_builders_empty_message_id_is_refused() {
+    let station = pdn_aprs::Station::new("N0CALL").unwrap();
+    assert_eq!(station.message("N0CALL", "hi").message_id("").build().unwrap_err().code(), RefusalCode::InvalidMessageId);
+    assert_eq!(station.message("N0CALL", "hi").message_id("").reply_ack("1").build().unwrap_err().code(), RefusalCode::InvalidMessageId);
+}
+
+fn hex(text: &str) -> Vec<u8> {
+    (0..text.len()).step_by(2).map(|i| u8::from_str_radix(&text[i..i + 2], 16).unwrap()).collect()
+}
+
+// ------------------------------------------------------------------ the Mic-E altitude
+
+fn long_comment() -> String {
+    format!("{}/A=001234{}WX", "x".repeat(96), "x".repeat(150))
+}
+
+#[test]
+fn a_mic_e_altitude_in_a_slash_form_that_reads_back_but_is_too_long_is_refused_for_its_size() {
+    // The Mic-E bytes do not read back (the comment holds a /A= of its own), the /A= form does, and it is over 256 bytes.
+    let built = Station::new("N0CALL")
+        .unwrap()
+        .mic_e(51.5, -0.5)
+        .symbol(Symbol::CAR)
+        .altitude_feet(1250.0)
+        .comment(&long_comment())
+        .messaging()
+        .build();
+    assert_eq!(built.unwrap_err().code(), RefusalCode::InformationFieldTooLong);
+    let fields = Positioned { altitude_feet: Some(1250.0), comment: long_comment(), ..position("") };
+    let report = MicEReport { type_code: Some('`'), fields, ..Default::default() };
+    let created = Packet::create(me(), to(), vec![], Data::MicE(report));
+    assert_eq!(created.unwrap_err().code(), RefusalCode::InformationFieldTooLong);
+}
+
+#[test]
+fn a_built_mic_e_packet_holds_the_altitude_as_given() {
+    // 1000 feet is 304.8 metres: written as 305 in the Mic-E bytes, held as 1000 feet.
+    let built = Station::new("N0CALL").unwrap().mic_e(51.5, -0.5).symbol(Symbol::CAR).altitude_feet(1000.0).build().unwrap();
+    let Data::MicE(report) = &built.data else { panic!() };
+    assert_eq!(report.fields.altitude_feet, Some(1000.0));
+    assert!(!report.altitude_in_comment);
+    assert!(built.information.contains(&b'}'), "the Mic-E altitude bytes end in a closing brace");
+    assert!(!String::from_utf8_lossy(&built.information).contains("/A="));
+    // The same data sent on its own is written by the rule for any data: a whole number of feet that the
+    // bytes do not hold exactly goes in a /A= first. The value in the data is the same either way.
+    let again = Packet::create(me(), to(), vec![], built.data.clone()).unwrap();
+    assert!(String::from_utf8_lossy(&again.information).contains("/A=001000"));
+}
+
+#[test]
+fn a_built_mic_e_altitude_the_comment_makes_unreadable_goes_in_a_slash_form_that_holds_it_exactly() {
+    let built =
+        Station::new("N0CALL").unwrap().mic_e(51.5, -0.5).symbol(Symbol::CAR).altitude_feet(1250.0).comment("a/A=001234b").build().unwrap();
+    let text = String::from_utf8_lossy(&built.information);
+    assert!(text.contains("/A=001250"), "{text}");
+    // A value the /A= does not hold exactly is refused rather than written.
+    let refused =
+        Station::new("N0CALL").unwrap().mic_e(51.5, -0.5).symbol(Symbol::CAR).altitude_feet(1250.4).comment("a/A=001234b").build();
+    assert_eq!(refused.unwrap_err().code(), RefusalCode::TextReadsAsField);
+}
+
+// ------------------------------------------------------------------ a packet written on its own
+
+#[test]
+fn an_inner_packet_written_on_its_own_is_read_back_by_the_outer_rules() {
+    // Its source is valid inside the third-party packet; as a line of its own decode_tnc2 would refuse it.
+    let outer = Packet::decode_tnc2(b"N0CALL>APZ001:}PY2SP_R-R>APZ001,TCPIP,N0CALL*:>hi", ParseOptions::LENIENT).unwrap();
+    let Data::ThirdParty(inner) = &outer.data else { panic!() };
+    assert_eq!(inner.to_tnc2().unwrap_err().code(), RefusalCode::InvalidAddress);
+    assert_eq!(inner.to_ax25().unwrap_err().code(), RefusalCode::InvalidAddress);
+    // The packet it is in is written as received, inner header included, and reads back by the third-party rules.
+    assert_eq!(outer.to_tnc2().unwrap(), b"N0CALL>APZ001:}PY2SP_R-R>APZ001,TCPIP,N0CALL*:>hi");
+    // A q-construct in an inner path is not compared; a frame cannot carry its lower-case q.
+    let outer = Packet::decode_tnc2(b"N0CALL>APRS:}N0CALL>APRS,qAR,X:>hi", ParseOptions::LENIENT).unwrap();
+    let Data::ThirdParty(inner) = &outer.data else { panic!() };
+    assert_eq!(inner.to_tnc2().unwrap(), b"N0CALL>APRS,qAR,X:>hi");
+    assert_eq!(inner.to_ax25().unwrap_err().code(), RefusalCode::Ax25CannotCarry);
+}
+
+#[test]
+fn a_line_is_not_written_with_a_line_break_inside_its_information_field() {
+    let mut p;
+    for inside in [&b">bye\r\nN0CALL>APZ001:>evil"[..], b">a\rb", b">a\nb", b"\r>hi"] {
+        // Decoded from those bytes, so that the data agrees with them and only the line break is at fault.
+        p = Packet::decode(me(), to(), vec![], inside, ParseOptions::LENIENT);
+        assert_eq!(p.to_tnc2().unwrap_err().code(), RefusalCode::Tnc2CannotCarry, "{inside:?}");
+        // A frame carries it.
+        assert!(p.to_ax25().is_ok(), "{inside:?}");
+    }
+    // At the very end, where a decoder takes it off as a trailing line break, it ends the line anyway and is carried.
+    for end in [&b">hi\r"[..], b">hi\n", b">hi\r\n"] {
+        p = Packet::decode(me(), to(), vec![], end, ParseOptions::LENIENT);
+        assert_eq!(p.to_tnc2().unwrap(), [&b"N0CALL>APZ001:"[..], end].concat());
+    }
+    // A header fault is named before the line break.
+    p = Packet::decode(Address::third_party_source("A B").unwrap(), to(), vec![], b">a\rb", ParseOptions::LENIENT);
+    assert_eq!(p.to_tnc2().unwrap_err().code(), RefusalCode::InvalidAddress);
+}
+
+#[test]
+fn a_user_defined_packet_cannot_inject_a_line() {
+    let line = b"N0CALL>APZ001:{Axa\nX>Y:>evil";
+    let p = Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+    assert_eq!(p.to_tnc2().unwrap_err().code(), RefusalCode::Tnc2CannotCarry);
+}
+
+#[test]
+fn a_display_is_not_a_writer() {
+    // Display of what is held is total: a header and data no writer would write are shown as held.
+    let mut p = packet(&[("WIDE1-1", true), ("WIDE2-1", true)]);
+    p.path[0].used = false;
+    p.source = Address::third_party_source("A B").unwrap();
+    p.information = b">a\rb".to_vec();
+    assert_eq!(p.source.to_string(), "A B");
+    assert!(format!("{p:?}").contains("A B"));
+    let t = Timestamp::dhm(31, 25, 61);
+    assert!(!t.to_string().is_empty());
+}
+
+#[test]
+fn an_inner_source_is_judged_by_the_outer_address_rule_before_any_frame_check() {
+    for source in ["a_b", "a b", "A*B"] {
+        let line = format!("N0CALL>APRS:}}{source}>APRS:>hi");
+        let outer = Packet::decode_tnc2(line.as_bytes(), ParseOptions::LENIENT).unwrap();
+        let Data::ThirdParty(inner) = &outer.data else { panic!("{source}") };
+        assert_eq!(inner.to_tnc2().unwrap_err().code(), RefusalCode::InvalidAddress, "{source}");
+        assert_eq!(inner.to_ax25().unwrap_err().code(), RefusalCode::InvalidAddress, "{source}");
+    }
+    // Lower case only is a valid line address, and a frame cannot carry it.
+    let outer = Packet::decode_tnc2(b"N0CALL>APRS:}abc>APRS:>hi", ParseOptions::LENIENT).unwrap();
+    let Data::ThirdParty(inner) = &outer.data else { panic!() };
+    assert_eq!(inner.to_tnc2().unwrap(), b"abc>APRS:>hi");
+    assert_eq!(inner.to_ax25().unwrap_err().code(), RefusalCode::Ax25CannotCarry);
+}
+
+// ------------------------------------------------------------------ second fix pass
+
+#[test]
+fn a_builder_judges_the_header_before_any_fault_in_the_data() {
+    let station = Station::new("N0CALL").unwrap().via(&["WIDE1-1", "WIDE2-1*"]).unwrap();
+    let invalid_path = |r: Result<Packet, EncodeError>, what: &str| assert_eq!(r.unwrap_err().code(), RefusalCode::InvalidPath, "{what}");
+    invalid_path(station.position(90.0, 0.0).symbol(Symbol::CAR).ambiguity(4).build(), "box past a pole");
+    invalid_path(station.telemetry(1000).build(), "sequence over 999");
+    invalid_path(station.telemetry(1).analog(&[None; 6]).build(), "six analog values");
+    invalid_path(station.object("OBJ").symbol(Symbol::CAR).permanent().build(), "object with no position");
+    invalid_path(station.position(10.0, 0.0).symbol(Symbol::CAR).tone(Tone::Tone, 100).build(), "tone with no frequency");
+    invalid_path(station.position(100.0, 0.0).symbol(Symbol::CAR).build(), "latitude out of range");
+}
+
+#[test]
+fn a_finite_value_the_builder_converts_past_the_largest_number_is_out_of_range() {
+    let station = Station::new("N0CALL").unwrap();
+    let w = || station.weather().at(1.0, 1.0).symbol(Symbol::WEATHER_STATION).wind_direction_degrees(10.0).wind_speed_mph(5.0);
+    let refused = |r: Result<Packet, EncodeError>, what: &str| assert_eq!(r.unwrap_err().code(), RefusalCode::ValueOutOfRange, "{what}");
+    refused(w().rain_1h_in(1e308).build(), "rain in inches");
+    refused(w().pressure_mbar(1e308).build(), "pressure");
+    refused(w().rain_1h_mm(1e308).build(), "rain in millimetres");
+    refused(w().temperature_c(1e308).build(), "temperature in Celsius");
+    refused(station.position(1.0, 1.0).symbol(Symbol::CAR).altitude_m(1e308).build(), "altitude in metres");
+    refused(station.mic_e(1.0, 1.0).symbol(Symbol::CAR).altitude_m(1e308).build(), "Mic-E altitude in metres");
+    // A value that is not a number is still not a number.
+    assert_eq!(w().rain_1h_in(f64::INFINITY).build().unwrap_err().code(), RefusalCode::NotANumber);
+}
+
+#[test]
+fn a_tone_value_without_its_tone_is_a_missing_field() {
+    let fields = Positioned {
+        frequency: Some(VoiceFrequency { mhz: 144.39, tone: None, tone_value: Some(100), ..Default::default() }),
+        ..position("")
+    };
+    let data = Data::Position(PositionReport { fields, ..Default::default() });
+    assert_eq!(refused(data), RefusalCode::MissingField);
+}
+
+#[test]
+fn a_corridor_width_on_an_area_that_is_not_a_line_is_not_allowed() {
+    let area = |shape, width| {
+        let fields = Positioned {
+            symbol: Symbol::new('\\', 'l'),
+            area: Some(AreaObject { shape, lat_offset: 1, color: AreaColor::Black, lon_offset: 1, corridor_width_miles: width }),
+            ..position("")
+        };
+        Data::Position(PositionReport { fields, ..Default::default() })
+    };
+    assert_eq!(refused(area(AreaShape::OpenCircle, Some(12))), RefusalCode::FieldNotAllowed);
+    assert!(area(AreaShape::LineDownRight, Some(12)).encode().is_ok());
+}
+
+#[test]
+fn a_deeper_inner_header_the_bytes_do_not_carry_is_an_invalid_third_party_header() {
+    let outer = Packet::decode_tnc2(b"N0CALL>APZ001:}G4ABC>APZ001:}G5ABC>APZ001,A*,B*:>hi", ParseOptions::LENIENT).unwrap();
+    let Data::ThirdParty(mut middle) = outer.data else { panic!() };
+    let Data::ThirdParty(inner) = &mut middle.data else { panic!() };
+    inner.path[0].used = false;
+    assert_eq!(refused(Data::ThirdParty(middle)), RefusalCode::InvalidThirdPartyHeader);
+}
+
+#[test]
+fn test_and_user_defined_data_hold_a_line_break_inside_and_a_line_refuses_it() {
+    for line in [&b"N0CALL>APZ001:,a\rb"[..], b"N0CALL>APZ001:{Axa\nb"] {
+        let p = Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+        // As an information field alone it is written; as a line it is `tnc2-cannot-carry`.
+        let data = Packet::decode(me(), to(), vec![], &line[14..], ParseOptions::LENIENT).data;
+        assert_eq!(data.encode().unwrap(), &line[14..]);
+        assert_eq!(p.to_tnc2().unwrap_err().code(), RefusalCode::Tnc2CannotCarry);
+    }
+    // Only data that ends in one is refused.
+    let test = Data::Test(TestData { data: "a\r".into() });
+    assert_eq!(refused(test), RefusalCode::InvalidCharacter);
+}
+
+#[test]
+fn a_timestamp_is_shown_as_held() {
+    assert_eq!(Timestamp::dhm(255, 1, 2).to_string(), "2550102z");
+    assert_eq!(Timestamp::dhm(9, 23, 45).to_string(), "092345z");
+}
+
+// ------------------------------------------------------------------ read back under the header written
+
+#[test]
+fn a_field_that_reads_as_other_data_under_its_header_is_not_encodable() {
+    // Raw bytes that are no report under a plain destination are a Mic-E position under S32U6T.
+    let line = b"N0CALL>APZ001:`(_fn\"Oj/";
+    let mut held = Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+    assert!(!matches!(held.data, Data::MicE(_)));
+    assert_eq!(held.to_tnc2().unwrap(), line);
+    held.destination = Address::new("S32U6T").unwrap();
+    assert_eq!(held.to_tnc2().unwrap_err().code(), RefusalCode::NotEncodable);
+    assert_eq!(held.to_ax25().unwrap_err().code(), RefusalCode::NotEncodable);
+    // The other way: a Mic-E report put under a plain destination.
+    let mut mic_e = Packet::decode_tnc2(b"N0CALL>S32U6T:`(_fn\"Oj/", ParseOptions::LENIENT).unwrap();
+    assert!(matches!(mic_e.data, Data::MicE(_)));
+    mic_e.destination = Address::new("APZ001").unwrap();
+    assert_eq!(mic_e.to_tnc2().unwrap_err().code(), RefusalCode::NotEncodable);
+    // As a third-party inner packet, under APZ001 it is written and under S32U6T it is not.
+    let outer = Packet::decode_tnc2(b"N0CALL>APZ001:}N0CALL>APZ001:`(_fn\"Oj/", ParseOptions::LENIENT).unwrap();
+    assert!(outer.data.encode().is_ok());
+    let Data::ThirdParty(mut inner) = outer.data else { panic!() };
+    inner.destination = Address::new("S32U6T").unwrap();
+    assert_eq!(Data::ThirdParty(inner).encode().unwrap_err().code(), RefusalCode::NotEncodable);
+}
+
+#[test]
+fn inner_mic_e_data_is_written_under_the_destination_it_computes_and_no_other() {
+    let outer = Packet::decode_tnc2(b"N0CALL>APZ001:}N0CALL>S32U6T:`(_fn\"Oj/", ParseOptions::LENIENT).unwrap();
+    assert_eq!(outer.data.encode().unwrap(), b"}N0CALL>S32U6T:`(_fn\"Oj/");
+    let Data::ThirdParty(mut inner) = outer.data else { panic!() };
+    assert!(matches!(inner.data, Data::MicE(_)));
+    // Another Mic-E destination reads as another position: the data is not written under it.
+    inner.destination = Address::new("S32U6U").unwrap();
+    assert_eq!(Data::ThirdParty(inner).encode().unwrap_err().code(), RefusalCode::NotEncodable);
+}
+
+#[test]
+fn a_held_mic_e_report_is_not_written_under_another_mic_e_destination() {
+    let held = Packet::decode_tnc2(b"N0CALL>S32U6T:`(_fn\"Oj/", ParseOptions::LENIENT).unwrap();
+    assert!(matches!(held.data, Data::MicE(_)));
+    assert!(held.to_tnc2().is_ok());
+    for other in ["S32U7T", "S32U6T-3"] {
+        let mut moved = held.clone();
+        moved.destination = Address::new(other).unwrap();
+        assert_eq!(moved.to_tnc2().unwrap_err().code(), RefusalCode::NotEncodable, "{other}");
+        assert_eq!(moved.to_ax25().unwrap_err().code(), RefusalCode::NotEncodable, "{other}");
+    }
+    // A built packet whose latitude lies between steps is still written under the destination it computes.
+    let built = Station::new("N0CALL").unwrap().mic_e(51.123456789, -0.5).symbol(Symbol::CAR).altitude_feet(1000.0).build().unwrap();
+    assert!(built.to_tnc2().is_ok());
+}
+
+#[test]
+fn an_inner_destination_the_data_does_not_compute_is_named_after_every_rule_check() {
+    // An inner Mic-E destination that does not match is the read-back's finding: an inner header fault beside it wins.
+    let outer = Packet::decode_tnc2(b"N0CALL>APZ001:}N0CALL>S32U6T,A,B*:`(_fn\"Oj/", ParseOptions::LENIENT).unwrap();
+    let Data::ThirdParty(mut inner) = outer.data else { panic!() };
+    inner.destination = Address::new("S32U6U").unwrap();
+    assert_eq!(Data::ThirdParty(inner.clone()).encode().unwrap_err().code(), RefusalCode::NotEncodable);
+    inner.path[0].used = false;
+    assert_eq!(Data::ThirdParty(inner).encode().unwrap_err().code(), RefusalCode::InvalidThirdPartyHeader);
+}
+
+#[test]
+fn a_defect_of_each_entry_is_listed_once_per_occurrence() {
+    let count = |p: &Packet, code: Code| p.diagnostics.iter().filter(|d| d.code == code).count();
+    let outer = Packet::decode_tnc2(b"N0CALL>APZ001,,A,,B:>hi", ParseOptions::LENIENT).unwrap();
+    assert_eq!(count(&outer, Code::EmptyPathEntry), 2);
+    let outer = Packet::decode_tnc2(b"N0CALL>APZ001:}G4ABC>APZ001,,A,,B:>hi", ParseOptions::LENIENT).unwrap();
+    let Data::ThirdParty(inner) = &outer.data else { panic!() };
+    assert_eq!(count(inner, Code::EmptyPathEntry), 2);
+    // A judgement about a whole is listed once: several used markers, a text's control characters.
+    let marks = Packet::decode_tnc2(b"N0CALL>APZ001,A*,B*,C*:>hi", ParseOptions::LENIENT).unwrap();
+    assert_eq!(count(&marks, Code::MultipleUsedMarkers), 1);
+    let text = Packet::decode_tnc2(b"N0CALL>APZ001:>a\x07b\x07c", ParseOptions::LENIENT).unwrap();
+    assert_eq!(count(&text, Code::ControlCharacterInText), 1);
+}
+
+// ------------------------------------------------------------------ a held packet whose parts disagree
+
+#[test]
+fn a_held_packet_whose_data_and_information_field_disagree_is_not_written() {
+    let decoded = |line: &[u8]| Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+    let both = |p: &Packet| (p.to_tnc2().unwrap_err().code(), p.to_ax25().unwrap_err().code());
+    let refused_as = RefusalCode::NotEncodable;
+    // The information field changed in place.
+    let mut p = decoded(b"N0CALL>APZ001:>hello");
+    p.information = b">evil".to_vec();
+    assert_eq!(both(&p), (refused_as, refused_as));
+    // The data changed in place.
+    let mut p = decoded(b"N0CALL>APZ001:>hello");
+    p.data = status("changed");
+    assert_eq!(both(&p), (refused_as, refused_as));
+    // A position's latitude changed.
+    let mut p = decoded(b"N0CALL>APZ001:!5127.26N/00058.69W>");
+    let Data::Position(report) = &mut p.data else { panic!() };
+    report.fields.position.latitude += 0.01;
+    assert_eq!(both(&p), (refused_as, refused_as));
+    // An inner packet's data and destination changed inside a held third-party packet, at depth 1 and 2.
+    let mut p = decoded(b"N0CALL>APZ001:}G4ABC>APZ001:}G4DEF>APZ001:>hi");
+    let Data::ThirdParty(inner) = &mut p.data else { panic!() };
+    inner.destination = Address::new("APZ002").unwrap();
+    assert_eq!(both(&p), (refused_as, refused_as));
+    let mut p = decoded(b"N0CALL>APZ001:}G4ABC>APZ001:}G4DEF>APZ001:>hi");
+    let Data::ThirdParty(inner) = &mut p.data else { panic!() };
+    let Data::ThirdParty(deeper) = &mut inner.data else { panic!() };
+    deeper.data = status("other");
+    assert_eq!(both(&p), (refused_as, refused_as));
+    // Unchanged, each is written as received.
+    for line in [&b"N0CALL>APZ001:>hello"[..], b"N0CALL>APZ001:}G4ABC>APZ001:}G4DEF>APZ001:>hi"] {
+        let p = decoded(line);
+        assert_eq!(p.to_tnc2().unwrap(), line);
+        assert!(p.to_ax25().is_ok());
+    }
+}

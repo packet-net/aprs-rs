@@ -15,7 +15,7 @@ fn info(data: Data) -> String {
 
 #[test]
 fn metadata_can_describe_another_station() {
-    let line = |packet: Packet| String::from_utf8(packet.to_tnc2()).unwrap();
+    let line = |packet: Packet| String::from_utf8(packet.to_tnc2().unwrap()).unwrap();
     assert_eq!(line(me().telemetry_names(&["Battery"]).addressee("G3NRW-5").build().unwrap()), "M0LTE-11>APZ001::G3NRW-5  :PARM.Battery");
     assert_eq!(line(me().telemetry_units(&["V"]).addressee("G3NRW-5").build().unwrap()), "M0LTE-11>APZ001::G3NRW-5  :UNIT.V");
     assert_eq!(
@@ -37,7 +37,7 @@ fn metadata_can_describe_another_station() {
 fn a_tone_has_a_kind_and_a_value_as_sent() {
     let base = || me().position(51.45, -0.98).symbol(Symbol::REPEATER).frequency(145.725);
     let tail = |tone: Tone, value: u16| {
-        let line = String::from_utf8(base().tone(tone, value).build().unwrap().to_tnc2()).unwrap();
+        let line = String::from_utf8(base().tone(tone, value).build().unwrap().to_tnc2().unwrap()).unwrap();
         line.split_once("MHz").unwrap().1.to_string()
     };
     assert_eq!(tail(Tone::Tone, 118), " T118");
@@ -46,7 +46,8 @@ fn a_tone_has_a_kind_and_a_value_as_sent() {
     assert_eq!(tail(Tone::Off, 0), " Toff");
     // A frequency is rounded to its step, not refused for extra decimals.
     let line =
-        String::from_utf8(me().position(51.45, -0.98).symbol(Symbol::REPEATER).frequency(145.7251).build().unwrap().to_tnc2()).unwrap();
+        String::from_utf8(me().position(51.45, -0.98).symbol(Symbol::REPEATER).frequency(145.7251).build().unwrap().to_tnc2().unwrap())
+            .unwrap();
     assert!(line.ends_with("145.725MHz"), "{line}");
 }
 
@@ -76,7 +77,7 @@ fn a_mic_e_altitude_goes_in_the_bytes_unless_it_came_from_a_slash_a() {
     for altitude in [9176.0, 100.0, 1000.0] {
         let packet = built(&|b| if altitude == 9176.0 { b.altitude_m(altitude) } else { b.altitude_feet(altitude) }).unwrap();
         assert!(!String::from_utf8_lossy(&packet.information).contains("/A="), "{}", String::from_utf8_lossy(&packet.information));
-        let heard = decode(&packet.to_tnc2());
+        let heard = decode(&packet.to_tnc2().unwrap());
         let Data::MicE(report) = &heard.data else { panic!("a Mic-E report") };
         assert!(!report.altitude_in_comment);
         assert_eq!(written(&heard), (packet.information.clone(), packet.destination.clone()));
@@ -239,7 +240,8 @@ fn comment_telemetry_is_one_value() {
             .telemetry(CommentTelemetry { sequence: 1, analog: vec![100, 200, 300, 400, 500], digital: Some(5) })
             .build()
             .unwrap()
-            .to_tnc2(),
+            .to_tnc2()
+            .unwrap(),
     )
     .unwrap();
     assert!(line.contains('|'), "{line}");
@@ -284,7 +286,7 @@ fn what_create_accepts_reads_back() {
                 let path: Vec<PathEntry> = entry.into_iter().map(|a| PathEntry { address: a, used: true }).collect();
                 if let Ok(packet) = Packet::create(source.clone(), destination.clone(), path, data.clone()) {
                     accepted += 1;
-                    let line = packet.to_tnc2();
+                    let line = packet.to_tnc2().unwrap();
                     assert!(Packet::decode_tnc2(&line, ParseOptions::LENIENT).is_ok(), "{}", String::from_utf8_lossy(&line));
                     assert!(Packet::decode_tnc2(&line, ParseOptions::STRICT).is_ok(), "{}", String::from_utf8_lossy(&line));
                 }
@@ -302,4 +304,122 @@ fn mic_e_locator_then_telemetry_then_a_spaced_comment_has_its_space() {
     let Data::MicE(report) = strict.data else { panic!("not Mic-E") };
     assert_eq!(report.locator.as_deref(), Some("IO91"));
     assert_eq!(report.fields.comment, "DG2MM");
+}
+
+/// A later Mic-E altitude lifted from between two bars splits them: no telemetry is read, the bars
+/// are text straight after the locator, and the locator's space is missing (lenient warns, strict
+/// rejects).
+#[test]
+fn mic_e_telemetry_split_by_a_later_altitude_is_text_after_the_locator() {
+    for (line, comment) in [
+        (&b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0hl!Y[/>\"4e}='p| DG2MM"[..], "|!:&0hl!Y[/>='p| DG2MM"),
+        (&b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0hl!Y[/>\"4e}='p| hello"[..], "|!:&0hl!Y[/>='p| hello"),
+        (&b"N0CALL>S32UVT:`(_fn\"Oj/`IO91SX/G|!:&0hl!Y[/>\"4e}='p| DG2MM"[..], "|!:&0hl!Y[/>='p| DG2MM"),
+    ] {
+        let lenient = Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+        assert!(lenient.diagnostics.iter().any(|d| d.code == Code::MissingSpaceAfterLocator), "{}", String::from_utf8_lossy(line));
+        assert!(lenient.diagnostics.iter().any(|d| d.code == Code::MicEAltitudeNotFirst));
+        let Data::MicE(report) = &lenient.data else { panic!("not Mic-E") };
+        assert!(report.fields.telemetry.is_none());
+        assert_eq!(report.fields.comment, comment);
+        let strict = Packet::decode_tnc2(line, ParseOptions::STRICT).unwrap();
+        assert!(strict.diagnostics.iter().any(|d| d.code == Code::MissingSpaceAfterLocator && d.severity == Severity::Error));
+        assert!(strict.diagnostics.iter().all(|d| d.code != Code::MicEAltitudeNotFirst));
+    }
+    // Text straight after the locator, with no telemetry, still has no space.
+    let line = b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G\"4e}DG2MM";
+    assert!(Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap().diagnostics.iter().any(|d| d.code == Code::MissingSpaceAfterLocator));
+}
+
+/// The locator's space is judged on what the decoder's own lifting leaves (vectors interpretations.md,
+/// "Where a Mic-E locator is read"). Two spaces after the locator: the first separates it, the comment
+/// loses one more, so it is `x`, whatever was lifted in between.
+#[test]
+fn mic_e_two_spaces_after_the_locator_give_the_comment_x() {
+    let comment = |line: &[u8]| {
+        let packet = Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+        assert!(packet.diagnostics.iter().all(|d| d.code != Code::MissingSpaceAfterLocator), "{}", String::from_utf8_lossy(line));
+        let Data::MicE(report) = packet.data else { panic!("not Mic-E") };
+        report.fields.comment
+    };
+    // A later altitude and telemetry: two variations of each.
+    for line in [
+        &b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G\"4e}  x"[..],
+        &b"N0CALL>S32UVT:`(_fn\"Oj/`IO91SX/G\"4e}  x"[..],
+        &b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0'p|  x"[..],
+        &b"N0CALL>S32UVT:`(_fn\"Oj/`IO91SX/G|!:&0'p|  x"[..],
+    ] {
+        assert_eq!(comment(line), "x", "{}", String::from_utf8_lossy(line));
+    }
+    // One space is only the separator.
+    assert_eq!(comment(b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G|!:&0'p| x"), "x");
+}
+
+/// A `!DAO!` that exists only by joining the text either side of a lifted altitude is not lifted, so
+/// the text after the locator starts with it and the locator's space is missing.
+#[test]
+fn mic_e_a_dao_joined_across_an_altitude_is_text_after_the_locator() {
+    for (line, comment) in [
+        (&b"N0CALL>S32UVT:`(_fn\"Oj/`IO91/G!W1\"4e}2! hi"[..], "!W12! hi"),
+        (&b"N0CALL>S32UVT:`(_fn\"Oj/`IO91SX/G!W1\"4e}2! hi"[..], "!W12! hi"),
+    ] {
+        let lenient = Packet::decode_tnc2(line, ParseOptions::LENIENT).unwrap();
+        assert!(lenient.diagnostics.iter().any(|d| d.code == Code::MissingSpaceAfterLocator), "{}", String::from_utf8_lossy(line));
+        let Data::MicE(report) = &lenient.data else { panic!("not Mic-E") };
+        assert!(report.fields.dao.is_none());
+        assert_eq!(report.fields.comment, comment);
+        let strict = Packet::decode_tnc2(line, ParseOptions::STRICT).unwrap();
+        assert!(strict.diagnostics.iter().any(|d| d.code == Code::MissingSpaceAfterLocator && d.severity == Severity::Error));
+    }
+}
+
+/// A garbled timestamp whose seven bytes end in a time indicator and are followed by an uncompressed
+/// position: the position after the seven bytes wins, even where the bytes after the DTI would read
+/// as a compressed position (vectors README, "Timestamps that are not there").
+#[test]
+fn a_garbled_timestamp_before_an_uncompressed_position() {
+    let lenient = |info: &str| Packet::decode_tnc2(format!("N0CALL>APZ001:{info}").as_bytes(), ParseOptions::LENIENT).unwrap();
+    // Strict does not tolerate the timestamp: an error, and no position report.
+    let rejected = |info: &str| {
+        let packet = Packet::decode_tnc2(format!("N0CALL>APZ001:{info}").as_bytes(), ParseOptions::STRICT).unwrap();
+        !matches!(packet.data, Data::Position(_))
+            && packet.diagnostics.iter().any(|d| d.code == Code::MalformedTimestamp && d.severity == Severity::Error)
+    };
+    let report = |packet: &Packet| match &packet.data {
+        Data::Position(r) => {
+            (r.timestamp.is_none(), r.messaging, r.fields.compressed, r.fields.position.latitude, r.fields.position.ambiguity)
+        }
+        other => panic!("not a position report: {other:?}"),
+    };
+    for dti in ['@', '/'] {
+        for seventh in ['z', '/', 'h'] {
+            let line = format!("{dti}R30549{seventh}2831.07N/08142.92W_015/001g006t058r000p000P000h-5b10170");
+            let packet = lenient(&line);
+            let (no_timestamp, messaging, compressed, lat, _) = report(&packet);
+            assert!(no_timestamp && !compressed && (lat - 28.517833).abs() < 1e-4, "{line}");
+            assert_eq!(messaging, dti == '@');
+            let warned: Vec<_> = packet.diagnostics.iter().filter(|d| d.code == Code::MalformedTimestamp).collect();
+            assert_eq!(warned.len(), 1, "{line}");
+            assert_eq!(warned[0].severity, Severity::Warning);
+            assert!(rejected(&line), "{line}");
+        }
+    }
+    // A lower-case hemisphere letter: the position decodes leniently, so it wins; strict rejects either way.
+    let line = "@R30549z2831.07n/08142.92w_015/001g006";
+    let (_, _, compressed, lat, _) = report(&lenient(line));
+    assert!(!compressed && (lat - 28.517833).abs() < 1e-4);
+    assert!(rejected(line));
+    // Ambiguity in the following position.
+    let (_, _, compressed, _, ambiguity) = report(&lenient("/R30549h2831.  N/08142.  W>"));
+    assert!(!compressed);
+    assert_eq!(ambiguity, 2);
+    // A seventh byte that is not a time indicator: the reading straight after the DTI stands.
+    let (_, _, compressed, _, _) = report(&lenient("@R30549x2831.07N/08142.92W_015/001"));
+    assert!(compressed);
+    // A compressed position after the seven bytes does not win over a compressed one straight after the DTI.
+    let (_, _, compressed, lat, _) = report(&lenient("@R30549z/5L!!<*e7>7P["));
+    assert!(compressed);
+    assert!((lat - 28.517833).abs() > 1.0);
+    // Too short for the new branch: nothing panics.
+    assert!(!matches!(lenient("@R30549z").data, Data::Position(_)));
 }

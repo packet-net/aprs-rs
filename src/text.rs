@@ -46,11 +46,6 @@ pub(crate) fn has_control_character(bytes: &[u8]) -> bool {
     bytes.iter().any(|&b| b < 0x20 || b == 0x7F)
 }
 
-/// Whether text has a CR or LF, which would end the packet on the air or on APRS-IS.
-pub(crate) fn has_line_break(bytes: &[u8]) -> bool {
-    bytes.iter().any(|&b| b == b'\r' || b == b'\n')
-}
-
 /// Whether every byte is printable ASCII (space to `~`).
 pub(crate) fn is_printable_ascii(bytes: &[u8]) -> bool {
     bytes.iter().all(|&b| (0x20..=0x7E).contains(&b))

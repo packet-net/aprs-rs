@@ -21,10 +21,16 @@ use compare::differences;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use libtest_mimic::{Arguments, Failed, Trial};
 use pdn_aprs::{Address, Code, Data, HeaderError, Packet, ParseOptions, PathEntry, Severity, Unrecognized};
 use serde_json::Value;
+
+/// How many cases the tolerance check runs on.
+static CHECKED: AtomicUsize = AtomicUsize::new(0);
+/// How many cases have lenient diagnostics naming exactly one tolerable code, and a strict result.
+static ELIGIBLE: AtomicUsize = AtomicUsize::new(0);
 
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("vectors")
@@ -47,7 +53,14 @@ fn main() {
             add_trials(&mut trials, case.clone(), &known);
         }
     }
-    libtest_mimic::run(&args, trials).exit();
+    let full_run = args.filter.is_none() && args.skip.is_empty() && !args.list && !args.ignored && !args.exact;
+    let conclusion = libtest_mimic::run(&args, trials);
+    if full_run {
+        let (checked, eligible) = (CHECKED.load(Ordering::Relaxed), ELIGIBLE.load(Ordering::Relaxed));
+        eprintln!("tolerance check: ran on {checked} of {eligible} cases whose lenient diagnostics name exactly one tolerable code");
+        assert_eq!(checked, eligible, "the tolerance check must run on every case that qualifies");
+    }
+    conclusion.exit();
 }
 
 fn known_differences() -> BTreeMap<String, String> {
@@ -84,12 +97,19 @@ fn add_trials(trials: &mut Vec<Trial>, case: Value, known: &BTreeMap<String, Str
     add("lenient", lenient);
     add("strict", strict);
     if case["strict"].is_object() && tolerance_for(&case).is_some() {
+        ELIGIBLE.fetch_add(1, Ordering::Relaxed);
         add("tolerance", tolerance);
     }
     if case.get("reencode").is_some() {
         add("reencode", reencode);
     }
     add("readback", readback);
+    if case.get("pass_through_inner").is_some() {
+        add("pass_through_inner", pass_through_inner);
+    }
+    if case.get("pass_through").is_some() {
+        add("pass_through", pass_through);
+    }
 }
 
 // ------------------------------------------------------------------ decoding
@@ -251,9 +271,25 @@ fn strict(case: &Value) -> Result<(), String> {
 }
 
 fn tolerance(case: &Value) -> Result<(), String> {
+    CHECKED.fetch_add(1, Ordering::Relaxed);
     let code = tolerance_for(case).unwrap();
     let decoded = decode(&case["input"], ParseOptions::LENIENT.without(code));
-    result(check_strict(case, &decoded).into_iter().map(|d| format!("with only {code} not tolerated: {d}")).collect())
+    let other = case["strict"].get("rejected_by").and_then(Value::as_str).filter(|x| Code::from_id(x) != Some(code));
+    let differences = match other {
+        // Strict is rejected by a different code: turning off this one tolerance must give a
+        // reading whose diagnostics include that code as a warning (README, "Checking a case").
+        Some(x) => match &decoded {
+            Ok(p)
+                if p.data != Data::Unrecognized(Unrecognized::Malformed)
+                    && neutral::diagnostics(&p.diagnostics).contains(&format!("warning:{x}")) =>
+            {
+                vec![]
+            }
+            _ => vec![format!("expected a reading with warning:{x}, got {}", describe(&decoded))],
+        },
+        None => check_strict(case, &decoded),
+    };
+    result(differences.into_iter().map(|d| format!("with only {code} not tolerated: {d}")).collect())
 }
 
 fn show(bytes: &[u8]) -> String {
@@ -363,7 +399,8 @@ fn encode(case: &Value) -> Result<(), String> {
 
 fn build_case(case: &Value) -> Result<(), String> {
     let expect = &case["expect"];
-    match build::outcome(&case["input"]["build"]) {
+    let frame = case["input"].get("write").and_then(Value::as_str) == Some("ax25");
+    match build::outcome_writing(&case["input"]["build"], frame) {
         build::Outcome::Unsupported(why) => Err(format!("build: this crate's builder cannot say it: {why}")),
         build::Outcome::Refused(code, why, _) => {
             if expect.get("refused").and_then(Value::as_bool) != Some(true) {
@@ -374,16 +411,87 @@ fn build_case(case: &Value) -> Result<(), String> {
                 _ => Ok(()),
             }
         }
-        build::Outcome::Built(line) => {
+        build::Outcome::Built(written) => {
             if expect.get("refused").and_then(Value::as_bool) == Some(true) {
-                return Err(format!("build: expected a refusal, built {}", show(&line)));
+                return Err(format!("build: expected a refusal, built {}", show(&written)));
             }
-            if String::from_utf8_lossy(&line) != expect["tnc2"].as_str().unwrap() {
-                return Err(format!("build: expected {}, built {}", expect["tnc2"], show(&line)));
+            if frame {
+                let hex: String = written.iter().map(|b| format!("{b:02X}")).collect();
+                if !hex.eq_ignore_ascii_case(expect["ax25_hex"].as_str().unwrap()) {
+                    return Err(format!("build: expected the frame {}, built {hex}", expect["ax25_hex"]));
+                }
+            } else if String::from_utf8_lossy(&written) != expect["tnc2"].as_str().unwrap() {
+                return Err(format!("build: expected {}, built {}", expect["tnc2"], show(&written)));
             }
             Ok(())
         }
     }
+}
+
+/// The lenient packet written back as the program holds it: its TNC2 line and AX.25 frame, or the
+/// refusal each gives.
+fn pass_through(case: &Value) -> Result<(), String> {
+    let packet =
+        decode(&case["input"], ParseOptions::LENIENT).map_err(|e| format!("header error {:?}", neutral::diagnostics(&e.diagnostics)))?;
+    written_back(&packet, &case["pass_through"], "pass_through")
+}
+
+/// The same for a third-party packet's inner packet, taken out of the outer one and written on its own.
+fn pass_through_inner(case: &Value) -> Result<(), String> {
+    let packet =
+        decode(&case["input"], ParseOptions::LENIENT).map_err(|e| format!("header error {:?}", neutral::diagnostics(&e.diagnostics)))?;
+    let Data::ThirdParty(inner) = &packet.data else {
+        return Err("pass_through_inner: the packet is not a third-party packet".into());
+    };
+    written_back(inner, &case["pass_through_inner"], "pass_through_inner")
+}
+
+fn written_back(held: &Packet, want: &Value, key: &str) -> Result<(), String> {
+    // The held packet's information field written under another header, when the case gives one.
+    let mut readdressed = held.clone();
+    if let Some(h) = want.get("header") {
+        if let Some(s) = h.get("source").and_then(Value::as_str) {
+            readdressed.source = Address::new(s).map_err(|e| e.to_string())?;
+        }
+        if let Some(d) = h.get("destination").and_then(Value::as_str) {
+            readdressed.destination = Address::new(d).map_err(|e| e.to_string())?;
+        }
+        if let Some(p) = h.get("path").and_then(Value::as_array) {
+            readdressed.path = p.iter().filter_map(Value::as_str).map(neutral::read_path_entry).collect();
+        }
+    }
+    let packet = &readdressed;
+    let mut out = Vec::new();
+    let mut one = |what: &str,
+                   written: Result<Vec<u8>, pdn_aprs::EncodeError>,
+                   bytes: Option<&str>,
+                   refusal: Option<&str>,
+                   hex_form: bool| match (written, bytes, refusal) {
+        (Ok(w), Some(expected), _) => {
+            let got =
+                if hex_form { w.iter().map(|b| format!("{b:02X}")).collect::<String>() } else { String::from_utf8_lossy(&w).into_owned() };
+            let same = if hex_form { got.eq_ignore_ascii_case(expected) } else { got == expected };
+            if !same {
+                out.push(format!("{key} {what}: expected {expected}, wrote {got}"));
+            }
+        }
+        (Ok(w), None, Some(code)) => out.push(format!("{key} {what}: expected the refusal {code}, wrote {}", show(&w))),
+        (Err(e), _, Some(code)) => {
+            if e.code().id() != code {
+                out.push(format!("{key} {what}: expected the refusal {code}, got {}: {e}", e.code()));
+            }
+        }
+        (Err(e), Some(expected), _) => out.push(format!("{key} {what}: expected {expected}, but the writer refused: {}: {e}", e.code())),
+        _ => {}
+    };
+    let text = |k: &str| want.get(k).and_then(Value::as_str);
+    if text("tnc2").is_some() || text("tnc2_refusal").is_some() {
+        one("tnc2", packet.to_tnc2(), text("tnc2"), text("tnc2_refusal"), false);
+    }
+    if text("ax25_hex").is_some() || text("ax25_refusal").is_some() {
+        one("ax25", packet.to_ax25(), text("ax25_hex"), text("ax25_refusal"), true);
+    }
+    result(out)
 }
 
 fn readback(case: &Value) -> Result<(), String> {

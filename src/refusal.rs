@@ -11,9 +11,11 @@ use core::fmt;
 pub enum RefusalCode {
     /// A header address is not 1-9 letters, digits or `-` in TNC2 text.
     InvalidAddress,
-    /// An AX.25 frame cannot carry the header: a call over 6 characters or in lower case, an SSID over 15 or with a leading zero, more than 8 path entries.
+    /// A path has an entry not marked used before one that is: every entry before a used one has been used, so it would read back used.
+    InvalidPath,
+    /// An AX.25 frame cannot carry the packet: a call over 6 characters, in lower case or empty, an SSID over 15 or with a leading zero, more than 8 path entries.
     Ax25CannotCarry,
-    /// A TNC2 line cannot carry the packet: its information field is not UTF-8 text.
+    /// A TNC2 line cannot carry the packet: a CR or LF inside its information field (one at the very end is carried).
     Tnc2CannotCarry,
     /// A third-party packet's inner header cannot be written as received.
     InvalidThirdPartyHeader,
@@ -67,8 +69,9 @@ pub enum RefusalCode {
 
 impl RefusalCode {
     /// Every code, in the order of the vectors' `refusals` list.
-    pub const ALL: [RefusalCode; 27] = [
+    pub const ALL: [RefusalCode; 28] = [
         RefusalCode::InvalidAddress,
+        RefusalCode::InvalidPath,
         RefusalCode::Ax25CannotCarry,
         RefusalCode::Tnc2CannotCarry,
         RefusalCode::InvalidThirdPartyHeader,
@@ -101,6 +104,7 @@ impl RefusalCode {
     pub const fn id(self) -> &'static str {
         match self {
             RefusalCode::InvalidAddress => "invalid-address",
+            RefusalCode::InvalidPath => "invalid-path",
             RefusalCode::Ax25CannotCarry => "ax25-cannot-carry",
             RefusalCode::Tnc2CannotCarry => "tnc2-cannot-carry",
             RefusalCode::InvalidThirdPartyHeader => "invalid-third-party-header",
@@ -162,11 +166,10 @@ pub(crate) fn check_size(bytes: usize) -> Result<(), crate::EncodeError> {
 
 /// The order in which a refusal with several faults names its code (vectors DESIGN.md, ruling 1):
 /// the first code that applies.
-const ORDER: [RefusalCode; 27] = [
+const ORDER: [RefusalCode; 28] = [
     RefusalCode::NotEncodable,
     RefusalCode::InvalidAddress,
-    RefusalCode::Ax25CannotCarry,
-    RefusalCode::Tnc2CannotCarry,
+    RefusalCode::InvalidPath,
     RefusalCode::InvalidThirdPartyHeader,
     RefusalCode::InvalidAddressee,
     RefusalCode::InvalidName,
@@ -190,6 +193,8 @@ const ORDER: [RefusalCode; 27] = [
     RefusalCode::TextReadsAsField,
     RefusalCode::DoesNotReadBack,
     RefusalCode::InformationFieldTooLong,
+    RefusalCode::Ax25CannotCarry,
+    RefusalCode::Tnc2CannotCarry,
 ];
 
 impl RefusalCode {
@@ -207,7 +212,7 @@ impl RefusalCode {
 /// above, so the refusal does not depend on which check happens to run first. The encoder goes on
 /// after a fault, writing bytes that are thrown away, and gives the result at the end.
 #[derive(Default)]
-pub(crate) struct Pending(Option<crate::EncodeError>, Option<usize>);
+pub(crate) struct Pending(Option<crate::EncodeError>);
 
 impl Pending {
     pub(crate) fn note(&mut self, e: crate::EncodeError) {
@@ -227,21 +232,7 @@ impl Pending {
         }
     }
 
-    /// Remembers the size of the information field, `bytes` long. It is judged last, on the bytes
-    /// written: only when nothing else is wrong does `finish` name `information-field-too-long` for it.
-    pub(crate) fn size(&mut self, bytes: usize) {
-        self.1 = Some(bytes);
-    }
-
-    /// The first fault in the order; failing that, `information-field-too-long` when the size remembered is over 256 bytes.
-    pub(crate) fn finish(self) -> Result<(), crate::EncodeError> {
-        match self.0 {
-            Some(e) => Err(e),
-            None => self.1.map_or(Ok(()), check_size),
-        }
-    }
-
-    /// The faults only, for a caller that judges the size itself after a later check.
+    /// The first fault in the order. The read-back and the size are judged after it, on the bytes written.
     pub(crate) fn finish_faults(self) -> Result<(), crate::EncodeError> {
         self.0.map_or(Ok(()), Err)
     }

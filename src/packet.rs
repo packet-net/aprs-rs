@@ -79,6 +79,8 @@ impl Address {
     }
 }
 
+/// The address as held, for display. This is not a writer: it never refuses and is not read back (a
+/// header is written, and read back, by [`Packet::to_tnc2`] and [`Packet::to_ax25`]).
 impl fmt::Display for Address {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
@@ -198,7 +200,7 @@ impl core::error::Error for EncodeError {}
 
 /// An APRS packet: the header, the information field as received, what it decodes to, and
 /// everything the decoder noticed on the way.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub struct Packet {
     /// Who sent it.
@@ -217,6 +219,20 @@ pub struct Packet {
     /// kept as sent: an APRS-IS q-construct is read only in the outer header, so
     /// [`Packet::q_construct`] finds none here.
     pub third_party: bool,
+    /// Made by [`Packet::create`] or a builder from data it holds as given, not decoded from bytes.
+    pub(crate) built: bool,
+}
+
+impl PartialEq for Packet {
+    fn eq(&self, other: &Packet) -> bool {
+        self.source == other.source
+            && self.destination == other.destination
+            && self.path == other.path
+            && self.information == other.information
+            && self.data == other.data
+            && self.diagnostics == other.diagnostics
+            && self.third_party == other.third_party
+    }
 }
 
 impl Packet {
@@ -235,68 +251,7 @@ impl Packet {
         let third_party = depth > 0;
         let mut ctx = Context::new(options);
         ctx.depth = depth;
-        let Some(colon) = line.iter().position(|&b| b == b':') else {
-            ctx.error(Code::InvalidHeader, "no ':' ends the header (SOURCE>DEST[,PATH]:)", None);
-            return Err(ctx.header_error());
-        };
-        let (header, info) = (&line[..colon], &line[colon + 1..]);
-        let Ok(header) = core::str::from_utf8(header) else {
-            ctx.error(Code::InvalidHeader, "the header is not text", Some(0));
-            return Err(ctx.header_error());
-        };
-        let Some((source, rest)) = header.split_once('>') else {
-            ctx.error(Code::InvalidHeader, "no '>' between source and destination", None);
-            return Err(ctx.header_error());
-        };
-        if source.is_empty() {
-            ctx.error(Code::InvalidHeader, "the source address is empty", Some(0));
-            return Err(ctx.header_error());
-        }
-
-        let mut fields = rest.split(',');
-        let destination = fields.next().unwrap_or("");
-        let source = if third_party && Address::is_third_party_source(source) {
-            Address::unchecked(source.to_string())
-        } else {
-            header_address(&mut ctx, source)?
-        };
-        let destination = if destination.is_empty() {
-            if !ctx.tolerate(Code::EmptyDestination, "the destination address is empty (UAP 5.2)", None) {
-                return Err(ctx.header_error());
-            }
-            Address::unchecked(String::new())
-        } else {
-            header_address(&mut ctx, destination)?
-        };
-
-        let mut path = Vec::new();
-        let mut used_markers = 0;
-        for field in fields {
-            if field.is_empty() {
-                if !ctx.tolerate(Code::EmptyPathEntry, "the path has an empty entry (UAP 5.6)", None) {
-                    return Err(ctx.header_error());
-                }
-                continue;
-            }
-            let (text, used) = match field.strip_suffix('*') {
-                Some(text) => (text, true),
-                None => (field, false),
-            };
-            used_markers += usize::from(used);
-            path.push(PathEntry { address: header_address(&mut ctx, text)?, used });
-        }
-
-        if used_markers > 1 && !ctx.tolerate(Code::MultipleUsedMarkers, "more than one path entry is marked used with * (UAP 5.30)", None) {
-            return Err(ctx.header_error());
-        }
-
-        // Every entry up to the last one marked used has been used.
-        if let Some(last) = path.iter().rposition(|e| e.used) {
-            for entry in &mut path[..last] {
-                entry.used = true;
-            }
-        }
-
+        let ((source, destination, path), info) = tnc2_header(&mut ctx, line, third_party)?;
         let mut packet = Packet::decode_with_context(ctx, source, destination, path, info);
         packet.third_party = third_party;
         Ok(packet)
@@ -305,54 +260,8 @@ impl Packet {
     /// Decodes an AX.25 UI frame in KISS form: addresses, control and PID, information; no flags, no FCS.
     pub fn decode_ax25(frame: &[u8], options: ParseOptions) -> Result<Packet, HeaderError> {
         let mut ctx = Context::new(options);
-        let mut addresses = Vec::new();
-        let mut at = 0;
-        loop {
-            if frame.len() < at + 7 {
-                ctx.error(Code::NotAprsFrame, "the frame ends inside its address field", Some(at));
-                return Err(ctx.header_error());
-            }
-            let chunk = &frame[at..at + 7];
-            addresses.push(chunk);
-            at += 7;
-            if chunk[6] & 1 == 1 {
-                break;
-            }
-        }
-
-        if addresses.len() < 2 {
-            ctx.error(Code::NotAprsFrame, "the frame has no source address", Some(0));
-            return Err(ctx.header_error());
-        }
-        if addresses.len() > 10 {
-            ctx.error(Code::TooManyDigipeaters, "the frame has more than 8 digipeater addresses", Some(0));
-            return Err(ctx.header_error());
-        }
-        if frame.len() < at + 2 || frame[at] & !0x10 != 0x03 || frame[at + 1] != 0xF0 {
-            ctx.error(Code::NotAprsFrame, "not a UI frame with PID 0xF0 (APRS12c ch. 3)", Some(at));
-            return Err(ctx.header_error());
-        }
-
-        let mut decoded = Vec::with_capacity(addresses.len());
-        for (i, bytes) in addresses.iter().enumerate() {
-            let role = match i {
-                0 => AddressRole::Destination,
-                1 => AddressRole::Source,
-                _ => AddressRole::Path,
-            };
-            decoded.push(ax25_address(&mut ctx, bytes, i * 7, role)?);
-        }
-
-        let mut decoded = decoded.into_iter();
-        let destination = decoded.next().flatten().unwrap_or_else(|| Address::unchecked(String::new()));
-        let source = decoded.next().flatten().unwrap_or_else(|| Address::unchecked(String::new()));
-        // A digipeater of spaces only is an empty path entry, tolerated and left out.
-        let path = addresses[2..]
-            .iter()
-            .zip(decoded)
-            .filter_map(|(bytes, address)| address.map(|address| PathEntry { address, used: bytes[6] & 0x80 != 0 }))
-            .collect();
-        Ok(Packet::decode_with_context(ctx, source, destination, path, &frame[at + 2..]))
+        let ((source, destination, path), at) = ax25_header(&mut ctx, frame)?;
+        Ok(Packet::decode_with_context(ctx, source, destination, path, &frame[at..]))
     }
 
     /// Decodes an information field whose header you already have.
@@ -362,31 +271,53 @@ impl Packet {
 
     fn decode_with_context(mut ctx: Context, source: Address, destination: Address, path: Vec<PathEntry>, information: &[u8]) -> Packet {
         let data = crate::decode::information(&mut ctx, &source, &destination, &path, information);
-        Packet { source, destination, path, information: information.to_vec(), data, diagnostics: ctx.diagnostics, third_party: false }
+        Packet {
+            source,
+            destination,
+            path,
+            information: information.to_vec(),
+            data,
+            diagnostics: ctx.diagnostics,
+            third_party: false,
+            built: false,
+        }
     }
 
     /// Builds a packet from data, encoding its information field. For Mic-E data the destination
     /// address is worked out from the report (it carries the latitude, message code and digipeat
     /// path, APRS12c ch. 10), and `destination` is not used.
     ///
-    /// Refuses with `invalid-address` a header that a TNC2 line cannot carry: every address must be
-    /// 1-9 letters, digits or `-`, so a third-party source such as `PY2SP_R-R` cannot head a packet
-    /// of its own, and no address may be empty. The header is checked before the data, and the
-    /// destination of Mic-E data is not checked because it is worked out from the report.
+    /// The header is judged before the data: `invalid-address` for a header a TNC2 line cannot carry
+    /// (every address must be 1-9 letters, digits or `-`, so a third-party source such as `PY2SP_R-R`
+    /// cannot head a packet of its own, and no address may be empty), then `invalid-path` for a path with
+    /// an entry not marked used before one that is. The destination of Mic-E data is not checked because
+    /// it is worked out from the report.
     pub fn create(source: Address, destination: Address, path: Vec<PathEntry>, data: Data) -> Result<Packet, EncodeError> {
-        let mic_e = matches!(data, Data::MicE(_));
-        if !Address::is_valid(source.as_str())
-            || (!mic_e && !Address::is_valid(destination.as_str()))
-            || path.iter().any(|e| !Address::is_valid(e.address.as_str()))
-        {
-            return Err(EncodeError::new(RefusalCode::InvalidAddress, "a header address is not 1-9 letters, digits or -"));
+        Packet::create_for(source, destination, path, data, false)
+    }
+
+    /// As [`Packet::create`]. `bytes_first` is the Mic-E builder saying the altitude goes in the Mic-E
+    /// bytes first, whatever its value.
+    pub(crate) fn create_for(
+        source: Address,
+        destination: Address,
+        path: Vec<PathEntry>,
+        data: Data,
+        bytes_first: bool,
+    ) -> Result<Packet, EncodeError> {
+        if matches!(data, Data::Unrecognized(_)) {
+            return Err(EncodeError::new(RefusalCode::NotEncodable, "undecoded data has nothing to encode"));
         }
-        let (destination, information) = match &data {
-            Data::MicE(report) => crate::mic_e::encode(report)?,
-            data => (destination, data.encode()?),
-        };
+        let mic_e = matches!(data, Data::MicE(_));
+        crate::readback::check_header(&source, (!mic_e).then_some(&destination), &path, false)?;
+        let (computed, information) = data.seal_for(bytes_first)?.into_parts();
+        let destination = computed.unwrap_or(destination);
+        // The field is read back under the header written, not only under the default one.
+        if crate::readback::mic_e_reads_as_other_data(&source, &destination, &path, &information, &data) {
+            return Err(crate::readback::reads_as_other_data());
+        }
         let decoded = Packet::decode(source.clone(), destination.clone(), path.clone(), &information, ParseOptions::STRICT);
-        Ok(Packet { source, destination, path, information, data, diagnostics: decoded.diagnostics, third_party: false })
+        Ok(Packet { source, destination, path, information, data, diagnostics: decoded.diagnostics, third_party: false, built: true })
     }
 
     /// Whether any diagnostic is a warning.
@@ -412,10 +343,57 @@ impl Packet {
 
     /// The packet as a TNC2 text line (without a line ending). The last used path entry is marked `*`.
     ///
-    /// This writes out a packet the program already holds, so it is not an encoder: the information
-    /// field is passed through as it stands and no size check is made (a decoded packet over 256
-    /// bytes is written as received). `Data::encode` and the builders are the encoders that refuse one.
-    pub fn to_tnc2(&self) -> Vec<u8> {
+    /// The information field is decoded under the header written and compared with the data held: when it reads as
+    /// other data (changed in place or by hand: a different latitude, text, or an inner packet's data or header at
+    /// any depth; Mic-E bytes under a plain destination; a plain field under a Mic-E destination) it is
+    /// `not-encodable`. A packet that came from a decode is compared exactly, one the library built from data with
+    /// the read-back's rounding allowance.
+    ///
+    /// The header is read back before it is returned, as a user's decode of a line reads it, whatever
+    /// the packet's origin: an address a TNC2 header cannot carry (a third-party inner packet's source
+    /// such as `PY2SP_R-R`, say) is `invalid-address`, and a path with an entry not marked used before
+    /// one that is would read back with that entry used, `invalid-path`. A CR or LF inside the
+    /// information field would end the line there, so it is refused (`tnc2-cannot-carry`); a trailing run of
+    /// them at the very end is carried.
+    ///
+    /// This writes out a packet the program already holds, so it is not an encoder: `information` is
+    /// passed through as it stands (the public field, as held) and no size check is made (a decoded
+    /// packet over 256 bytes is written as received). `Data::encode` and the builders are the encoders
+    /// that refuse one.
+    pub fn to_tnc2(&self) -> Result<Vec<u8>, EncodeError> {
+        self.check_reads_as_held()?;
+        let mut out = crate::readback::tnc2_header(&self.source, &self.destination, &self.path)?;
+        if crate::readback::line_break_inside(&self.information) {
+            return Err(EncodeError::new(
+                RefusalCode::Tnc2CannotCarry,
+                "a CR or LF inside the information field would end the line there: a TNC2 line cannot carry it",
+            ));
+        }
+        out.reserve(self.information.len());
+        out.extend_from_slice(&self.information);
+        Ok(out)
+    }
+
+    /// The information field read under the header this packet is written with must be the data the packet
+    /// holds (`not-encodable` when it is not), as when a held packet is re-addressed or changed in place.
+    fn check_reads_as_held(&self) -> Result<(), EncodeError> {
+        if crate::readback::header_reads_as_other_data(
+            &self.source,
+            &self.destination,
+            &self.path,
+            &self.information,
+            &self.data,
+            !self.built,
+            self.third_party,
+        ) {
+            return Err(crate::readback::reads_as_other_data());
+        }
+        Ok(())
+    }
+
+    /// The TNC2 line with no read-back of its header: a third-party packet's inner packet, whose
+    /// header the outer packet's read-back reads again.
+    pub(crate) fn tnc2_unchecked(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(32 + self.information.len());
         out.extend_from_slice(self.source.as_str().as_bytes());
         out.push(b'>');
@@ -433,27 +411,18 @@ impl Packet {
         out
     }
 
-    /// The packet as an AX.25 UI frame in KISS form (no flags, no FCS). Fails if an address
-    /// cannot be sent over the air, or the path is longer than 8 entries.
+    /// The packet as an AX.25 UI frame in KISS form (no flags, no FCS). The header is judged as for
+    /// [`to_tnc2`](Packet::to_tnc2) (`invalid-address`, `invalid-path`), then a frame refuses
+    /// (`ax25-cannot-carry`) an address it cannot send (a call over 6 characters, in lower case or empty,
+    /// an SSID over 15) and a path of more than 8 entries; an empty destination is never written as spaces.
     ///
     /// Like [`to_tnc2`](Packet::to_tnc2), this writes out a packet the program already holds and is
-    /// not an encoder: the information field is passed through as it stands, with no size check.
+    /// not an encoder: `information` is passed through as it stands, with no size check, and the
+    /// addresses are read back before the frame is returned.
     pub fn to_ax25(&self) -> Result<Vec<u8>, EncodeError> {
-        if self.path.len() > 8 {
-            return Err(EncodeError::new(RefusalCode::Ax25CannotCarry, "an AX.25 frame has room for at most 8 digipeaters"));
-        }
-        let mut out = Vec::with_capacity(16 + 7 * self.path.len() + self.information.len());
-        let all = [(&self.destination, 0xE0u8), (&self.source, 0x60u8)];
-        for (address, flags) in all {
-            write_ax25_address(&mut out, address, flags)?;
-        }
-        for entry in &self.path {
-            write_ax25_address(&mut out, &entry.address, if entry.used { 0xE0 } else { 0x60 })?;
-        }
-        let last = out.len() - 1;
-        out[last] |= 1;
-        out.push(0x03);
-        out.push(0xF0);
+        self.check_reads_as_held()?;
+        let mut out = crate::readback::ax25_header(&self.source, &self.destination, &self.path, write_ax25_address)?;
+        out.reserve(self.information.len());
         out.extend_from_slice(&self.information);
         Ok(out)
     }
@@ -463,6 +432,134 @@ impl Packet {
 fn is_q_construct(text: &str) -> bool {
     let b = text.as_bytes();
     b.len() == 3 && b[0] == b'q' && b[1].is_ascii_uppercase() && b[2].is_ascii_alphabetic()
+}
+
+/// A header: source, destination and path.
+pub(crate) type Header = (Address, Address, Vec<PathEntry>);
+
+/// The header of a TNC2 line, `SOURCE>DEST[,PATH]:`, and the information field after it. Every
+/// entry up to the last one marked used is used.
+pub(crate) fn tnc2_header<'a>(ctx: &mut Context, line: &'a [u8], third_party: bool) -> Result<(Header, &'a [u8]), HeaderError> {
+    let Some(colon) = line.iter().position(|&b| b == b':') else {
+        ctx.error(Code::InvalidHeader, "no ':' ends the header (SOURCE>DEST[,PATH]:)", None);
+        return Err(ctx.header_error());
+    };
+    let (header, info) = (&line[..colon], &line[colon + 1..]);
+    let Ok(header) = core::str::from_utf8(header) else {
+        ctx.error(Code::InvalidHeader, "the header is not text", Some(0));
+        return Err(ctx.header_error());
+    };
+    let Some((source, rest)) = header.split_once('>') else {
+        ctx.error(Code::InvalidHeader, "no '>' between source and destination", None);
+        return Err(ctx.header_error());
+    };
+    if source.is_empty() {
+        ctx.error(Code::InvalidHeader, "the source address is empty", Some(0));
+        return Err(ctx.header_error());
+    }
+
+    let mut fields = rest.split(',');
+    let destination = fields.next().unwrap_or("");
+    let source = if third_party && Address::is_third_party_source(source) {
+        Address::unchecked(source.to_string())
+    } else {
+        header_address(ctx, source)?
+    };
+    let destination = if destination.is_empty() {
+        if !ctx.tolerate(Code::EmptyDestination, "the destination address is empty (UAP 5.2)", None) {
+            return Err(ctx.header_error());
+        }
+        Address::unchecked(String::new())
+    } else {
+        header_address(ctx, destination)?
+    };
+
+    let mut path = Vec::new();
+    let mut used_markers = 0;
+    for field in fields {
+        if field.is_empty() {
+            if !ctx.tolerate(Code::EmptyPathEntry, "the path has an empty entry (UAP 5.6)", None) {
+                return Err(ctx.header_error());
+            }
+            continue;
+        }
+        let (text, used) = match field.strip_suffix('*') {
+            Some(text) => (text, true),
+            None => (field, false),
+        };
+        used_markers += usize::from(used);
+        path.push(PathEntry { address: header_address(ctx, text)?, used });
+    }
+
+    if used_markers > 1 && !ctx.tolerate(Code::MultipleUsedMarkers, "more than one path entry is marked used with * (UAP 5.30)", None) {
+        return Err(ctx.header_error());
+    }
+
+    // Every entry up to the last one marked used has been used.
+    if let Some(last) = path.iter().rposition(|e| e.used) {
+        for entry in &mut path[..last] {
+            entry.used = true;
+        }
+    }
+    Ok(((source, destination, path), info))
+}
+
+/// The addresses of an AX.25 UI frame, and where its information field starts.
+pub(crate) fn ax25_header(ctx: &mut Context, frame: &[u8]) -> Result<(Header, usize), HeaderError> {
+    let mut addresses = Vec::new();
+    let mut at = 0;
+    loop {
+        if frame.len() < at + 7 {
+            ctx.error(Code::NotAprsFrame, "the frame ends inside its address field", Some(at));
+            return Err(ctx.header_error());
+        }
+        let chunk = &frame[at..at + 7];
+        addresses.push(chunk);
+        at += 7;
+        if chunk[6] & 1 == 1 {
+            break;
+        }
+    }
+
+    if addresses.len() < 2 {
+        ctx.error(Code::NotAprsFrame, "the frame has no source address", Some(0));
+        return Err(ctx.header_error());
+    }
+    if addresses.len() > 10 {
+        ctx.error(Code::TooManyDigipeaters, "the frame has more than 8 digipeater addresses", Some(0));
+        return Err(ctx.header_error());
+    }
+    if frame.len() < at + 2 || frame[at] & !0x10 != 0x03 || frame[at + 1] != 0xF0 {
+        ctx.error(Code::NotAprsFrame, "not a UI frame with PID 0xF0 (APRS12c ch. 3)", Some(at));
+        return Err(ctx.header_error());
+    }
+
+    let mut decoded = Vec::with_capacity(addresses.len());
+    for (i, bytes) in addresses.iter().enumerate() {
+        let role = match i {
+            0 => AddressRole::Destination,
+            1 => AddressRole::Source,
+            _ => AddressRole::Path,
+        };
+        decoded.push(ax25_address(ctx, bytes, i * 7, role)?);
+    }
+
+    let mut decoded = decoded.into_iter();
+    let destination = decoded.next().flatten().unwrap_or_else(|| Address::unchecked(String::new()));
+    let source = decoded.next().flatten().unwrap_or_else(|| Address::unchecked(String::new()));
+    // A digipeater of spaces only is an empty path entry, tolerated and left out.
+    let mut path: Vec<PathEntry> = addresses[2..]
+        .iter()
+        .zip(decoded)
+        .filter_map(|(bytes, address)| address.map(|address| PathEntry { address, used: bytes[6] & 0x80 != 0 }))
+        .collect();
+    // H bits are read as TNC2 marks are: every entry before the last one with its bit set has been used.
+    if let Some(last) = path.iter().rposition(|e| e.used) {
+        for entry in &mut path[..last] {
+            entry.used = true;
+        }
+    }
+    Ok(((source, destination, path), at + 2))
 }
 
 fn header_address(ctx: &mut Context, text: &str) -> Result<Address, HeaderError> {

@@ -13,7 +13,7 @@ fn me() -> Station {
 /// The packet as TNC2 text, after checking it reads back under strict parsing with no warning or error
 /// (a positionless weather report still gets its "not recommended" note).
 fn sent(packet: Packet) -> String {
-    let line = String::from_utf8(packet.to_tnc2()).unwrap();
+    let line = String::from_utf8(packet.to_tnc2().unwrap()).unwrap();
     let heard = Packet::decode_tnc2(line.as_bytes(), ParseOptions::STRICT).unwrap();
     let complaints: Vec<_> = heard.diagnostics.iter().filter(|d| d.severity != Severity::Info).collect();
     assert!(complaints.is_empty(), "{line}: {complaints:?}");
@@ -573,4 +573,19 @@ fn a_mic_e_comment_after_a_frequency_that_would_read_as_a_suffix_takes_a_slash()
 fn a_mic_e_comment_that_something_follows_needs_no_slash() {
     let line = sent(me().mic_e(42.179, -71.1985).symbol(Symbol::CAR).frequency(144.39).comment("X").dao().build().unwrap());
     assert!(line.contains("144.390MHz X!"), "{line}");
+}
+
+#[test]
+fn a_mic_e_altitude_in_a_slash_a_that_reads_back_but_is_too_long_is_refused_for_its_size() {
+    // 53346 feet is held exactly only by a /A=; the Mic-E bytes do not read back beside the comment's /A=, and the /A= form does, at 292 bytes.
+    let comment = format!("440 Voice 442.000{}/A=001234{}WX", "x".repeat(95), "x".repeat(150));
+    let built = pdn_aprs::Station::new("VK2XYZ-15")
+        .unwrap()
+        .mic_e(55.2574, 31.2727)
+        .symbol(pdn_aprs::Symbol::new('3', '>'))
+        .altitude_feet(53346.0)
+        .comment(&comment)
+        .messaging()
+        .build();
+    assert_eq!(built.unwrap_err().code(), pdn_aprs::RefusalCode::InformationFieldTooLong);
 }

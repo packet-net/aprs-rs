@@ -8,32 +8,86 @@ use alloc::vec::Vec;
 
 use crate::RefusalCode;
 use crate::comment::{self, KNOTS_TO_MPH, beacon_rate_char};
-use crate::context::Context;
 use crate::position::{self, type_to_bits};
+use crate::readback::{Forms, Sealed};
 use crate::refusal::Pending;
 use crate::weather::{self, push_digits};
 use crate::{
     CompressionFix, CompressionOrigin, CompressionSource, CompressionType, DaoPrecision, Data, EncodeError, ItemReport, ObjectReport,
-    ParseOptions, PositionReport, Positioned, Timestamp, Tone,
+    PositionReport, Positioned, Timestamp, Tone,
 };
 
 impl Data {
     /// The information field for this data. Fails, naming the field, when the data cannot be
-    /// written as APRS12c allows, and when the information field would be over 256 bytes (`too-long`).
+    /// written as APRS12c allows, and when the information field would be over 256 bytes (`information-field-too-long`).
     /// Text with a control character is refused (`invalid-character`). Mic-E data is refused, since it carries half its position in
     /// the destination address: use [`crate::Packet::create`], which works that address out.
+    ///
+    /// What is written is decoded again before it is returned and must read back as the data given
+    /// (see [`crate::RefusalCode::DoesNotReadBack`]): the encoder writes the next equivalent form the
+    /// spec allows when the first does not, and refuses when none does.
     pub fn encode(&self) -> Result<Vec<u8>, EncodeError> {
-        let mut out = Vec::new();
-        match self {
-            Data::Position(r) => position_report(&mut out, r)?,
-            Data::Object(o) => object(&mut out, o)?,
-            Data::Item(i) => item(&mut out, i)?,
-            Data::MicE(_) => {
-                return Err(EncodeError::new(
-                    RefusalCode::NotEncodable,
-                    "Mic-E data carries half its position in the destination address, which this information field leaves out: use Packet::create",
-                ));
+        if matches!(self, Data::MicE(_)) {
+            return Err(EncodeError::new(
+                RefusalCode::NotEncodable,
+                "Mic-E data carries half its position in the destination address, which this information field leaves out: use Packet::create",
+            ));
+        }
+        Ok(self.seal()?.into_bytes())
+    }
+
+    /// Writes this data and reads it back: the one way bytes leave an encoder. A Mic-E report is
+    /// written too, for [`crate::Packet::create`], with the destination it computes.
+    pub(crate) fn seal(&self) -> Result<Sealed, EncodeError> {
+        self.seal_for(false)
+    }
+
+    /// As [`Data::seal`]. `bytes_first` is what a builder says of a Mic-E altitude it was given: the
+    /// Mic-E altitude bytes are the first form, whatever the value (neutral data puts a whole number
+    /// of feet that the bytes do not hold exactly in a `/A=` first). It is an argument, not a mark on the data.
+    pub(crate) fn seal_for(&self, bytes_first: bool) -> Result<Sealed, EncodeError> {
+        // A non-finite number anywhere, an inner packet's included, is `not-a-number`, wherever the
+        // report's own checks stand in the order: a fault ranked before it is named first.
+        let not_a_number = crate::readback::has_non_finite(self);
+        let refuse = |e: EncodeError| {
+            if not_a_number && !e.code().precedes(RefusalCode::NotANumber) {
+                EncodeError::new(RefusalCode::NotANumber, "a number in the data is NaN or infinite")
+            } else {
+                e
             }
+        };
+        let sealed = match self {
+            Data::MicE(r) => {
+                let sealed = crate::readback::seal(self, crate::mic_e::forms(r, false, bytes_first).map_err(refuse)?);
+                match sealed {
+                    // The next form the Encoding rule names: an altitude in a `/A=` where the Mic-E bytes do not read back.
+                    Err(e)
+                        if matches!(e.code(), RefusalCode::TextReadsAsField | RefusalCode::DoesNotReadBack)
+                            && crate::mic_e::altitude_has_text_form(r, bytes_first) =>
+                    {
+                        // A form that reads back but is too long is refused for its size; any other fault is the first form's.
+                        crate::readback::seal(self, crate::mic_e::forms(r, true, bytes_first).map_err(refuse)?)
+                            .map_err(|second| if second.code() == RefusalCode::InformationFieldTooLong { second } else { e })
+                    }
+                    other => other,
+                }
+            }
+            other => crate::readback::seal(other, other.forms().map_err(refuse)?),
+        };
+        if not_a_number && sealed.is_ok() {
+            return Err(EncodeError::new(RefusalCode::NotANumber, "a number in the data is NaN or infinite"));
+        }
+        sealed.map_err(refuse)
+    }
+
+    /// The forms this data may be written in, best first. Nothing here returns bytes to a caller: they
+    /// pass through [`crate::readback::seal`] first.
+    pub(crate) fn forms(&self) -> Result<Forms, EncodeError> {
+        match self {
+            Data::Position(r) => position_report(r),
+            Data::Object(o) => object(o),
+            Data::Item(i) => item(i),
+            Data::MicE(_) => Err(EncodeError::new(RefusalCode::NotEncodable, "Mic-E data is written by Packet::create")),
             Data::Message(_)
             | Data::Ack(_)
             | Data::Reject(_)
@@ -43,15 +97,15 @@ impl Data {
             | Data::TelemetryUnits(_)
             | Data::TelemetryCoefficients(_)
             | Data::TelemetryBits(_)
-            | Data::DirectedQuery(_) => return crate::message::encode(self),
-            other => return crate::other::encode(other),
+            | Data::DirectedQuery(_) => crate::message::encode(self),
+            other => crate::other::encode(other),
         }
-        Ok(out)
     }
 }
 
-fn position_report(out: &mut Vec<u8>, r: &PositionReport) -> Result<(), EncodeError> {
+fn position_report(r: &PositionReport) -> Result<Forms, EncodeError> {
     let mut p = Pending::default();
+    let mut out = Vec::new();
     out.push(match (r.timestamp.is_some(), r.messaging) {
         (false, false) => b'!',
         (false, true) => b'=',
@@ -59,12 +113,13 @@ fn position_report(out: &mut Vec<u8>, r: &PositionReport) -> Result<(), EncodeEr
         (true, true) => b'@',
     });
     if let Some(t) = &r.timestamp {
-        p.run(dhm_or_hms(out, t));
+        p.run(dhm_or_hms(&mut out, t));
     }
     positioned(out, &r.fields, p)
 }
 
-fn object(out: &mut Vec<u8>, o: &ObjectReport) -> Result<(), EncodeError> {
+fn object(o: &ObjectReport) -> Result<Forms, EncodeError> {
+    let mut out = Vec::new();
     let name = o.name.as_bytes();
     if name.is_empty() || name.len() > 9 || !crate::text::is_printable_ascii(name) {
         return Err(EncodeError::new(RefusalCode::InvalidName, "an object name is 1-9 printable ASCII characters (APRS12c ch. 11)"));
@@ -80,13 +135,14 @@ fn object(out: &mut Vec<u8>, o: &ObjectReport) -> Result<(), EncodeError> {
     match &o.timestamp {
         None => p.note(EncodeError::new(RefusalCode::MissingField, "an object report must have a timestamp (APRS12c ch. 11)")),
         Some(t) => {
-            p.run(dhm_or_hms(out, t));
+            p.run(dhm_or_hms(&mut out, t));
         }
     }
     positioned(out, &o.fields, p)
 }
 
-fn item(out: &mut Vec<u8>, i: &ItemReport) -> Result<(), EncodeError> {
+fn item(i: &ItemReport) -> Result<Forms, EncodeError> {
+    let mut out = Vec::new();
     let name = i.name.as_bytes();
     if !(3..=9).contains(&name.len()) || !crate::text::is_printable_ascii(name) || name.contains(&b'!') || name.contains(&b'_') {
         return Err(EncodeError::new(
@@ -125,7 +181,8 @@ pub(crate) fn check_timestamp(t: &Timestamp) -> Result<(), EncodeError> {
 
 /// The position, symbol, extension, weather and comment of a position, object or item. `p` holds
 /// what is already wrong with the report around it.
-pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned, mut p: Pending) -> Result<(), EncodeError> {
+pub(crate) fn positioned(mut out: Vec<u8>, f: &Positioned, mut p: Pending) -> Result<Forms, EncodeError> {
+    let out = &mut out;
     let weather_symbol = comment::is_weather_symbol(f);
     if weather_symbol && f.weather.is_none() {
         // A report with the weather station symbol reads back as weather, whatever it holds.
@@ -181,7 +238,6 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned, mut p: Pending) -> R
         Some(d) if d.precision != DaoPrecision::None && !f.compressed => Some(d.precision == DaoPrecision::Base91),
         _ => None,
     };
-    let start = out.len();
     let mut dao_digits = None;
     let mut altitude_in_cs = false;
     let mut extension = false;
@@ -258,6 +314,9 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned, mut p: Pending) -> R
             out.push(b'}');
         }
         if let Some(w) = f.area.and_then(|a| a.corridor_width_miles) {
+            if !f.area.is_some_and(|a| matches!(a.shape, crate::AreaShape::LineDownRight | crate::AreaShape::LineDownLeft)) {
+                p.note(EncodeError::new(RefusalCode::FieldNotAllowed, "a corridor width goes only with an area that is a line"));
+            }
             if w > 999 {
                 p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "an area corridor width is at most 999 miles"));
             }
@@ -318,63 +377,33 @@ pub(crate) fn positioned(out: &mut Vec<u8>, f: &Positioned, mut p: Pending) -> R
         }
         trailer.push(b'!');
     }
-    // Write the text as it is (after a frequency, a space first); if it does not read back
-    // unchanged, try it without the space, then after a '/' delimiter. A weather report has no place
-    // for a comment, so the text makes no bytes there.
-    let separators: &[&[u8]] = if f.frequency.is_some() && !text.is_empty() { &[b" ", b"", b" /"] } else { &[b"", b"/"] };
-    let mut differs = "";
-    let mut read_back = false;
-    for separator in separators {
-        out.truncate(text_at);
-        if f.weather.is_some() && !separator.is_empty() {
-            break;
-        }
-        if f.weather.is_none() {
-            out.extend_from_slice(separator);
-            out.extend_from_slice(text);
-        }
-        out.extend_from_slice(&trailer);
-        match reads_back(&out[start..], f) {
-            Ok(()) => {
-                read_back = true;
-                break;
-            }
-            Err(what) => differs = what,
-        }
-    }
-    if !read_back {
-        // Nothing reads back: the size is of the first form written.
-        out.truncate(text_at);
-        if f.weather.is_none() {
-            out.extend_from_slice(separators[0]);
-            out.extend_from_slice(text);
-        }
-        out.extend_from_slice(&trailer);
-    }
-    // What is wrong on its own, or between fields, is named before the read-back result is, and
-    // the size, which only the bytes finally written have, comes last.
+    // The comment is written as it is (after a frequency, a space first); if that does not read back
+    // unchanged, the next form: without the space, then after a '/' delimiter. A weather report has no
+    // place for a comment, so the text makes no bytes there. What is wrong on its own, or between
+    // fields, is named before the read-back result is; the read-back and then the size come last.
     p.finish_faults()?;
-    if read_back {
-        return crate::refusal::check_size(out.len());
+    let separators: &[&[u8]] = if f.weather.is_some() {
+        &[b""]
+    } else if f.frequency.is_some() && !text.is_empty() {
+        &[b" ", b"", b" /"]
+    } else {
+        &[b"", b"/"]
+    };
+    let mut forms: Option<Forms> = None;
+    for separator in separators {
+        let mut form = Vec::with_capacity(text_at + separator.len() + text.len() + trailer.len());
+        form.extend_from_slice(&out[..text_at]);
+        if f.weather.is_none() {
+            form.extend_from_slice(separator);
+            form.extend_from_slice(text);
+        }
+        form.extend_from_slice(&trailer);
+        forms = Some(match forms {
+            None => Forms::new(form),
+            Some(forms) => forms.then(form),
+        });
     }
-    if f.weather.is_some() {
-        return Err(EncodeError::new(
-            RefusalCode::TextReadsAsField,
-            "the weather does not read back as given: a software type and unit, or an extra field, that would read as weather fields",
-        ));
-    }
-    if text.is_empty() {
-        return Err(EncodeError::new(
-            RefusalCode::DoesNotReadBack,
-            format!("the report does not read back as given: its {differs} differs"),
-        ));
-    }
-    Err(EncodeError::new(
-        RefusalCode::TextReadsAsField,
-        format!(
-            "comment text contains something that decodes as a structured element (altitude, !DAO!, |telemetry|, frequency, PHG/RNG/DFS or braces), so the {differs} reads back differently; set the property instead",
-        ),
-    ))
+    Ok(forms.unwrap_or_else(|| Forms::new(out.clone())))
 }
 
 /// Writes the compressed cs and type bytes. `true` when they carry the altitude exactly.
@@ -846,6 +875,9 @@ pub(crate) fn frequency(out: &mut Vec<u8>, f: &crate::VoiceFrequency, p: &mut Pe
             Tone::Ctcss => Some(b'C'),
             Tone::Dcs => Some(b'D'),
         };
+        if letter.is_none() && f.tone_value.is_some() {
+            p.note(EncodeError::new(RefusalCode::FieldNotAllowed, "this tone has no value: Toff and the 1750 Hz burst carry none"));
+        }
         if let Some(letter) = letter {
             match f.tone_value {
                 Some(value) if value <= 999 => {
@@ -858,16 +890,18 @@ pub(crate) fn frequency(out: &mut Vec<u8>, f: &crate::VoiceFrequency, p: &mut Pe
         }
     } else if f.narrow {
         p.note(EncodeError::new(RefusalCode::MissingField, "narrow band is written with the tone field, so it needs a tone"));
+    } else if f.tone_value.is_some() {
+        p.note(EncodeError::new(RefusalCode::MissingField, "a tone value needs the tone it belongs to"));
     }
     if let Some(offset) = f.offset_khz {
-        if offset.abs() > 9990 {
+        if offset.unsigned_abs() > 9990 {
             p.note(EncodeError::new(RefusalCode::ValueOutOfRange, "the offset is up to 9.99 MHz"));
         } else if offset % 10 != 0 {
             p.note(EncodeError::new(RefusalCode::ValueHasNoForm, "the offset is in 10 kHz steps"));
         } else {
             out.push(b' ');
             out.push(if offset < 0 { b'-' } else { b'+' });
-            push_digits(out, (offset.abs() / 10) as u32, 3);
+            push_digits(out, offset.unsigned_abs() / 10, 3);
         }
     }
     if let Some(range) = f.range {
@@ -906,56 +940,4 @@ pub(crate) fn telemetry_into(out: &mut Vec<u8>, t: &crate::CommentTelemetry, p: 
         crate::base91::encode(u32::from(d), 2, out);
     }
     out.push(b'|');
-}
-
-/// Whether what was written for `f` (from the position on) decodes back to the same comment and
-/// structured elements; if not, which one differs.
-fn reads_back(written: &[u8], f: &Positioned) -> Result<(), &'static str> {
-    let mut ctx = Context::new(ParseOptions::LENIENT);
-    let Some(decoded) = position::decode(&mut ctx, written, 0) else {
-        return Err("position");
-    };
-    let mut back =
-        Positioned { position: decoded.position, symbol: decoded.symbol, compressed: decoded.compressed, ..Positioned::default() };
-    if !comment::decode(&mut ctx, &mut back, decoded.cs, &written[decoded.len..], decoded.len) || ctx.has_errors() {
-        return Err("comment");
-    }
-    let close = |a: Option<f64>, b: Option<f64>, tolerance: f64| match (a, b) {
-        (None, None) => true,
-        (Some(x), Some(y)) => (x - y).abs() <= tolerance * x.abs().max(1.0),
-        _ => false,
-    };
-    // A /A= or RNG value is written rounded to its whole step.
-    let rounded = |a: Option<f64>, b: Option<f64>| a.is_some() && a == b.map(crate::steps::round);
-    // The cs bytes cannot hold an altitude of 1 foot or less: the nearest is cs 0, 1 foot, which
-    // a compressed weather report (no comment, so no `/A=`) is written with alone.
-    let cs_floor = |f: &Positioned, back: Option<f64>| {
-        f.compressed && f.weather.is_some() && f.altitude_feet.is_some_and(|feet| feet <= 1.0) && back == Some(1.0)
-    };
-    let frequency_fields =
-        |v: &Option<crate::VoiceFrequency>| v.as_ref().map(|x| (x.tone, x.tone_value, x.offset_khz, x.range, x.range_km, x.narrow));
-    let checks = [
-        (back.comment == f.comment, "comment"),
-        (back.phg == f.phg, "PHG"),
-        (back.dfs == f.dfs, "DFS"),
-        (back.area == f.area, "area"),
-        (back.df_bearing == f.df_bearing, "DF bearing"),
-        (back.storm == f.storm, "storm data"),
-        (back.telemetry == f.telemetry, "telemetry"),
-        (frequency_fields(&back.frequency) == frequency_fields(&f.frequency), "frequency"),
-        (back.signpost == f.signpost, "signpost"),
-        (back.dao.map(|d| d.datum) == f.dao.map(|d| d.datum), "DAO"),
-        (back.weather.as_ref().map(weather::text_parts) == f.weather.as_ref().map(weather::text_parts), "weather"),
-        (
-            close(back.altitude_feet, f.altitude_feet, 0.01)
-                || rounded(back.altitude_feet, f.altitude_feet)
-                || cs_floor(f, back.altitude_feet),
-            "altitude",
-        ),
-        (close(back.range_miles, f.range_miles, 0.1) || rounded(back.range_miles, f.range_miles), "range"),
-    ];
-    match checks.iter().find(|(same, _)| !same) {
-        Some((_, what)) => Err(what),
-        None => Ok(()),
-    }
 }

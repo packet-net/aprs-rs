@@ -6,7 +6,7 @@ Conforms to [aprs-vectors](https://github.com/packet-net/aprs-vectors) 1.2: ever
 
 - **Decoding never fails because of the information field.** Every deviation from the spec becomes a [`Diagnostic`] with a stable [`Code`], and the rest of the packet is still read where it can be.
 - **Strict or lenient, one defect at a time.** [`ParseOptions`] says which of the 33 tolerable defects to accept: lower-case hemispheres, unpadded object names, text after weather data, and so on. [`ParseOptions::LENIENT`] (the default) accepts them all, each with a warning. [`ParseOptions::STRICT`] accepts none. Any single one can be switched off.
-- **The encoder writes only what the spec allows.** It checks free text by decoding what it wrote: a comment that would read back as something else, such as an altitude, a data extension or a `!DAO!`, is escaped or refused rather than silently changed. It refuses an information field over 256 bytes (`information-field-too-long`, counted in bytes; `Packet::to_tnc2` and `Packet::to_ax25` only write out a packet you already hold and do not check the size) and text that holds a control character (`invalid-character`). Decoding has no size limit, and a control character in text decodes with a `control-character-in-text` warning.
+- **The encoder never returns bytes that do not read back as the data it was given.** Every call that writes bytes from data (`Data::encode`, `Packet::create` and the builders, in every report type, a third-party packet and its inner packet included) ends with one read-back: it decodes what it wrote, leniently, under a well-formed header (for Mic-E, the destination it computed) and compares the result with the data given. The decode must have no warning or error, and every field given must be in it with the same value and no other field with it; the only differences allowed are a number rounded once to the step of the form written (a compressed position, hundredths of a minute, a `!DAO!` digit, the cs bytes, a Mic-E metre), a value the form must carry (the default compression type, a Mic-E speed of 0, what an NMEA sentence determines), and an empty string or list that reads back as absent. When the first form does not match the encoder writes the next equivalent form the spec allows (a comment after a `/`, then after a space; an altitude in a `/A=` where the Mic-E bytes do not read back), and when none does it refuses (`text-reads-as-field` when free text reads back changed, otherwise `does-not-read-back`); no rule decides whether the check runs. A header is judged when it is given, before any data: an address a TNC2 header cannot carry is `invalid-address`, and a path with an entry not marked used before one that is is `invalid-path` (`Packet::create` and the builders refuse it, and so do `Packet::to_tnc2` and `Packet::to_ax25`). Those two write a packet you already hold, and read its header back as a user's decode of that form reads it, whatever the packet's origin (a third-party packet's inner packet written on its own is held to the outer address rule): `*` marks the last used entry only in a TNC2 line, an AX.25 frame sets the H bit of every used entry, an AX.25 frame refuses what AX.25 forbids (`ax25-cannot-carry`: a call over 6 characters, in lower case or empty, an SSID a frame cannot hold, over 8 path entries) and a TNC2 line refuses a CR or LF inside its information field (`tnc2-cannot-carry`; a trailing run of them at the very end is carried). The encoder also refuses an information field over 256 bytes (`information-field-too-long`, counted in bytes; `Packet::to_tnc2` and `Packet::to_ax25` write the information field as held and do not check the size) and text that holds a control character (`invalid-character`). A built packet's data holds the values as given (a Mic-E altitude in feet is not rounded to the metre; the allowed rounding is what lets its bytes read back), and `Display` of an address or timestamp and `Debug` of a packet show what is held: they are for display, not for sending, and never refuse. Decoding has no size limit, and a control character in text decodes with a `control-character-in-text` warning.
 
 It is built and tested against the language-neutral conformance vectors in [packet-net/aprs-vectors](https://github.com/packet-net/aprs-vectors), the same cases the C# implementation, [Packet.Aprs](https://www.nuget.org/packages/Packet.Aprs), runs.
 
@@ -47,7 +47,7 @@ let frame = [
     0xE2, 0xAE, 0x92, 0x88, 0x8A, 0x64, 0x40, 0x63, 0x03, 0xF0, b'>', b'h', b'e', b'l', b'l', b'o',
 ];
 let packet = Packet::decode_ax25(&frame, ParseOptions::default())?;
-assert_eq!(packet.to_tnc2(), b"M0LTE-9>APZ001,M0LTE-1*,WIDE2-1:>hello");
+assert_eq!(packet.to_tnc2()?, b"M0LTE-9>APZ001,M0LTE-1*,WIDE2-1:>hello");
 assert_eq!(packet.to_ax25()?, frame);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -86,10 +86,10 @@ use pdn_aprs::{Station, Symbol, Timestamp, Tone};
 let me = Station::new("M0LTE-9")?.via(&["WIDE1-1", "WIDE2-1"])?;
 
 let beacon = me.position(51.4543, -0.9781).symbol(Symbol::CAR).course_degrees(88.0).speed_knots(36.0).altitude_feet(120.0).comment("Mobile").build()?;
-assert_eq!(beacon.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:!5127.26N/00058.69W>088/036/A=000120Mobile");
+assert_eq!(beacon.to_tnc2()?, b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:!5127.26N/00058.69W>088/036/A=000120Mobile");
 
 let message = me.message("G3NRW", "Hi Ian").message_id("01").build()?;
-assert_eq!(message.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1::G3NRW    :Hi Ian{01");
+assert_eq!(message.to_tnc2()?, b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1::G3NRW    :Hi Ian{01");
 
 let repeater = me
     .object("MYRPTR")
@@ -100,10 +100,10 @@ let repeater = me
     .tone(Tone::Tone, 118)
     .offset_khz(-600)
     .build()?;
-assert_eq!(repeater.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:;MYRPTR   *251830z5127.00N/00058.80Wr145.725MHz T118 -060");
+assert_eq!(repeater.to_tnc2()?, b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:;MYRPTR   *251830z5127.00N/00058.80Wr145.725MHz T118 -060");
 
 let weather = me.weather().at(51.45, -0.98).wind_direction_degrees(220.0).wind_speed_mph(4.0).wind_gust_mph(5.0).temperature_f(77.0).build()?;
-assert_eq!(weather.to_tnc2(), b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:!5127.00N/00058.80W_220/004g005t077");
+assert_eq!(weather.to_tnc2()?, b"M0LTE-9>APZ001,WIDE1-1,WIDE2-1:!5127.00N/00058.80W_220/004g005t077");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -135,7 +135,7 @@ let packet = Packet::create(
     vec![PathEntry::new(Address::new("WIDE1-1")?)],
     Data::Position(report),
 )?;
-assert_eq!(packet.to_tnc2(), b"N0CALL-9>APZ001,WIDE1-1:=5130.00N/00007.00W>088/036/A=000120Mobile");
+assert_eq!(packet.to_tnc2()?, b"N0CALL-9>APZ001,WIDE1-1:=5130.00N/00007.00W>088/036/A=000120Mobile");
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 

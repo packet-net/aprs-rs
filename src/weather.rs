@@ -335,37 +335,29 @@ pub(crate) fn software_and_unit(rest: &[u8], weather: &mut Weather) -> bool {
     true
 }
 
-/// The parts of weather that are text rather than numbers: the software type, the unit and the
-/// extra fields. Written back, they must read back the same, and not as fields (`h89b1` as a
-/// software type and unit would read back as humidity).
-pub(crate) fn text_parts(w: &Weather) -> (Option<char>, Option<&str>, &[WeatherField]) {
-    (w.software, w.unit.as_deref(), &w.extra)
-}
-
 /// Writes the fields after the wind (gust, temperature, rain, humidity, pressure, luminosity, snow,
 /// raw rain, extra fields), then software and unit. Gust and temperature are mandatory, written as
 /// dots when unknown.
 pub(crate) fn write_fields(out: &mut Vec<u8>, w: &Weather, p: &mut Pending) {
     p.run(field(out, b'g', w.wind_gust_mph, 3, false));
     p.run(field(out, b't', w.temperature_f, 3, true));
-    p.run(optional(out, b'r', w.rain_1h_in.map(|v| v * 100.0), 3));
-    p.run(optional(out, b'p', w.rain_24h_in.map(|v| v * 100.0), 3));
-    p.run(optional(out, b'P', w.rain_midnight_in.map(|v| v * 100.0), 3));
+    p.run(optional(out, b'r', w.rain_1h_in, 100.0, 3));
+    p.run(optional(out, b'p', w.rain_24h_in, 100.0, 3));
+    p.run(optional(out, b'P', w.rain_midnight_in, 100.0, 3));
     if let Some(h) = w.humidity_percent {
-        // Rounded once to a whole percent: 99.7 is `h00`, and 0.4, which rounds to 0, is refused
+        // Rounded once to a whole percent: 99.7 is `h00`, and 0.4 and -0.4, which round to 0, are refused
         // since `h00` means 100.
         let original = h;
         let h = crate::steps::round(h);
         if !(1.0..=100.0).contains(&h) {
-            let code =
-                if (0.0..1.0).contains(&h) && original >= 0.0 { RefusalCode::ValueHasNoForm } else { RefusalCode::for_value(original) };
+            let code = if h == 0.0 && original > -0.5 { RefusalCode::ValueHasNoForm } else { RefusalCode::for_value(original) };
             p.note(EncodeError::new(code, "humidity must round to 1-100 percent"));
         } else {
             out.push(b'h');
             push_digits(out, h as u32 % 100, 2);
         }
     }
-    p.run(optional(out, b'b', w.pressure_mbar.map(|v| v * 10.0), 5));
+    p.run(optional(out, b'b', w.pressure_mbar, 10.0, 5));
     if let Some(l) = w.luminosity_w_m2 {
         // Rounded once to a whole number of W/m2.
         let given = l;
@@ -396,6 +388,10 @@ pub(crate) fn write_fields(out: &mut Vec<u8>, w: &Weather, p: &mut Pending) {
         // As they are read: a letter the spec does not define, then two or more digits, dots or
         // '-', ending in a digit.
         let v = extra.value.as_bytes();
+        if extra.letter.is_ascii_control() || crate::text::has_control_character(v) {
+            p.note(EncodeError::new(RefusalCode::InvalidCharacter, "an extra weather field cannot contain a control character"));
+            continue;
+        }
         if !extra.letter.is_ascii_alphabetic()
             || is_known(extra.letter as u8)
             || v.len() < 2
@@ -411,12 +407,23 @@ pub(crate) fn write_fields(out: &mut Vec<u8>, w: &Weather, p: &mut Pending) {
         out.push(extra.letter as u8);
         out.extend_from_slice(extra.value.as_bytes());
     }
-    match (w.software, &w.unit) {
+    if w.software.is_some_and(|s| s.is_ascii_control()) || w.unit.as_ref().is_some_and(|u| crate::text::has_control_character(u.as_bytes()))
+    {
+        p.note(EncodeError::new(RefusalCode::InvalidCharacter, "weather software and unit cannot contain a control character"));
+        return;
+    }
+    // An empty unit is no unit (empty and absent are one value).
+    match (w.software, &w.unit.as_ref().filter(|u| !u.is_empty())) {
         (Some(s), Some(u)) if s.is_ascii() && is_software_and_unit(alloc::format!("{s}{u}").as_bytes()) => {
             out.push(s as u8);
             out.extend_from_slice(u.as_bytes());
         }
         (None, None) => {}
+        // The software type and its unit are one thing (the Weather rule): one without the other is a field needed only because the other is there.
+        (Some(_), None) | (None, Some(_)) => p.note(EncodeError::new(
+            RefusalCode::MissingField,
+            "a weather software type goes with its unit, and a unit with its software type",
+        )),
         _ => p.note(EncodeError::new(
             RefusalCode::TextReadsAsField,
             "weather software is a letter, and the unit 2-4 letters, digits, - or _, not all digits",
@@ -434,10 +441,12 @@ pub(crate) fn field(out: &mut Vec<u8>, letter: u8, value: Option<f64>, width: us
     Ok(())
 }
 
-fn optional(out: &mut Vec<u8>, letter: u8, value: Option<f64>, width: usize) -> Result<(), EncodeError> {
+/// A value in units of `1 / scale` of its field's step (hundredths of an inch, tenths of a millibar). The value
+/// is judged as given: one the scaling carries past the field is `value-out-of-range`, never `not-a-number`.
+fn optional(out: &mut Vec<u8>, letter: u8, value: Option<f64>, scale: f64, width: usize) -> Result<(), EncodeError> {
     if let Some(v) = value {
         out.push(letter);
-        number_field(out, v, width, false)?;
+        number_field_scaled(out, v, scale, width, false)?;
     }
     Ok(())
 }
@@ -445,7 +454,11 @@ fn optional(out: &mut Vec<u8>, letter: u8, value: Option<f64>, width: usize) -> 
 /// A value in its field's steps, rounded to the nearest (vectors README, Encoding), in `width`
 /// digits.
 fn number_field(out: &mut Vec<u8>, value: f64, width: usize, signed: bool) -> Result<(), EncodeError> {
-    let n = crate::steps::round(value);
+    number_field_scaled(out, value, 1.0, width, signed)
+}
+
+fn number_field_scaled(out: &mut Vec<u8>, value: f64, scale: f64, width: usize, signed: bool) -> Result<(), EncodeError> {
+    let n = crate::steps::round(value * scale);
     if n.is_nan() {
         return Err(EncodeError::new(RefusalCode::NotANumber, "a weather value is not a number"));
     }

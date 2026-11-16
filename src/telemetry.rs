@@ -6,8 +6,9 @@ use alloc::vec::Vec;
 use crate::RefusalCode;
 use crate::context::Context;
 use crate::message::{is_decimal, telemetry_value};
+use crate::readback::Forms;
 use crate::refusal::Pending;
-use crate::{Code, Data, EncodeError, ParseOptions, Telemetry, text};
+use crate::{Code, Data, EncodeError, Telemetry, text};
 
 pub(crate) fn report(ctx: &mut Context, info: &[u8]) -> Option<Data> {
     let Some(body) = info.strip_prefix(b"T#") else {
@@ -77,7 +78,7 @@ pub(crate) fn report(ctx: &mut Context, info: &[u8]) -> Option<Data> {
     Some(Data::Telemetry(t))
 }
 
-pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
+pub(crate) fn encode(t: &Telemetry) -> Result<Forms, EncodeError> {
     let mut p = Pending::default();
     // The sequence is fixed-form text: letters and digits, or MIC.
     if t.sequence.is_empty() {
@@ -130,23 +131,5 @@ pub(crate) fn encode(t: &Telemetry) -> Result<Vec<u8>, EncodeError> {
     out.extend_from_slice(t.bits.as_deref().unwrap_or_default().as_bytes());
     out.extend_from_slice(t.comment.as_bytes());
     p.finish_faults()?;
-    // A sequence that starts MIC but is not MIC would not read back, for one.
-    let mut ctx = Context::new(ParseOptions::LENIENT);
-    match report(&mut ctx, &out) {
-        Some(Data::Telemetry(back))
-            if back.sequence == t.sequence
-                && back.bits == t.bits
-                && back.comment == t.comment
-                && back.analog.len() == t.analog.len()
-                && back.analog.iter().zip(&t.analog).all(|(x, y)| match (x, y) {
-                    (None, None) => true,
-                    (Some(x), Some(y)) => x == y,
-                    _ => false,
-                }) =>
-        {
-            crate::refusal::check_size(out.len())?;
-            Ok(out)
-        }
-        _ => Err(EncodeError::new(RefusalCode::TextReadsAsField, "the telemetry report would not read back as given")),
-    }
+    Ok(Forms::new(out))
 }

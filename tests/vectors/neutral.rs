@@ -380,11 +380,10 @@ impl std::fmt::Display for Unreadable {
 type Read<T> = Result<T, Unreadable>;
 
 /// The Refusal reasons order (vectors README): the first code that applies is the one named.
-pub const ORDER: [&str; 27] = [
+pub const ORDER: [&str; 28] = [
     "not-encodable",
     "invalid-address",
-    "ax25-cannot-carry",
-    "tnc2-cannot-carry",
+    "invalid-path",
     "invalid-third-party-header",
     "invalid-addressee",
     "invalid-name",
@@ -408,7 +407,19 @@ pub const ORDER: [&str; 27] = [
     "text-reads-as-field",
     "does-not-read-back",
     "information-field-too-long",
+    "ax25-cannot-carry",
+    "tnc2-cannot-carry",
 ];
+
+/// Where a refusal comes in the order: `not-encodable` for a field that reads as other data under its header is
+/// the read-back's finding, so it ranks with `does-not-read-back`, after every rule check.
+pub fn effective_rank(code: pdn_aprs::RefusalCode, why: &str) -> usize {
+    if code == pdn_aprs::RefusalCode::NotEncodable && why.contains("reads as other data") {
+        rank(pdn_aprs::RefusalCode::DoesNotReadBack)
+    } else {
+        rank(code)
+    }
+}
 
 /// Where a refusal code comes in the order.
 pub fn rank(code: pdn_aprs::RefusalCode) -> usize {
@@ -426,12 +437,18 @@ thread_local! {
     /// code, a sequence of -1, an infinity), each with a valid stand-in put in its place. Vectors README,
     /// "Encode records": the record is then encoded with the stand-ins, and the refusal named is the first in
     /// the order among that result and these, a size refusal losing to every one of them.
-    static DEFERRED: std::cell::RefCell<Vec<(pdn_aprs::RefusalCode, String)>> = const { std::cell::RefCell::new(Vec::new()) };
+    static DEFERRED: std::cell::RefCell<Vec<(pdn_aprs::RefusalCode, String, bool)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// Notes a refusal the reader made on an input it replaced with a stand-in.
 pub fn defer(code: pdn_aprs::RefusalCode, why: String) {
-    DEFERRED.with(|d| d.borrow_mut().push((code, why)));
+    DEFERRED.with(|d| d.borrow_mut().push((code, why, false)));
+}
+
+/// Notes a refusal that is the read-back's finding (an inner Mic-E destination the data does not compute):
+/// it ranks with `does-not-read-back`, after every rule check, whatever its code.
+pub fn defer_late(code: pdn_aprs::RefusalCode, why: String) {
+    DEFERRED.with(|d| d.borrow_mut().push((code, why, true)));
 }
 
 /// Forgets the refusals noted so far.
@@ -442,7 +459,9 @@ pub fn clear_deferred() {
 /// The first in the order of the refusals noted since the last `clear_deferred` or `settle`, taking them all.
 fn take_first() -> Option<(pdn_aprs::RefusalCode, String)> {
     let all = DEFERRED.with(|d| std::mem::take(&mut *d.borrow_mut()));
-    all.into_iter().min_by_key(|(code, _)| rank(*code))
+    all.into_iter()
+        .min_by_key(|(code, _, late)| if *late { rank(pdn_aprs::RefusalCode::DoesNotReadBack) } else { rank(*code) })
+        .map(|(code, why, _)| (code, why))
 }
 
 /// What encoding data read with stand-ins came to, settled against the reader's own refusals: the
@@ -453,7 +472,7 @@ pub fn settle<T>(result: Result<T, (pdn_aprs::RefusalCode, String)>) -> Result<T
     match (take_first(), result) {
         (None, Ok(t)) => Ok(t),
         (None, Err((code, why))) => Err((code, why, false)),
-        (Some((code, why)), Err((c, w))) if rank(c) < rank(code) && !is_size(c, &w) => {
+        (Some((code, why)), Err((c, w))) if effective_rank(c, &w) < rank(code) && !is_size(c, &w) => {
             let _ = (code, why);
             Err((c, w, false))
         }
@@ -470,6 +489,29 @@ fn out_of_type(v: &Value, name: &str) -> Option<(pdn_aprs::RefusalCode, String)>
         return Some((pdn_aprs::RefusalCode::NotANumber, format!("{name}: not a number")));
     }
     Some((pdn_aprs::RefusalCode::ValueOutOfRange, format!("{name}: outside what this crate's data holds")))
+}
+
+/// A whole number that fits `T`; a number that does not (a fraction, a negative count, an infinity) is noted
+/// as the refusal its value decides (`value-out-of-range`, `not-a-number`) and 0 stands in, for the encoder to
+/// find any earlier code. A fraction is never rounded in a whole-unit or code field. Text is not read.
+fn whole_or_defer<T: TryFrom<i128>>(v: &Value, name: &str) -> Read<T> {
+    if let Some(t) = whole(v).and_then(|n| T::try_from(n).ok()) {
+        return Ok(t);
+    }
+    let stand_in = || T::try_from(0).ok().expect("0 fits");
+    match num(v) {
+        Some(x) if x.is_finite() && x.fract() != 0.0 && x.abs() < 1e30 => {
+            defer(pdn_aprs::RefusalCode::ValueOutOfRange, format!("{name}: not a whole number"));
+            Ok(stand_in())
+        }
+        _ => match out_of_type(v, name) {
+            Some((code, why)) => {
+                defer(code, why);
+                Ok(stand_in())
+            }
+            None => unsupported(format!("{name}: not a whole number in the range this crate holds")),
+        },
+    }
 }
 
 fn unsupported<T>(why: String) -> Read<T> {
@@ -542,13 +584,11 @@ impl<'a> Keys<'a> {
             .ok_or_else(|| Unreadable::Unsupported(format!("{}: missing, and this crate has no value for its absence", self.name(k))))
     }
 
-    /// A whole number that fits `T`.
+    /// A whole number that fits `T`; a number that does not (a fraction, a negative count, an infinity)
+    /// is noted as the refusal its value decides (`value-out-of-range`, `not-a-number`) and 0 stands in,
+    /// for the encoder to find any earlier code. Text is not read.
     fn int<T: TryFrom<i128>>(&self, k: &str) -> Read<Option<T>> {
-        let Some(v) = self.get(k) else { return Ok(None) };
-        whole(v)
-            .and_then(|n| T::try_from(n).ok())
-            .map(Some)
-            .ok_or_else(|| Unreadable::Unsupported(format!("{}: not a whole number in the range this crate holds", self.name(k))))
+        self.int_or_defer(k)
     }
 
     /// A number this crate holds in whole steps (a course, a humidity), rounded to the nearest as
@@ -584,21 +624,11 @@ impl<'a> Keys<'a> {
         }))
     }
 
-    /// A whole number that fits `T`; a number that does not (a negative count, an infinity) is noted as the
-    /// refusal its value decides, and 0 stands in. A fraction or text is not read.
+    /// As [`Keys::int`].
     fn int_or_defer<T: TryFrom<i128>>(&self, k: &str) -> Read<Option<T>> {
-        let Some(v) = self.get(k) else { return Ok(None) };
-        if let Some(t) = whole(v).and_then(|n| T::try_from(n).ok()) {
-            return Ok(Some(t));
-        }
-        let name = self.name(k);
-        let fraction = num(v).is_some_and(|x| x.is_finite() && x.fract() != 0.0 && x.abs() < 1e30);
-        match out_of_type(v, &name).filter(|_| !fraction) {
-            Some((code, why)) => {
-                defer(code, why);
-                Ok(Some(T::try_from(0).ok().expect("0 fits")))
-            }
-            None => unsupported(format!("{name}: not a whole number in the range this crate holds")),
+        match self.get(k) {
+            None => Ok(None),
+            Some(v) => whole_or_defer(v, &self.name(k)).map(Some),
         }
     }
 
@@ -807,11 +837,7 @@ fn read_data(v: &Value) -> Read<Data> {
             locator: o.string("locator")?,
             legacy_telemetry: match o.array("legacy_telemetry")? {
                 None => Vec::new(),
-                Some(a) => a
-                    .iter()
-                    .map(|x| whole(x).and_then(|n| u8::try_from(n).ok()))
-                    .collect::<Option<Vec<u8>>>()
-                    .ok_or_else(|| Unreadable::Unsupported("legacy_telemetry: values are bytes, 0-255".into()))?,
+                Some(a) => a.iter().map(|x| whole_or_defer::<u8>(x, "legacy_telemetry")).collect::<Read<Vec<u8>>>()?,
             },
             destination_ssid: o.int("destination_ssid")?.unwrap_or(0),
             fields: read_positioned(&o)?,
@@ -983,6 +1009,16 @@ fn read_data(v: &Value) -> Read<Data> {
                     "third-party packets nest at most four deep".into(),
                 ));
             }
+            // Undecoded data within the four levels is `not-encodable`, first in the refusal order, before any
+            // header fault of the levels above it.
+            if let Some(last) = inner.get("packet").and_then(|p| p.get("data")) {
+                if last["type"] == "unrecognized" && last.get("reason").and_then(Value::as_str) != Some("empty") {
+                    return Err(Unreadable::Refused(
+                        pdn_aprs::RefusalCode::NotEncodable,
+                        "the inner packet's data is undecoded, and its bytes are not in the neutral form".into(),
+                    ));
+                }
+            }
             let p = o.required("packet", o.object("packet", &["source", "destination", "path", "data", "diagnostics"])?)?;
             let source = p.text("source")?;
             let source = Address::third_party_source(&source).unwrap_or_else(|_| {
@@ -1037,6 +1073,18 @@ fn read_data(v: &Value) -> Read<Data> {
             let data = data?;
             let information = match &data {
                 Data::Unrecognized(_) => Vec::new(),
+                // Mic-E data is written with the destination it computes; under any other inner destination it is not written.
+                Data::MicE(_) => {
+                    let made = Packet::create(Address::new("N0CALL").expect("an address"), destination.clone(), Vec::new(), data.clone())
+                        .map_err(|e| Unreadable::Refused(e.code(), format!("the inner packet's data: {e}")))?;
+                    if made.destination != destination {
+                        defer_late(
+                            pdn_aprs::RefusalCode::NotEncodable,
+                            "the inner Mic-E data is not under the destination it computes".into(),
+                        );
+                    }
+                    made.information
+                }
                 data => data.encode().map_err(|e| Unreadable::Refused(e.code(), format!("the inner packet's data: {e}")))?,
             };
             // Packet is non-exhaustive: start from decoding the information field, then say what the
@@ -1350,11 +1398,10 @@ fn read_positioned(o: &Keys) -> Read<Positioned> {
             None => None,
             Some(t) => Some(CommentTelemetry {
                 sequence: t.required_int("sequence")?,
-                analog: t
-                    .array("analog")?
-                    .map(|a| a.iter().map(|x| whole(x).and_then(|n| u16::try_from(n).ok())).collect::<Option<Vec<u16>>>())
-                    .unwrap_or(Some(Vec::new()))
-                    .ok_or_else(|| Unreadable::Unsupported("telemetry.analog: each is a whole number, 0-65535".into()))?,
+                analog: match t.array("analog")? {
+                    None => Vec::new(),
+                    Some(a) => a.iter().map(|x| whole_or_defer::<u16>(x, "telemetry.analog")).collect::<Read<Vec<u16>>>()?,
+                },
                 digital: t.int("digital")?,
             }),
         },
