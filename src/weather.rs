@@ -317,12 +317,25 @@ fn number(bytes: &[u8]) -> f64 {
 
 /// The software type and unit, when the rest is exactly that: a letter and a 2-4 character unit
 /// of letters, digits, `-` or `_`, not all digits (`wRSW`, `eMB64`, `tU2k`). A letter followed
-/// only by digits is a malformed weather field instead (`b0990`).
+/// only by digits is a malformed weather field instead (`b0990`), and text that starts like a
+/// field is text: a letter APRS12c defines followed by a digit, or `t` followed by `-` and a
+/// digit (`t2h35`, `s12a`, `t-5ab`; vectors interpretations.md, "Text after the weather fields
+/// that starts like a field").
 pub(crate) fn is_software_and_unit(rest: &[u8]) -> bool {
     (3..=5).contains(&rest.len())
         && rest[0].is_ascii_alphabetic()
         && !rest[1..].iter().all(u8::is_ascii_digit)
+        && !starts_like_a_field(rest)
         && rest.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// A letter APRS12c defines as a weather field followed by a digit, or `t` followed by `-` and a digit.
+fn starts_like_a_field(rest: &[u8]) -> bool {
+    match rest {
+        [b't', b'-', d, ..] => d.is_ascii_digit(),
+        [l, d, ..] => b"csgtrpPhbLl".contains(l) && d.is_ascii_digit(),
+        _ => false,
+    }
 }
 
 /// Reads the software type and unit (see [`is_software_and_unit`]) into `weather`.
