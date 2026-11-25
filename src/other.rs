@@ -714,7 +714,12 @@ fn inner_reads_as_other_data(p: &Packet) -> bool {
         return true;
     }
     match &p.data {
-        Data::MicE(_) => p.data.seal_for(false).ok().and_then(|s| s.into_parts().0).is_some_and(|computed| computed != p.destination),
+        // The destination the data computes, whether or not its bytes read back: the read-back's own
+        // findings come after not-encodable in the Refusal reasons order.
+        Data::MicE(r) => crate::mic_e::forms(r, false, false)
+            .ok()
+            .and_then(|f| f.destination().cloned())
+            .is_some_and(|computed| computed != p.destination),
         _ => false,
     }
 }

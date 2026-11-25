@@ -60,6 +60,11 @@ impl Forms {
         self.destination = Some(destination);
         self
     }
+
+    /// The destination address these forms are written for, if they set one (Mic-E).
+    pub(crate) fn destination(&self) -> Option<&Address> {
+        self.destination.as_ref()
+    }
 }
 
 /// Bytes that passed the read-back and the size check. Only [`seal`] makes one.

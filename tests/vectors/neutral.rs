@@ -1074,9 +1074,30 @@ fn read_data(v: &Value) -> Read<Data> {
             let information = match &data {
                 Data::Unrecognized(_) => Vec::new(),
                 // Mic-E data is written with the destination it computes; under any other inner destination it is not written.
-                Data::MicE(_) => {
-                    let made = Packet::create(Address::new("N0CALL").expect("an address"), destination.clone(), Vec::new(), data.clone())
-                        .map_err(|e| Unreadable::Refused(e.code(), format!("the inner packet's data: {e}")))?;
+                Data::MicE(m) => {
+                    let create = |d: Data| Packet::create(Address::new("N0CALL").expect("an address"), destination.clone(), Vec::new(), d);
+                    let made = match create(data.clone()) {
+                        Ok(made) => made,
+                        // Past every rule check, Mic-E data under a destination it does not compute is
+                        // not-encodable, before what the read-back found: the destination does not
+                        // depend on the comment, so the report without one says what it computes.
+                        Err(e)
+                            if matches!(
+                                e.code(),
+                                pdn_aprs::RefusalCode::TextReadsAsField
+                                    | pdn_aprs::RefusalCode::DoesNotReadBack
+                                    | pdn_aprs::RefusalCode::InformationFieldTooLong
+                            ) =>
+                        {
+                            let mut bare = m.clone();
+                            bare.fields.comment.clear();
+                            match create(Data::MicE(bare)) {
+                                Ok(made) if made.destination != destination => made,
+                                _ => return Err(Unreadable::Refused(e.code(), format!("the inner packet's data: {e}"))),
+                            }
+                        }
+                        Err(e) => return Err(Unreadable::Refused(e.code(), format!("the inner packet's data: {e}"))),
+                    };
                     if made.destination != destination {
                         defer_late(
                             pdn_aprs::RefusalCode::NotEncodable,
