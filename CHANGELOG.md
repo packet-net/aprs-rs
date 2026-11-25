@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.4.0 (2026-11-25)
+
+Round 6 of the conformance vectors (pinned at 85c675b).
+
+- Weather: text left after the fields that starts like a field (a letter APRS12c defines followed by a digit, or `t` then `-` and a digit), whether that field was read or not, is `weather-comment` text, not a software type and unit: `t2h35` after a repeated `t` is the comment `t2h35`, while `hXYZ`, `e1ab` and `dP1x` stay a software type and unit (aprs-vectors#42). This holds in position, object, item and positionless reports. Data with such a software type and unit is refused `text-reads-as-field` by the read-back.
+- A third-party inner Mic-E report under a destination it does not compute is refused `not-encodable` even where its text would also read back changed, as the refusal order says (it was `text-reads-as-field`). The held-packet check computes the destination without the read-back.
+
 ## 1.3.0 (2026-11-16)
 
 Round 5 of the conformance vectors (pinned at 26dd1dd).
